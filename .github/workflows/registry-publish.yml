@@ -166,20 +166,40 @@ jobs:
           fi
           echo "label ok: ${have}"
 
+      # `imagetools create` cannot attach a tag to an existing manifest: it wraps
+      # a bare image manifest in a one-entry manifest list, so the pushed tag
+      # has a digest of its own and only *contains* the proven one (v0.9.3 was
+      # the first, and the first re-run refused its own tag). A re-run therefore
+      # compares the image manifests a reference resolves to, not the digest of
+      # the reference itself, before calling the tag the same image.
       - name: Tag the image as ${{ env.TAG }} on GHCR
         run: |
           set -euo pipefail
-          existing=$(docker buildx imagetools inspect "${IMAGE}:${TAG}" --format '{{ .Manifest.Digest }}' 2>/dev/null || true)
-          if [ -n "$existing" ]; then
-            if [ "$existing" = "$SOURCE_DIGEST" ]; then
-              echo "::notice::${IMAGE}:${TAG} already is ${SOURCE_DIGEST}: not re-pushed"
+          # The platform manifests behind a reference, sorted: a bare manifest
+          # is its own member; a list contributes its non-attestation entries.
+          members_of() {
+            local raw
+            raw=$(docker buildx imagetools inspect "$1" --raw) && [ -n "$raw" ] || return 1
+            if jq -e '.manifests' <<<"$raw" >/dev/null 2>&1; then
+              jq -r '[.manifests[] | select((.annotations["vnd.docker.reference.type"] // "") != "attestation-manifest") | .digest] | sort | join(" ")' <<<"$raw"
             else
-              echo "::error::${IMAGE}:${TAG} already exists as ${existing}, not ${SOURCE_DIGEST}. A release tag is immutable; this job will not move it."
+              printf 'sha256:%s\n' "$(printf '%s' "$raw" | sha256sum | cut -d' ' -f1)"
+            fi
+          }
+          existing=$(docker buildx imagetools inspect "${IMAGE}:${TAG}" --format '{{json .Manifest}}' 2>/dev/null | jq -r .digest || true)
+          if [ -n "$existing" ]; then
+            want=$(members_of "$SOURCE_REF")
+            have=$(members_of "${IMAGE}:${TAG}")
+            if [ "$have" = "$want" ]; then
+              echo "::notice::${IMAGE}:${TAG} (${existing}) already resolves to ${want}: not re-pushed"
+            else
+              echo "::error::${IMAGE}:${TAG} already exists as ${existing} (resolving to ${have:-nothing}), not ${want}. A release tag is immutable; this job will not move it."
               exit 1
             fi
           else
             docker buildx imagetools create -t "${IMAGE}:${TAG}" "$SOURCE_REF"
-            echo "${IMAGE}:${TAG} -> ${SOURCE_DIGEST}"
+            pushed=$(docker buildx imagetools inspect "${IMAGE}:${TAG}" --format '{{json .Manifest}}' | jq -r .digest)
+            echo "${IMAGE}:${TAG} = ${pushed}, resolving to ${SOURCE_DIGEST}"
           fi
           docker logout ghcr.io
 
@@ -243,7 +263,7 @@ jobs:
             echo "|---|---|"
             echo "| server | \`${name}\` |"
             echo "| version | \`${VERSION}\` |"
-            echo "| image | \`${IMAGE}:${TAG}\` (\`${SOURCE_DIGEST}\`) |"
+            echo "| image | \`${IMAGE}:${TAG}\` (manifest \`${SOURCE_DIGEST}\`) |"
             echo "| commit | \`${BUILD_SHA}\` |"
             echo
             echo "https://registry.modelcontextprotocol.io/v0/servers?search=${name}"
