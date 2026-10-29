@@ -222,6 +222,10 @@ _EXTRACTION_CLEANERS = {
     # Version 3 only rejects mask-decided link targets (#218). Re-deriving
     # their graph rows must preserve version-2 embedding certification.
     3: clean_for_embedding,
+    # Version 4 adds task extraction (#350): `note_tasks` rows must be
+    # derived for every note once, but the embedding text is untouched, so a
+    # v3-stamped row compares equal here and is NOT re-embedded.
+    4: clean_for_embedding,
 }
 
 
