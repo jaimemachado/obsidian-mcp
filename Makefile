@@ -50,7 +50,7 @@ SCHEMA_TEST_CONTAINER ?= obsidian-mcp-schema-test
 SCHEMA_TEST_PORT ?= 55438
 SCHEMA_TEST_IMAGE ?= pgvector/pgvector:pg16
 
-.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-check db-vacuum-notes db-backup db-restore status check-no-backups-mount clean reindex reset-embeddings rebuild-tsvectors audit trivy test-schema test-integration concurrency-report search-eval-export search-eval-snapshot
+.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-check db-vacuum-notes db-backup db-restore status check-no-backups-mount clean reindex reset-embeddings rebuild-tsvectors audit trivy test-schema test-integration concurrency-report search-eval search-eval-export search-eval-snapshot
 
 help:
 	@echo "$(GREEN)Obsidian MCP Server$(NC)"
@@ -87,6 +87,7 @@ help:
 	@echo "  make reset-embeddings - Drop & recreate embedding column at configured dim"
 	@echo "  make rebuild-tsvectors - Recompute keyword index for FTS_CONFIGS and store snippet excerpts (no embeddings, no API calls)"
 	@echo "  make concurrency-report TARGET=queue|enforce [DAYS=n] [END=iso] - Concurrency readiness verdict (#188; exit 0 only on PASS)"
+	@echo "  make search-eval  - Score retrieval on the synthetic fixture (no DB); with SEARCH_EVAL_DATA=dir SEARCH_EVAL_DATABASE_URL=<restored BACKUP_FULL=1 copy> [ARMS=...] [BASELINE=arm], on real judgments (#356)"
 	@echo "  make search-eval-export [DAYS=90] [USER_ID=id] - Read-only export of search/read_note usage rows into SEARCH_EVAL_DIR (#356; tenant data, 0700)"
 	@echo "  make search-eval-snapshot SEARCH_EVAL_DATA=dir SEARCH_EVAL_DATABASE_URL=url - Record the restored copy's searchable notes; run it BEFORE applying any candidate"
 	@echo "  make status       - Show container and health status"
@@ -499,6 +500,51 @@ concurrency-report:
 	fi
 	docker exec $(CONTAINER) python -m scripts.concurrency_report --target $(TARGET) \
 		$(if $(DAYS),--days $(DAYS)) $(if $(END),--end $(END))
+
+# The search-eval gate (#356, design D7, E4). With no SEARCH_EVAL_DATA it runs
+# mine -> run -> score on the committed synthetic fixture with the two
+# fixture arms, into a temporary directory removed afterwards: no database, no
+# embedding provider, no real data. With SEARCH_EVAL_DATA (normally
+# .search-eval) it mines that directory's usage-export.jsonl (plus
+# manual.jsonl when present), replays ARMS against SEARCH_EVAL_DATABASE_URL
+# and scores in place. SEARCH_EVAL_DATABASE_URL is a disposable database
+# restored from a BACKUP_FULL=1 dump, and nothing else. The score step's exit
+# code is the recipe's (0 OK, 2 INSUFFICIENT_DATA or CORPUS_LOSS, 64 usage or
+# incomplete run, 1 failure); make itself reports any failure as 2.
+SEARCH_EVAL_DATA ?=
+SEARCH_EVAL_FIXTURE := tests/fixtures/search_eval
+ARMS ?=
+BASELINE ?=
+MIN_QUERIES ?=
+SEED ?= 0
+SEARCH_EVAL_ARMS = $(or $(ARMS),$(if $(SEARCH_EVAL_DATA),keyword semantic,fixture-lexical fixture-title))
+SEARCH_EVAL_BASELINE = $(or $(BASELINE),$(firstword $(SEARCH_EVAL_ARMS)))
+SEARCH_EVAL_MIN_QUERIES = $(or $(MIN_QUERIES),$(if $(SEARCH_EVAL_DATA),50,1))
+
+search-eval:
+	@if [ -z "$(SEARCH_EVAL_DATA)" ]; then \
+		T=$$(mktemp -d) || exit 1; \
+		trap 'rm -rf "$$T"' EXIT INT TERM; \
+		echo "$(GREEN)search-eval on the synthetic fixture ($(SEARCH_EVAL_FIXTURE)), arms: $(SEARCH_EVAL_ARMS)$(NC)"; \
+		$(PYTHON) -m scripts.search_eval mine --export $(SEARCH_EVAL_FIXTURE)/usage-export.jsonl \
+			--manual $(SEARCH_EVAL_FIXTURE)/manual.jsonl --out "$$T" || exit $$?; \
+		$(PYTHON) -m scripts.search_eval run --data "$$T" --fixture-corpus $(SEARCH_EVAL_FIXTURE)/corpus.json \
+			--arm $(SEARCH_EVAL_ARMS) || exit $$?; \
+		$(PYTHON) -m scripts.search_eval score --data "$$T" --arm $(SEARCH_EVAL_ARMS) \
+			--baseline $(SEARCH_EVAL_BASELINE) --min-queries $(SEARCH_EVAL_MIN_QUERIES) --seed $(SEED); \
+		exit $$?; \
+	fi; \
+	if [ ! -f "$(SEARCH_EVAL_DATA)/corpus-snapshot.json" ]; then \
+		echo "$(RED)$(SEARCH_EVAL_DATA)/corpus-snapshot.json is missing: run make search-eval-snapshot on the restored copy BEFORE applying any candidate$(NC)"; \
+		exit 64; \
+	fi; \
+	MANUAL=""; \
+	if [ -f "$(SEARCH_EVAL_DATA)/manual.jsonl" ]; then MANUAL="--manual $(SEARCH_EVAL_DATA)/manual.jsonl"; fi; \
+	$(PYTHON) -m scripts.search_eval mine --export "$(SEARCH_EVAL_DATA)/usage-export.jsonl" \
+		$$MANUAL --out "$(SEARCH_EVAL_DATA)" || exit $$?; \
+	$(PYTHON) -m scripts.search_eval run --data "$(SEARCH_EVAL_DATA)" --arm $(SEARCH_EVAL_ARMS) || exit $$?; \
+	$(PYTHON) -m scripts.search_eval score --data "$(SEARCH_EVAL_DATA)" --arm $(SEARCH_EVAL_ARMS) \
+		--baseline $(SEARCH_EVAL_BASELINE) --min-queries $(SEARCH_EVAL_MIN_QUERIES) --seed $(SEED)
 
 # The search-eval usage export (#356, design D1/D3/D9). One read-only
 # transaction, one SELECT (scripts/search_eval_export.sql), through the same

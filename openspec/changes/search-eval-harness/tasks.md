@@ -121,7 +121,7 @@
 
 ## 5. Make target — D7, E4
 
-- [ ] 5.1 Add the `search-eval` target.
+- [x] 5.1 Add the `search-eval` target.
   - `SEARCH_EVAL_DATA ?=`: empty means the fixture.
   - `ARMS ?=`: `fixture-lexical fixture-title` for the fixture, `keyword semantic` for real data.
   - `BASELINE ?=`: defaults to the first arm.
