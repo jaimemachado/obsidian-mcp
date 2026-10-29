@@ -58,16 +58,18 @@ in an overlay copied from `overlays/example/`.
   CRI-O (`RuntimeDefault`, which the manifests request) allow it. **Kernel
   5.8** is also needed for the file-transfer tools. Below it the server starts,
   and uploads and imports refuse.
-- **A container image you can pull.** The project publishes no public image.
-  Build one from the repository's `Dockerfile` and push it to a registry your
-  cluster can reach:
+- **A container image you can pull.** Prebuilt images are public at
+  `ghcr.io/maxkuminov/obsidian-mcp`: `:v<release>` per release tag (the image
+  CI built and scanned for that commit, retagged, never rebuilt), `:main` for
+  the tip. Point `images:` in your overlay at a release tag and pin by digest
+  in production (`docker buildx imagetools inspect ghcr.io/maxkuminov/obsidian-mcp:v<release>`
+  prints it). To run your own build instead, build from the repository's
+  `Dockerfile` and push it to a registry your cluster can reach:
 
   ```bash
   docker build -t registry.example.com/obsidian-mcp:$(git rev-parse --short HEAD) .
   docker push registry.example.com/obsidian-mcp:$(git rev-parse --short HEAD)
   ```
-
-  Then set `images:` in your overlay. Pin by digest in production.
 - **PostgreSQL 16 with pgvector 0.8.0 or newer.** Use your own database, or the
   optional [`postgres/`](#database) component. On an older pgvector the server
   exits, because filtered semantic search would silently lose results.
@@ -716,7 +718,7 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: task
-          image: registry.example.com/obsidian-mcp:<same tag as the Deployment>
+          image: ghcr.io/maxkuminov/obsidian-mcp:<same tag as the Deployment>
           command: ["python", "-m", "scripts.rebuild_tsvectors"]   # or scripts.reset_embeddings
           envFrom:
             - configMapRef: { name: obsidian-mcp-config }

@@ -863,11 +863,11 @@ The first deploy backfills the index, the wikilink graph, and the
 embeddings. For a 2 to 3k-note vault on Ollama with a GPU this takes
 a few minutes. On `text-embedding-3-small` it's seconds.
 
-Prebuilt images are published at `ghcr.io/maxkuminov/obsidian-mcp`
+Prebuilt images are public at `ghcr.io/maxkuminov/obsidian-mcp`
 (`:v<release>` per release tag, `:main` for the tip), built and scanned
-by CI. The package has to be public for the MCP Registry's OCI
-validation to see it; until the owner flips that package setting, pull
-with a GitHub token or build locally as above.
+by CI; a release tag is the image CI proved for that commit, retagged,
+never rebuilt. `docker pull ghcr.io/maxkuminov/obsidian-mcp:v<release>`
+needs no token. Or build locally as above.
 
 ### 4. Connect a client
 

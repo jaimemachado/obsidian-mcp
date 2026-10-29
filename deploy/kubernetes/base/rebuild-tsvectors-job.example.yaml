@@ -44,7 +44,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: task
-          image: registry.example.com/obsidian-mcp:CHANGE_ME   # the Deployment's tag
+          image: ghcr.io/maxkuminov/obsidian-mcp:CHANGE_ME   # the Deployment's image and tag
           command: ["python", "-m", "scripts.rebuild_tsvectors"]
           envFrom:
             - configMapRef:
