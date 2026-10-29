@@ -59,23 +59,23 @@
 
 ## 4. Metrics, snapshot, arms, replay and scoring — D3, D4, D6, D8
 
-- [ ] 4.1 Write `scripts/search_eval/metrics.py`, standard library only, with the D8 functions:
+- [x] 4.1 Write `scripts/search_eval/metrics.py`, standard library only, with the D8 functions:
   - `dedup`, `recall_at`, `reciprocal_rank`, `mean`;
   - `ndcg_at`, with binary gains and IDCG over min(|relevant|, k);
   - `bootstrap_ci(deltas, *, resamples=1000, seed=0, level=0.95)`: `random.Random(seed)`, resampling with replacement, returning the 2.5th and 97.5th percentiles of the resampled means, and `None` for an empty list.
-- [ ] 4.2 Write the read-only engine helper.
+- [x] 4.2 Write the read-only engine helper.
   - Build it from `SEARCH_EVAL_DATABASE_URL` or `--database-url` only, as `create_async_engine(url, connect_args={"server_settings": {"default_transaction_read_only": "on"}})`.
   - Assert that `SHOW transaction_read_only` returns `on` before any use; exit 1 if it does not.
   - A DB-backed step with no URL exits 64 before connecting.
   - The URL's own parameters govern TLS. Do not import `Settings`.
-- [ ] 4.3 Write the `snapshot` CLI: `--database-url URL --data DIR`.
+- [x] 4.3 Write the `snapshot` CLI: `--database-url URL --data DIR`.
   - In a read-only session, run `SELECT m.user_id, m.file_path, m.content_tsvector IS NOT NULL AS keyword, EXISTS (SELECT 1 FROM note_embeddings e WHERE e.note_id = m.id) AS semantic, m.embedded_content_hash IS DISTINCT FROM m.content_hash AS stale_vector FROM notes_metadata m`. `stale_vector` is informational only and never part of membership (D6).
   - Write `corpus-snapshot.json` (`{user_id-or-"null": {path: {metadata, keyword, semantic}}}`) to a `.tmp` file, then rename it, mode `0600`.
   - Share the membership SQL with the `run` step's replay check: one function, one SQL text.
   - Write `snapshot-meta.json` with the file's `sha256` and the URL's host and database name. No password.
   - Refuse to overwrite an existing snapshot without `--force`.
   - Add a Makefile target `search-eval-snapshot` that wraps it, requiring `SEARCH_EVAL_DATA` and `SEARCH_EVAL_DATABASE_URL`. Its help text says to run it on the restored copy **before** applying any candidate.
-- [ ] 4.4 In `scripts/search_eval/arms.py`, implement the D4 interface:
+- [x] 4.4 In `scripts/search_eval/arms.py`, implement the D4 interface:
   - `EvalQuery` with `sources: frozenset[str]`, `ArmContext`, `Arm` and `ArmFactory`.
   - Built-in `keyword` and `semantic` arms. Each lazily imports `src.services.search.full_text_search` or `src.services.embeddings.semantic_search` and calls it with a fresh supplied session per query, passing the owner and filters through.
   - Membership: `keyword` declares `"keyword"`, `semantic` declares `"semantic"`, and fixture arms use the fixture corpus.
@@ -83,7 +83,7 @@
   - Resolution of `runfile:<path>` arms. The file must sit next to its producing generation's `manifest.json`, that manifest must be `complete` with the file's sha256 listed, and its qrels, snapshot and selected-qid hashes must equal the current ones. Otherwise exit 64.
   - `--arm-opt key=value` pass-through.
   - An unknown arm is exit 64.
-- [ ] 4.5 Write the `run` CLI: `--data DIR --arm NAME… [--generation ID] [--depth 20] [--limit-queries N] [--database-url URL] [--fixture-corpus FILE]`.
+- [x] 4.5 Write the `run` CLI: `--data DIR --arm NAME… [--generation ID] [--depth 20] [--limit-queries N] [--database-url URL] [--fixture-corpus FILE]`.
   - **Generation.** `__main__` computes the default generation once, as a UTC stamp. Library code takes it as a parameter and never calls `now()`. Refuse an existing generation directory (exit 64).
   - **Selection.** Require `corpus-snapshot.json` in DIR, or `--fixture-corpus` (the snapshot and replay corpus together); exit 64 if missing. Select the qids after the drift drop, sorted, keeping the first N for `--limit-queries`. `selected_qids_hash` is the sha256 of the newline-joined sorted qids.
   - **Running manifest.** Before any factory or arm executes, atomically write `runs/manifest.json` (`.tmp` plus rename) as `{generation, status: "running", selected_qids_hash, selection: {limit_queries}, qrels_sha256, snapshot_sha256, arms, options, depth}`.
@@ -92,8 +92,8 @@
   - **Staging.** Stage `runs/<generation>/<arm-slug>.json` with `meta = {arm, membership, options, depth, generation, selected_qids_hash, qrels_sha256, snapshot_sha256, corpus_loss}` and `runs = {qid: [path…]}`.
   - **Failure.** Atomically rewrite the manifest with `status: "failed"`, `failed_arm` and `error` (exception type and message, never query text), then exit 1. Leave earlier generation directories in place.
   - **Success.** Only after every arm has answered every selected query, atomically rewrite the manifest with `status: "complete"` and `files: {arm: {path, sha256}}`.
-- [ ] 4.6 Implement the drift drop in `scoring.py` from the snapshot only. Record `dropped_paths`, `dropped_queries` and `ownerless_queries`. The replay corpus must never shrink the qrels.
-- [ ] 4.7 Write `score(data_dir, arms, *, baseline=None, min_queries=50, seed=0)` in `scripts/search_eval/scoring.py`.
+- [x] 4.6 Implement the drift drop in `scoring.py` from the snapshot only. Record `dropped_paths`, `dropped_queries` and `ownerless_queries`. The replay corpus must never shrink the qrels.
+- [x] 4.7 Write `score(data_dir, arms, *, baseline=None, min_queries=50, seed=0)` in `scripts/search_eval/scoring.py`.
   - Read run data **only** through `runs/manifest.json`, with no fallback to any other generation. Refuse with exit 64 unless all of these hold:
     - `status == "complete"`;
     - the manifest's `selected_qids_hash` equals the hash of the qids selected now from the current `queries.jsonl` and snapshot under the manifest's `selection` options;
@@ -117,7 +117,7 @@
   - Define `UNSTABLE_KEYS = {"commit_sha", "generated_at", "generation"}` and `stable_projection(report)`, documented in the module docstring. Tests pass a fixed `--generation`, but the key stays out of the golden file anyway.
   - Assert explicitly that no query text and no path string appears in the serialized report.
   - Exit codes: 2 for `INSUFFICIENT_DATA` (below `min_queries`) or `CORPUS_LOSS` (any arm with loss above 0); otherwise 0. No metric threshold (E2).
-- [ ] 4.8 Add the fixture arms `fixture-lexical` (term overlap over title and body) and `fixture-title` (title tokens only), both over `ArmContext.corpus`. They are deterministic, break ties by path, and need no session.
+- [x] 4.8 Add the fixture arms `fixture-lexical` (term overlap over title and body) and `fixture-title` (title tokens only), both over `ArmContext.corpus`. They are deterministic, break ties by path, and need no session.
 
 ## 5. Make target — D7, E4
 

@@ -28,3 +28,31 @@ def write_mine(*, export: Path, out: Path, window_seconds: float = DEFAULT_WINDO
     atomic_write(out / QRELS_FILE, canonical_json(result.qrels))
     atomic_write(out / MINE_REPORT_FILE, pretty_json(result.report))
     return result
+
+
+async def write_snapshot(*, data: Path, database_url: str | None, force: bool = False) -> dict:
+    """`snapshot`: per-arm searchable membership of the restored copy, pre-candidate (D6)."""
+    from scripts.search_eval.db import describe_url, fetch_membership, open_readonly, resolve_url
+    from scripts.search_eval.scoring import SNAPSHOT_FILE, SNAPSHOT_META_FILE
+
+    url = resolve_url(database_url)
+    target = data / SNAPSHOT_FILE
+    if target.exists() and not force:
+        raise UsageError(f"{target} exists; pass --force to replace the pre-candidate snapshot")
+    engine, maker = await open_readonly(url)
+    try:
+        async with maker() as session:
+            membership = await fetch_membership(session)
+    finally:
+        await engine.dispose()
+    ensure_private_dir(data)
+    digest = atomic_write(target, canonical_json(membership))
+    meta = {
+        "sha256": digest,
+        **describe_url(url),
+        "rows": sum(len(v) for v in membership.values()),
+        "stale_vector_rows": sum(1 for v in membership.values() for e in v.values()
+                                 if e["stale_vector"]),
+    }
+    atomic_write(data / SNAPSHOT_META_FILE, pretty_json(meta))
+    return meta

@@ -253,21 +253,19 @@ def query_id(user_id: int | None, text: str, filters: dict) -> str:
 # --------------------------------------------------------------------------
 
 
-def derive_provenance(rows: list[dict], *, malformed: int = 0,
-                      user_filter: int | None = None) -> dict:
+def derive_provenance(rows: list[dict], *, user_filter: int | None = None) -> dict:
     """`{"users": 1 | "multi", "basis": ...}` for the rows the miner read.
 
     `users` is 1 when the export was restricted to one user (every row carries
     the same non-null `user_filter` and that `user_id`, or the miner's own
     `--user-id` filtered it), or when the deployment has at most one user and
     the rows hold at most one distinct `user_id` (NULL counts as one value).
-    Anything else is `"multi"`, including an empty export (no evidence) and an
-    export with malformed lines, whose owners cannot be established.
+    Anything else is `"multi"`, including an empty export (no evidence).
+    Malformed lines contribute nothing to any count but `malformed_lines`, so
+    they do not change the provenance.
     """
     if not rows:
         return {"users": "multi", "basis": "empty"}
-    if malformed:
-        return {"users": "multi", "basis": "malformed_lines"}
     if user_filter is not None:
         if all(r.get("user_id") == user_filter for r in rows):
             return {"users": 1, "basis": "user_filter"}
@@ -462,7 +460,7 @@ def mine(rows: list[dict], *, window_seconds: float = DEFAULT_WINDOW_SECONDS,
         "n_both_sources": n_both,
         "per_class": {c: class_counts.get(c, 0) for c in CLASSES},
         "per_source": {s: source_counts.get(s, 0) for s in ("mined", "manual")},
-        "provenance": derive_provenance(rows, malformed=malformed, user_filter=user_filter),
+        "provenance": derive_provenance(rows, user_filter=user_filter),
     }
     return MineResult(queries=out_queries, qrels=qrels, report=report)
 

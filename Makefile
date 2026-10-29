@@ -50,7 +50,7 @@ SCHEMA_TEST_CONTAINER ?= obsidian-mcp-schema-test
 SCHEMA_TEST_PORT ?= 55438
 SCHEMA_TEST_IMAGE ?= pgvector/pgvector:pg16
 
-.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-check db-vacuum-notes db-backup db-restore status check-no-backups-mount clean reindex reset-embeddings rebuild-tsvectors audit trivy test-schema test-integration concurrency-report search-eval-export
+.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-check db-vacuum-notes db-backup db-restore status check-no-backups-mount clean reindex reset-embeddings rebuild-tsvectors audit trivy test-schema test-integration concurrency-report search-eval-export search-eval-snapshot
 
 help:
 	@echo "$(GREEN)Obsidian MCP Server$(NC)"
@@ -88,6 +88,7 @@ help:
 	@echo "  make rebuild-tsvectors - Recompute keyword index for FTS_CONFIGS and store snippet excerpts (no embeddings, no API calls)"
 	@echo "  make concurrency-report TARGET=queue|enforce [DAYS=n] [END=iso] - Concurrency readiness verdict (#188; exit 0 only on PASS)"
 	@echo "  make search-eval-export [DAYS=90] [USER_ID=id] - Read-only export of search/read_note usage rows into SEARCH_EVAL_DIR (#356; tenant data, 0700)"
+	@echo "  make search-eval-snapshot SEARCH_EVAL_DATA=dir SEARCH_EVAL_DATABASE_URL=url - Record the restored copy's searchable notes; run it BEFORE applying any candidate"
 	@echo "  make status       - Show container and health status"
 	@echo "  make clean        - Remove containers and images"
 	@echo ""
@@ -536,6 +537,20 @@ search-eval-export:
 		echo "$(RED)Export FAILED: psql through DB_BACKEND=$(DB_BACKEND) returned non-zero; nothing was replaced$(NC)"; \
 		exit 1; \
 	fi
+
+# The pre-candidate corpus snapshot (#356, design D6): which indexed paths each
+# arm could reach on the restored copy, so a candidate that loses notes is
+# reported as CORPUS_LOSS instead of scoring better. Run it on the restored
+# BACKUP_FULL=1 copy BEFORE applying any candidate (migration, re-chunk,
+# re-embed); the harness cannot check that ordering. The URL is read from the
+# environment, never from DATABASE_URL, and never echoed.
+export SEARCH_EVAL_DATABASE_URL
+search-eval-snapshot:
+	@if [ -z "$(SEARCH_EVAL_DATA)" ] || [ -z "$$SEARCH_EVAL_DATABASE_URL" ]; then \
+		echo "$(RED)Usage: make search-eval-snapshot SEARCH_EVAL_DATA=<dir> SEARCH_EVAL_DATABASE_URL=<restored BACKUP_FULL=1 copy> [FORCE=1]$(NC)"; \
+		exit 64; \
+	fi
+	@$(PYTHON) -m scripts.search_eval snapshot --data "$(SEARCH_EVAL_DATA)" $(if $(filter-out 0,$(FORCE)),--force)
 
 status:
 	@echo "$(GREEN)Obsidian MCP Status:$(NC)"
