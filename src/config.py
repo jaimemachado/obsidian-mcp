@@ -126,6 +126,24 @@ MAX_NOTE_BYTES = 10 * 1024 * 1024  # 10 MB
 # real note, including a generated MOC.
 MAX_LINKS_PER_NOTE = 10_000
 
+# Task extraction caps (#350, design D11). Constants, not settings: changing
+# any of the first four changes what the extractor stores, which is a grammar
+# change and needs a `CURRENT_EXTRACTION_VERSION` bump (design D3).
+#
+# - `MAX_TASKS_PER_NOTE`: checkbox rows kept per note, in document order. A
+#   capped note sets `notes_metadata.tasks_truncated`; `list_tasks` counts it.
+# - `TASK_TEXT_MAX_CHARS`: code points of task text stored (`text_cut`).
+# - `TASK_TAG_MAX_CHARS`: a longer inline tag on a task is not stored
+#   (`tags_cut`). The tag regex is ASCII-only, so this is also far under
+#   `MAX_TAG_BYTES`.
+# - `TASK_MAX_TAGS`: the first N distinct tags of a task, in document order.
+# - `LIST_TASKS_MAX_TAG_ARGS`: entries `list_tasks(tags=…)` accepts.
+MAX_TASKS_PER_NOTE = 5_000
+TASK_TEXT_MAX_CHARS = 1_000
+TASK_TAG_MAX_CHARS = 128
+TASK_MAX_TAGS = 64
+LIST_TASKS_MAX_TAG_ARGS = 32
+
 # Chunks embedded and stored for a single note. Unbounded, the arithmetic is
 # `MAX_NOTE_BYTES` (10 MiB) ÷ `CHUNK_SIZE` (512 tokens, ~4 characters each) ≈
 # 5,120 chunks for one legal note, each of them one sequential, 30 s-bounded
