@@ -75,6 +75,17 @@ jobs:
       - name: Verify the mount-namespace harness can run
         run: unshare -Urm --propagation private true
 
+      # tests/integration/test_search_eval_pg.py runs `make search-eval-export`
+      # through real `psql` (#356, design D3), and fails rather than skips when
+      # it is missing. GitHub's Ubuntu image ships the client today; this only
+      # installs it if the image ever stops doing so.
+      - name: Ensure the PostgreSQL client is present
+        run: |
+          if ! psql --version; then
+            sudo apt-get update && sudo apt-get install -y postgresql-client
+            psql --version
+          fi
+
       - name: Run the test suite
         env:
           # Real Postgres for tests/integration/*. The harness creates and drops

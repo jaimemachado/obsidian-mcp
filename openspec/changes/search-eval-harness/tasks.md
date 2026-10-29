@@ -11,8 +11,8 @@
 
 ## 1. Ignores and CI — D3, D9
 
-- [ ] 1.1 Add `.search-eval/` to `.gitignore`.
-- [ ] 1.2 In `.github/workflows/ci.yml`, add a step to the `tests` job before "Run the test suite". It runs `psql --version`, and only if that fails, `sudo apt-get update && sudo apt-get install -y postgresql-client` followed by `psql --version` again. GitHub's `ubuntu-latest` image ships the PostgreSQL client today; the step guards against the image changing. Do not add a new env variable.
+- [x] 1.1 Add `.search-eval/` to `.gitignore`.
+- [x] 1.2 In `.github/workflows/ci.yml`, add a step to the `tests` job before "Run the test suite". It runs `psql --version`, and only if that fails, `sudo apt-get update && sudo apt-get install -y postgresql-client` followed by `psql --version` again. GitHub's `ubuntu-latest` image ships the PostgreSQL client today; the step guards against the image changing. Do not add a new env variable.
 
 ## 2. Export — D1, D3
 
