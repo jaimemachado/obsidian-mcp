@@ -10,28 +10,6 @@
     "source": "github",
     "id": "1184745561"
   },
-  "remotes": [
-    {
-      "type": "streamable-http",
-      "url": "https://{host}/mcp",
-      "variables": {
-        "host": {
-          "description": "Hostname of your own deployment (MCP_HOSTNAME). There is no public instance: you host this server yourself.",
-          "isRequired": true,
-          "placeholder": "obsidian-mcp.example.com"
-        }
-      },
-      "headers": [
-        {
-          "name": "Authorization",
-          "description": "Bearer <API key> minted in the control panel (omcp_...). Omit it to connect via OAuth instead.",
-          "isSecret": true,
-          "isRequired": false,
-          "placeholder": "Bearer omcp_..."
-        }
-      ]
-    }
-  ],
   "packages": [
     {
       "registryType": "oci",
@@ -71,7 +49,10 @@
           "description": "Embedding provider: `ollama` (self-hosted, default) or `openai` (bring your own key). Switching after deploy requires `make reset-embeddings`.",
           "isRequired": false,
           "default": "ollama",
-          "choices": ["ollama", "openai"]
+          "choices": [
+            "ollama",
+            "openai"
+          ]
         },
         {
           "name": "OLLAMA_URL",
