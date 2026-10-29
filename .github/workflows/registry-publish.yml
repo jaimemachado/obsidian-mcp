@@ -219,8 +219,11 @@ jobs:
           set -euo pipefail
           jq -e '(.packages | length) == 1 and .packages[0].registryType == "oci"' server.json >/dev/null \
             || { echo "::error::server.json: expected exactly one oci package"; exit 1; }
+          # The live registry refuses an OCI package that carries registryBaseUrl
+          # (the canonical reference in `identifier` is the registry); the schema
+          # validator accepts it, so strip it here too, in case it creeps back.
           jq --arg v "$VERSION" --arg img "${IMAGE}:${TAG}" \
-             '.version = $v | .packages[0].identifier = $img' server.json > server.json.tmp
+             '.version = $v | .packages[0].identifier = $img | del(.packages[0].registryBaseUrl)' server.json > server.json.tmp
           mv server.json.tmp server.json
           mcp-publisher validate
           cat server.json
