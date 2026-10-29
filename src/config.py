@@ -1,5 +1,6 @@
 import ipaddress
 import logging
+import math
 import resource
 import sys
 from typing import Annotated, Any, Literal
@@ -186,6 +187,11 @@ MAX_LIST_PATTERN_CHARS = 1024
 # opposite sides of the body/no-body line and carry different usage markers on
 # purpose.
 MAX_SEARCH_QUERY_CHARS = 8192
+
+#: The smallest accepted `RANK_WEIGHTS` entry (#344, Codex C-3). The array is
+#: bound as `float4[]`, where a positive Python float below float4's smallest
+#: subnormal (~1.4e-45) encodes as 0 and silently zeroes that weight's covers.
+RANK_WEIGHT_MIN = 1e-6
 
 # Upper bound on `import_from_url`'s `url` argument (#322), through the same
 # declarative `arg_char_caps` screen as the search query: the existing
@@ -477,6 +483,27 @@ class Settings(BaseSettings):
     # validator below so the CSV form doesn't trip pydantic-settings' JSON
     # decode of complex (list) fields.
     fts_configs: Annotated[list[str], NoDecode] = ["english"]
+    # ── Keyword ranking and snippets (#344, migration 031) ─────────────────
+    #
+    # `ts_rank_cd`'s weight array `{D, C, B, A}`, bound as `float4[]` and never
+    # interpolated. The keyword vector holds the title and aliases at `A` and
+    # the body at `D`; at the default one adjacent two-word title cover
+    # (`2/(1+1) = 1.0`) outweighs fifty body covers (`2/(50+50) = 0.02` each),
+    # where PostgreSQL's default `D = 0.1` lets ten body repetitions tie the
+    # title — the #344 failure. Changing it re-ranks title-versus-body
+    # competition only; body-only order is unchanged by any uniform `D`.
+    # Accepts `{0.02, 0.2, 0.4, 1.0}`, a JSON list or a CSV; four finite
+    # numbers in [1e-6, 1] (`RANK_WEIGHT_MIN`: float4 must not round one to 0). See "Keyword ranking" in docs/architecture/search.md.
+    rank_weights: Annotated[list[float], NoDecode] = [0.02, 0.2, 0.4, 1.0]
+    # How many leading characters of the text a keyword vector was built from
+    # are stored in `notes_metadata.body_excerpt` for `ts_headline`. Applies to
+    # rows written afterwards; `make rebuild-tsvectors` rewrites the rest.
+    keyword_excerpt_chars: int = Field(20_000, ge=1_000, le=100_000)
+    # Snippets (`ts_headline`) are computed for the first N rows of a
+    # keyword_search page regardless of `limit` — the parse cost is bounded by
+    # this, by `KEYWORD_EXCERPT_CHARS` and by the config count, never by the
+    # page size. 0 disables snippets.
+    keyword_snippet_rows: int = Field(20, ge=0, le=100)
 
     embedding_provider: Literal["ollama", "openai"] = "ollama"
     openai_api_key: str | None = None
@@ -1121,6 +1148,55 @@ class Settings(BaseSettings):
             out.append(name)
         if not out:
             raise ValueError("FTS_CONFIGS must contain at least one config name")
+        return out
+
+    @field_validator("rank_weights", mode="before")
+    @classmethod
+    def _parse_rank_weights(cls, v):
+        """`{0.02, 0.2, 0.4, 1.0}` (PostgreSQL array spelling), a JSON list, a
+        CSV, or a list: exactly four finite numbers, each in [1e-6, 1], as
+        `D, C, B, A`."""
+        if isinstance(v, str):
+            s = v.strip()
+            if s.startswith("{") and s.endswith("}"):
+                s = s[1:-1]
+            elif s.startswith("["):
+                import json
+
+                try:
+                    v = json.loads(s)
+                except ValueError as e:
+                    raise ValueError(
+                        f"RANK_WEIGHTS looks like JSON but failed to parse: {e}"
+                    ) from e
+            if isinstance(v, str):
+                v = s.split(",")
+        if not isinstance(v, (list, tuple)):
+            raise ValueError(
+                "RANK_WEIGHTS must be four numbers {D, C, B, A}, e.g. "
+                "{0.02, 0.2, 0.4, 1.0}"
+            )
+        out: list[float] = []
+        for item in v:
+            try:
+                number = float(str(item).strip())
+            except ValueError as e:
+                raise ValueError(f"RANK_WEIGHTS entry {item!r} is not a number") from e
+            # Finite and in [1e-6, 1]: ts_rank_cd divides by each weight (zero
+            # is not a weight) and PostgreSQL refuses one above 1 ("weight out
+            # of range"); the array binds as float4, where a positive value
+            # below ~1.4e-45 encodes as 0 — so the floor sits far above that.
+            if not math.isfinite(number) or not (RANK_WEIGHT_MIN <= number <= 1.0):
+                raise ValueError(
+                    f"RANK_WEIGHTS entry {item!r} is outside [{RANK_WEIGHT_MIN:g}, 1]; "
+                    "ts_rank_cd divides by each weight, PostgreSQL refuses one above 1, "
+                    "and a smaller value would bind as float4 zero"
+                )
+            out.append(number)
+        if len(out) != 4:
+            raise ValueError(
+                f"RANK_WEIGHTS must have exactly four entries (D, C, B, A), got {len(out)}"
+            )
         return out
 
     @field_validator("oauth_known_redirect_hosts", mode="before")

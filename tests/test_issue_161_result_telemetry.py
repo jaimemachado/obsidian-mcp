@@ -63,7 +63,7 @@ class _Session:
         self._batches = list(batches)
 
     async def execute(self, clause, *_a, **_k):
-        if str(clause).lstrip().upper().startswith("SET LOCAL"):
+        if str(clause).lstrip().upper().startswith(("SET LOCAL", "SET TRANSACTION")):
             return _Result()
         return _Result(self._batches.pop(0) if self._batches else [])
 
@@ -83,7 +83,7 @@ class _FindRelatedSession(_Session):
         self._preamble = [[source] if source else [], chunks]
 
     async def execute(self, clause, *_a, **_k):
-        if not str(clause).lstrip().upper().startswith("SET LOCAL") and self._preamble:
+        if not str(clause).lstrip().upper().startswith(("SET LOCAL", "SET TRANSACTION")) and self._preamble:
             return _Result(self._preamble.pop(0))
         return await super().execute(clause, *_a, **_k)
 
@@ -118,10 +118,10 @@ class _Note:
 def _keyword_row(path):
     from types import SimpleNamespace
 
-    # `keyword_search` projects four columns (#280, D6), so a row is flat.
+    # `keyword_search` projects five columns (#280 D6, #344), so a row is flat.
     note = _Note(1, path)
     return SimpleNamespace(
-        file_path=note.file_path, title=note.title, tags=note.tags, rank=0.5
+        id=1, file_path=note.file_path, title=note.title, tags=note.tags, rank=0.5
     )
 
 
