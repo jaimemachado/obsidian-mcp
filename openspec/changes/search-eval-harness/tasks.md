@@ -1,13 +1,13 @@
 ## 0. Pre-flight
 
-- [ ] 0.1 Check the base. Work on branch `search-eval-harness` at or after `6bcc9d9`, and confirm that `grep -c "Prebuilt images are public" docs/deployment-kubernetes.md` prints `1`. Confirm that `src/services/timing.py` defines `MAX_RESULT_PATHS = 10` and `src/mcp_server/tools.py` defines `_MAX_PARAM_LEN = 200`, because the miner's truncation and pool rules depend on both. Confirm that `oauth_tokens.grant_id` is `NOT NULL` in `src/models/db.py`, and read the principal definition in `src/auth/session.py`.
-- [ ] 0.2 Read this change's `proposal.md` and `design.md`, including "Owner decisions" and "Codex spec review, round 1", and `specs/search-evaluation/spec.md`. Then read:
+- [x] 0.1 Check the base. Work on branch `search-eval-harness` at or after `6bcc9d9`, and confirm that `grep -c "Prebuilt images are public" docs/deployment-kubernetes.md` prints `1`. Confirm that `src/services/timing.py` defines `MAX_RESULT_PATHS = 10` and `src/mcp_server/tools.py` defines `_MAX_PARAM_LEN = 200`, because the miner's truncation and pool rules depend on both. Confirm that `oauth_tokens.grant_id` is `NOT NULL` in `src/models/db.py`, and read the principal definition in `src/auth/session.py`.
+- [x] 0.2 Read this change's `proposal.md` and `design.md`, including "Owner decisions" and "Codex spec review, round 1", and `specs/search-evaluation/spec.md`. Then read:
   - `docs/architecture/search.md`, section "Search result telemetry"
   - `docs/architecture/usage-attribution.md`, sections "The read-only consumer" and "What reaches `params` is rendered"
   - `src/services/search_analytics.py`, for `analysable_sql` and the `(user_id, path)` identity rule
   - `docker/db-exec.sh`
-- [ ] 0.3 Confirm from `_tracked`'s tail in `src/mcp_server/tools.py` (around `logged["error"] = body_outcome.marker`) that a failed `read_note` row carries `params.error`. If any `read_note` failure path writes a row *without* `error`, stop and record it in design.md L10 before relying on the rule.
-- [ ] 0.4 Touch nothing under `src/` or `alembic/`, and do not change the Dockerfile or any `requirements*.txt`. This change is tooling, tests and docs only, and adds no dependency (E1). The only workflow edit allowed is 1.2.
+- [x] 0.3 Confirm from `_tracked`'s tail in `src/mcp_server/tools.py` (around `logged["error"] = body_outcome.marker`) that a failed `read_note` row carries `params.error`. If any `read_note` failure path writes a row *without* `error`, stop and record it in design.md L10 before relying on the rule.
+- [x] 0.4 Touch nothing under `src/` or `alembic/`, and do not change the Dockerfile or any `requirements*.txt`. This change is tooling, tests and docs only, and adds no dependency (E1). The only workflow edit allowed is 1.2.
 
 ## 1. Ignores and CI — D3, D9
 
