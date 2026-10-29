@@ -397,7 +397,7 @@ update it in the same change.** What stays here is the short list:
   mount is not detected (L1) — see
   [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
 - **Every tool publishes a `title` and all four `ToolAnnotations` hints
-  explicitly** (#343). Fifteen read tools are read-only/idempotent/closed;
+  explicitly** (#343). Sixteen read tools are read-only/idempotent/closed;
   the destructive set is the write-bucket set minus `create_note` plus
   `request_upload` (its `overwrite=True` link overwrites on redemption);
   `import_from_url` alone is open-world. **Hints, not enforcement** — nothing
@@ -409,11 +409,25 @@ update it in the same change.** What stays here is the short list:
   contract and the reasoning moved to the vault-tools note. See
   [vault tools](docs/architecture/vault-tools.md), "Tool metadata".
 - Wikilink graph extracted from note bodies into `note_links`; resolved at index time with same-folder-first preference
+- **Task rows are derived state keyed by note id** (#350, migration 032).
+  `note_tasks` has no path and no owner column — both come from the
+  `notes_metadata` join, so a task cannot outlive, precede or be listed
+  under another tenant than its note — and is written only by the index
+  pass, right after the link rebuild, for the same changed list, from the
+  scan's buffered bodies (`src/services/tasks.py`, fence-aware, the #218
+  rule). Extraction version 4 is the backfill (no re-embed). **A
+  task-derivation failure is isolated to that note's task rows**: per-note
+  savepoint, one retry, then `tasks_failed` — never the quarantine, never a
+  skip, never a pass failure. `list_tasks` always reports the not-yet-scanned
+  (`extraction_version < 4`), could-not-be-indexed and capped counts, each
+  even at zero; its cursor carries an owner discriminator and a filters
+  digest, never an id. See [indexing and embeddings](docs/architecture/indexing-and-embeddings.md)
+  and [vault tools](docs/architecture/vault-tools.md).
 - `MCP_SANDBOX_MODE=true` is a registry-eval-only switch: lifespan skips `_check_embedding_dim` and the indexer, and `APIKeyMiddleware` bypasses auth on `/mcp/*`. Lets Glama's sandbox build the image and validate MCP introspection without external deps. Never enable in production — tools register but cannot run.
 
 ## MCP tools
 
-25 tools, all registered in `src/mcp_server/server.py` and all wrapped by
+26 tools, all registered in `src/mcp_server/server.py` and all wrapped by
 `_tracked`, which resolves the caller's vault root *before* the tool body runs
 — that decorator is the whole enforcement of "this user has no vault"
 ([vault roots and tenancy](docs/architecture/vault-roots-and-tenancy.md)).
@@ -443,6 +457,11 @@ destructive-write surface: read
 **Raw files (non-markdown)** — `read_file`, `write_file`, `list_files`,
 `delete_file`. Pure byte transport, same traversal and dot-dir guards, no
 indexing.
+
+**Tasks** — `list_tasks(folder?, status="open", due_by?, scheduled_by?,
+tags?, limit=100, cursor?)`: checkbox tasks from `note_tasks`, never a file;
+registered last, so the first 25 `tools/list` entries keep the 5a391ca
+fixture's order (the rest are in `tools_list_schema_additions.json`).
 
 **Transfer** — `request_upload`, `check_upload`, `request_download`,
 `import_from_url`, plus the public `/transfer/*` routes. A capability pins

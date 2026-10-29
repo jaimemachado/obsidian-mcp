@@ -36,7 +36,7 @@ worst case (not read-only, destructive, open-world), which is how a
 
 | shape | readOnly | destructive | idempotent | openWorld | tools |
 | --- | --- | --- | --- | --- | --- |
-| `_READ_ONLY` | true | false | true | false | `keyword_search`, `semantic_search`, `read_note`, `list_notes`, `get_tags`, `get_recent`, `get_vault_guide`, `read_file`, `list_files`, `get_backlinks`, `get_links`, `get_neighborhood`, `find_related`, `find_orphans`, `check_upload` |
+| `_READ_ONLY` | true | false | true | false | `keyword_search`, `semantic_search`, `read_note`, `list_notes`, `get_tags`, `get_recent`, `get_vault_guide`, `read_file`, `list_files`, `get_backlinks`, `get_links`, `get_neighborhood`, `find_related`, `find_orphans`, `check_upload`, `list_tasks` (#350) |
 | `_ADDITIVE` | false | false | false | false | `create_note` (no-clobber), `request_download` (mints a capability, destroys nothing) |
 | `_DESTRUCTIVE` | false | true | false | false | `edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file`, `delete_file`, `request_upload` |
 | `_DESTRUCTIVE_OPEN_WORLD` | false | true | false | true | `import_from_url` |
@@ -753,6 +753,75 @@ Derived state does not heal on its own — the bytes on disk are unchanged, so
 `content_hash` cannot see the grammar move. See the `extraction_version`
 mechanism in
 [indexing and embeddings](indexing-and-embeddings.md#re-deriving-after-a-grammar-change-150).
+
+### The task grammar rides on the fence grammar (#350)
+
+`src/services/tasks.py` is the fourth consumer of the shared mask (after
+links, tags and headings). A line is a checkbox task when the **masked** line
+starts with optional `>` prefixes, any indentation, a bullet or ordered marker,
+horizontal whitespace and `[c]` — `c` one code point, U+0020 or non-whitespace
+other than `[`/`]` — followed by whitespace or the end of the line; the pattern
+is possessive and anchored at each line start, so a 10 MiB `> > - [` body is
+linear. **The #218 rule, for tasks**: the original and masked text must be equal
+from the line start through the closing `]`, so a marker decided by masking
+(`` `- [ ]` `` as inline code, a span inside a fence) is not a task, while inline
+code *after* the marker leaves the task intact. Fields are read from the masked
+text too, so `` `📅 2026-01-01` `` documented in inline code is not a due date.
+Tags reuse `vault.INLINE_TAG_RE` and headings `vault._ATX_HEADING_RE` — imported,
+never copied — so a task's tags and heading path can never disagree with the
+note's own. A Tasks-plugin ```` ```tasks ```` query block is a fence like any
+other and is never evaluated.
+
+Accepted divergences (L1/L2): the flat fence grammar does not parse containers
+or comments, so a checkbox inside an HTML comment, a `%% %%` comment or a fence
+nested in a callout is listed; and a date signifier anywhere on the line counts
+(last occurrence wins), where the plugin reads only trailing fields. Any change
+here is an extraction-version bump, like the fence and link grammars.
+
+### `list_tasks`: rendering and the cursor (#350)
+
+- **One server-authored line per task**: `- [c] `` `path` ``:line`, then any
+  present dates, priority, the task's own tags, `under: <heading path>`, and
+  `text:` last. Text, heading and tags pass through `_one_line` (every
+  whitespace run, U+2028/9 and `\r` included, becomes one space), and the path
+  is rendered with every whitespace character other than U+0020 escaped
+  (`\n`, `\r`, `\t`, `\uXXXX`), so it stays exact and on one line — stricter
+  than `keyword_search`, which renders paths raw (L9). A cut text reads
+  `text (cut at 1000 chars):`, a capped tag list `— tags cut`.
+- **The header is always there** and always states `shown`, `more` and three
+  owner-scoped note counts — `not yet scanned for tasks` (`extraction_version
+  < 4`), `tasks could not be indexed` (`tasks_failed`), `over the task cap`
+  (`tasks_truncated`) — each even at zero (#200's rule), plus `tasks with cut
+  tags` whenever `tags=` is given (conservative: tasks matching every other
+  filter whose tags were cut, any of which might have carried the tag). When
+  either of the first two is non-zero a closing `Incomplete list:` line says so.
+  Echoed filters are display only, cut at 64 characters.
+- **Bounded, with guaranteed progress.** The header (≤ 480) and the notice are
+  reserved first, then the footer (≤ 200), then rows are appended while each
+  fits `MAX_READ_RESPONSE_CHARS`. A first row that does not fit is rendered
+  **abbreviated** — dates and priority kept, tags and heading dropped with a
+  note, text cut to the room, the path cut around `…` only when it alone cannot
+  fit, the line ending `— abbreviated` — so every page with a match shows a row
+  and its cursor advances, down to the 1,000-character minimum cap.
+- **The cursor** is base64url JSON over the caller's own values:
+  `{"v":1,"o":…,"f":…,"d":…,"p" | "h":…,"l":…}`. `o` is 16 hex of
+  SHA-256(`owner:<uid>` / `owner:null`) — bound to the owner scope, not the
+  credential — and `f` 16 hex of the normalised filters (`limit` excluded); a
+  cursor whose `o` or `f` differs from the call's is refused, which is what
+  stops one tenant's boundary being applied to another's rows. `d` is never
+  null: an undated boundary is `infinity`, bound as `'infinity'::date`, the same
+  value the ORDER BY's `coalesce` produces, so the resume predicate
+  `(coalesce(due,'infinity'::date), file_path, line) > (CAST(:d AS date),
+  CAST(:p AS varchar), :l)` is never UNKNOWN. When the full form would not fit
+  the remaining room or the 2,048-character argument cap (a long non-ASCII
+  path), the compact form carries `h`, 32 hex of SHA-256 over the path's UTF-8,
+  resolved inside the call's snapshot against the caller's own rows; no match,
+  or more than one, is refused (L4). **No `notes_metadata.id` or other global
+  sequence value appears in a cursor or a line** — a forged cursor with a valid
+  `o` only moves its forger within their own rows, so it needs no MAC.
+- **One snapshot.** The compact resolution, the counts and the page run in one
+  `REPEATABLE READ, READ ONLY` transaction (#344's pattern), joined to
+  `notes_metadata` under `_note_owner_predicate` in the join condition.
 
 ### The link grammar every link consumer shares (#180)
 
