@@ -16,11 +16,11 @@
 
 ## 2. Export — D1, D3
 
-- [ ] 2.1 Write `scripts/search_eval_export.sql`. It contains `BEGIN TRANSACTION READ ONLY;`, then one `SELECT json_build_object(...)::text FROM usage_logs ul LEFT JOIN oauth_tokens ot ON ot.id = ul.oauth_token_id WHERE ul.tool IN ('keyword_search','semantic_search','read_note') AND ul.created_at >= now() - make_interval(days => :'days'::int) AND (:'user_id' = '' OR ul.user_id = NULLIF(:'user_id','')::int) ORDER BY ul.created_at, ul.id`, then `COMMIT;`.
+- [x] 2.1 Write `scripts/search_eval_export.sql`. It contains `BEGIN TRANSACTION READ ONLY;`, then one `SELECT json_build_object(...)::text FROM usage_logs ul LEFT JOIN oauth_tokens ot ON ot.id = ul.oauth_token_id WHERE ul.tool IN ('keyword_search','semantic_search','read_note') AND ul.created_at >= now() - make_interval(days => :'days'::int) AND (:'user_id' = '' OR ul.user_id = NULLIF(:'user_id','')::int) ORDER BY ul.created_at, ul.id`, then `COMMIT;`.
   - Use exactly the fields and params subset in design D1, including `grant_id` from `ot.grant_id` and the D10 provenance fields `user_filter` and `deployment_users` (`(SELECT count(*) FROM users)`).
   - `created_at` is epoch microseconds, as a bigint.
   - Add a header comment explaining why the file uses `-A -t` and not COPY.
-- [ ] 2.2 Add the Makefile target `search-eval-export`.
+- [x] 2.2 Add the Makefile target `search-eval-export`.
   - Variables: `SEARCH_EVAL_DIR ?= .search-eval`; `SEARCH_EVAL_DB_NAME ?= obsidian_mcp`; `DAYS ?= 90`, an integer from 1 to 365, else exit 64; `USER_ID ?=`, empty or an integer.
   - `mkdir -p` the directory, then `chmod 700` it.
   - Under `umask 077`, run `$(DB_EXEC) -i psql -U postgres -d $(SEARCH_EVAL_DB_NAME) -X -q -A -t -v ON_ERROR_STOP=1 -v days=… -v user_id=… < scripts/search_eval_export.sql > $(SEARCH_EVAL_DIR)/usage-export.jsonl.tmp`.

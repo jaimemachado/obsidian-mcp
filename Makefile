@@ -50,7 +50,7 @@ SCHEMA_TEST_CONTAINER ?= obsidian-mcp-schema-test
 SCHEMA_TEST_PORT ?= 55438
 SCHEMA_TEST_IMAGE ?= pgvector/pgvector:pg16
 
-.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-check db-vacuum-notes db-backup db-restore status check-no-backups-mount clean reindex reset-embeddings rebuild-tsvectors audit trivy test-schema test-integration concurrency-report
+.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-check db-vacuum-notes db-backup db-restore status check-no-backups-mount clean reindex reset-embeddings rebuild-tsvectors audit trivy test-schema test-integration concurrency-report search-eval-export
 
 help:
 	@echo "$(GREEN)Obsidian MCP Server$(NC)"
@@ -87,6 +87,7 @@ help:
 	@echo "  make reset-embeddings - Drop & recreate embedding column at configured dim"
 	@echo "  make rebuild-tsvectors - Recompute keyword index for FTS_CONFIGS and store snippet excerpts (no embeddings, no API calls)"
 	@echo "  make concurrency-report TARGET=queue|enforce [DAYS=n] [END=iso] - Concurrency readiness verdict (#188; exit 0 only on PASS)"
+	@echo "  make search-eval-export [DAYS=90] [USER_ID=id] - Read-only export of search/read_note usage rows into SEARCH_EVAL_DIR (#356; tenant data, 0700)"
 	@echo "  make status       - Show container and health status"
 	@echo "  make clean        - Remove containers and images"
 	@echo ""
@@ -497,6 +498,44 @@ concurrency-report:
 	fi
 	docker exec $(CONTAINER) python -m scripts.concurrency_report --target $(TARGET) \
 		$(if $(DAYS),--days $(DAYS)) $(if $(END),--end $(END))
+
+# The search-eval usage export (#356, design D1/D3/D9). One read-only
+# transaction, one SELECT (scripts/search_eval_export.sql), through the same
+# docker/db-exec.sh channel `make db-backup` uses, so it works for the docker
+# and cnpg backends without new credentials. The output is TENANT DATA (query
+# text and the paths agents read): it lands in a 0700 directory as a 0600
+# file, under umask 077, and `.search-eval/` is git-ignored. On a multi-user
+# deployment set USER_ID= to your own id for a report you will attach to a PR
+# (design D10). The file is written to `.tmp` and renamed into place only when
+# psql succeeds; on failure the `.tmp` is removed and an earlier export is left
+# untouched. DB_EXEC stays overridable from the command line: the integration
+# gate swaps in tests/integration/fixtures/local-db-exec.sh. DAYS is a
+# target-specific default so `make concurrency-report` keeps its own.
+SEARCH_EVAL_DIR ?= .search-eval
+SEARCH_EVAL_DB_NAME ?= obsidian_mcp
+USER_ID ?=
+search-eval-export: DAYS ?= 90
+
+search-eval-export:
+	@case "$(DAYS)" in ''|*[!0-9]*) echo "$(RED)Usage: DAYS must be an integer from 1 to 365 (got '$(DAYS)')$(NC)"; exit 64;; esac; \
+	if [ "$(DAYS)" -lt 1 ] || [ "$(DAYS)" -gt 365 ]; then \
+		echo "$(RED)Usage: DAYS must be an integer from 1 to 365 (got '$(DAYS)')$(NC)"; exit 64; \
+	fi; \
+	case "$(USER_ID)" in '') ;; *[!0-9]*) echo "$(RED)Usage: USER_ID must be empty or an integer (got '$(USER_ID)')$(NC)"; exit 64;; esac; \
+	mkdir -p "$(SEARCH_EVAL_DIR)" && chmod 700 "$(SEARCH_EVAL_DIR)" || exit 1; \
+	OUT="$(SEARCH_EVAL_DIR)/usage-export.jsonl"; \
+	umask 077; \
+	if $(DB_EXEC) -i psql -U postgres -d "$(SEARCH_EVAL_DB_NAME)" -X -q -A -t -v ON_ERROR_STOP=1 \
+			-v days=$(DAYS) -v user_id=$(USER_ID) < scripts/search_eval_export.sql > "$$OUT.tmp"; then \
+		chmod 600 "$$OUT.tmp" && mv -f "$$OUT.tmp" "$$OUT" || { rm -f "$$OUT.tmp"; exit 1; }; \
+		ROWS=$$(grep -c . "$$OUT" || true); \
+		echo "$(GREEN)Exported $$ROWS row(s) to $$OUT (last $(DAYS) days; $(if $(USER_ID),user $(USER_ID) only,all users))$(NC)"; \
+		echo "$(YELLOW)Tenant data: never commit it or paste it into an issue.$(NC)"; \
+	else \
+		rm -f "$$OUT.tmp"; \
+		echo "$(RED)Export FAILED: psql through DB_BACKEND=$(DB_BACKEND) returned non-zero; nothing was replaced$(NC)"; \
+		exit 1; \
+	fi
 
 status:
 	@echo "$(GREEN)Obsidian MCP Status:$(NC)"
