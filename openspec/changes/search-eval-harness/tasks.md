@@ -30,12 +30,12 @@
 
 ## 3. Mining and classification — D2, D5
 
-- [ ] 3.1 Create the `scripts/search_eval/` package with `__init__.py` and `__main__.py`.
+- [x] 3.1 Create the `scripts/search_eval/` package with `__init__.py` and `__main__.py`.
   - The CLI is argparse, with subcommands `mine`, `snapshot`, `run` and `score`.
   - Exit codes are 0/1/2/64.
   - Nothing in the package may import `src.*` at module scope. The DB-backed pieces import lazily.
-- [ ] 3.2 Write `classify(text) -> Literal["identifier","prose"]` in `scripts/search_eval/classify.py`, exactly as D5 defines it.
-- [ ] 3.3 Write `scripts/search_eval/mining.py`:
+- [x] 3.2 Write `classify(text) -> Literal["identifier","prose"]` in `scripts/search_eval/classify.py`, exactly as D5 defines it.
+- [x] 3.3 Write `scripts/search_eval/mining.py`:
   - `load_export(path)`: type-checks every field, counts malformed lines and never raises on them.
   - `principal_of(row)`: returns `("api_key", key_id)` if `key_id` is set, else `("oauth", grant_id)` if `grant_id` is set, else `None`, counted as `unresolved_principal`. It never falls back to `actor_ref`.
   - `usable_search(row)` and `usable_read(row)`: each returns `(ok, reason)`.
@@ -48,11 +48,11 @@
     - keep every exclusion counter.
 
     It is pure and does no I/O beyond what the caller passes in.
-- [ ] 3.4 Write the manual-judgment loader. Input is JSONL of `{user_id, text, folder?, tags?, frontmatter?, relevant: [path…], class?}`.
+- [x] 3.4 Write the manual-judgment loader. Input is JSONL of `{user_id, text, folder?, tags?, frontmatter?, relevant: [path…], class?}`.
   - Validate each line.
   - A manual query uses the same qid rule, gets `sources = {"manual"}` and a pool equal to its relevant set, and its explicit class overrides the classifier.
   - When a manual qid collides with a mined one, union the relevant paths and the pools, set `sources = {"mined","manual"}`, and count the query in `n_both_sources`.
-- [ ] 3.5 Wire the `mine` CLI: `--export FILE --out DIR [--window-seconds N] [--manual FILE] [--user-id N]`.
+- [x] 3.5 Wire the `mine` CLI: `--export FILE --out DIR [--window-seconds N] [--manual FILE] [--user-id N]`.
   - It writes `queries.jsonl`, `qrels.json` (canonical JSON) and `mine-report.json` with mode `0600`, and creates the out directory with mode `0700`.
   - It derives `provenance` per D10 and writes it into `mine-report.json`.
   - `--user-id` filters the rows in memory and counts as a user filter for provenance. It exists for the fixture's single-user assertion, and the operator path uses `USER_ID=` on the export.
