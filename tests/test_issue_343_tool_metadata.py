@@ -14,12 +14,35 @@ What an MCP client learns about a tool before calling it is exactly what
 - no description exceeds 4,000 characters on the wire, and the four longest
   lead with their contract;
 - the tool surface is otherwise unchanged: names, order, `inputSchema` and
-  `outputSchema` equal a fixture generated on `main` at 5a391ca.
+  `outputSchema` of the first 25 tools equal a fixture generated on `main` at
+  5a391ca (frozen), and every tool after them equals, in order,
+  `tests/fixtures/tools_list_schema_additions.json` (#350, design D12).
 
 Everything is read from the server's own registry (#89's reason): the string a
 client receives is the contract, not the module function a test might follow.
 
-Regenerating the fixture (only when a schema change is *intended*):
+Regenerating a fixture (only when a schema change is *intended*). The
+5a391ca fixture is frozen; a tool-adding change regenerates only the additions
+fixture, which holds every listed tool after the first 25 — `list_tasks` (#350)
+first. Run this with the additions fixture's path as the argument:
+
+    OLLAMA_URL=http://127.0.0.1:11434 .venv/bin/python - \
+        tests/fixtures/tools_list_schema_additions.json <<'EOF'
+    import asyncio, json, os, sys, tempfile
+    os.environ.setdefault("SECRET_KEY", "test")
+    os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://test:test@localhost/test")
+    os.environ.setdefault("VAULT_PATH", "/tmp/test-vault")
+    out = os.path.abspath(sys.argv[1])
+    sys.path.insert(0, os.getcwd()); os.chdir(tempfile.gettempdir())
+    from src.mcp_server.server import mcp
+    rows = [{"name": t.name, "inputSchema": t.inputSchema, "outputSchema": t.outputSchema}
+            for t in asyncio.run(mcp.list_tools())]
+    frozen = json.load(open(os.path.join(os.path.dirname(out), "tools_list_schema_5a391ca.json")))
+    assert [r["name"] for r in rows[:len(frozen)]] == [r["name"] for r in frozen]
+    json.dump(rows[len(frozen):], open(out, "w"), indent=2, sort_keys=True, ensure_ascii=False)
+    EOF
+
+The original command that produced the 5a391ca fixture, for the record:
 
     OLLAMA_URL=http://127.0.0.1:11434 .venv/bin/python - <<'EOF'
     import asyncio, json, os, sys, tempfile
@@ -57,19 +80,21 @@ from src.mcp_server.server import mcp  # noqa: E402
 from src.services import concurrency  # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "tools_list_schema_5a391ca.json"
+ADDITIONS = Path(__file__).resolve().parent / "fixtures" / "tools_list_schema_additions.json"
 
 DESCRIPTION_CAP = 4_000
 LEAD_CHARS = 1_500
 INSTRUCTIONS_CAP = 2_000
 INSTRUCTIONS_LEAD = 512
 
-# The fifteen tools that neither change vault bytes nor mint a capability. Named
+# The sixteen tools that neither change vault bytes nor mint a capability. Named
 # explicitly so a read tool added without annotations fails on its name, not
 # only on a count.
 READ_TOOLS = frozenset({
     "keyword_search", "semantic_search", "read_note", "list_notes", "get_tags",
     "get_recent", "get_vault_guide", "read_file", "list_files", "get_backlinks",
     "get_links", "get_neighborhood", "find_related", "find_orphans", "check_upload",
+    "list_tasks",  # #350
 })
 RESTRUCTURED_WRITE_TOOLS = ("edit_note", "move_note", "set_frontmatter")
 # The refusal statement is qualified in every description that makes one: the
@@ -160,8 +185,9 @@ def tool_shaped_references(text: str, words: frozenset[str]) -> set[str]:
 # ── 1. completeness ──────────────────────────────────────────────────────────
 
 
-def test_exactly_25_tools():
-    assert len(listed()) == 25
+def test_exactly_26_tools():
+    # 25 → 26: `list_tasks` (#350).
+    assert len(listed()) == 26
 
 
 @pytest.mark.parametrize("tool", listed(), ids=lambda t: t.name)
@@ -414,8 +440,15 @@ def test_read_note_leads_with_its_fields():
 
 @pytest.mark.asyncio
 async def test_names_order_and_schemas_match_the_5a391ca_fixture():
-    fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    frozen = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    additions = json.loads(ADDITIONS.read_text(encoding="utf-8"))
+    assert len(frozen) == 25
+    assert [row["name"] for row in additions][:1] == ["list_tasks"]
+    fixture = frozen + additions
     live = await mcp.list_tools()
+    # The first 25 are the frozen surface, in order; the rest the additions.
+    assert [t.name for t in live[:25]] == [row["name"] for row in frozen]
+    assert [t.name for t in live[25:]] == [row["name"] for row in additions]
     assert [t.name for t in live] == [row["name"] for row in fixture]
     for tool, row in zip(live, fixture):
         got_in = json.loads(json.dumps(tool.inputSchema, sort_keys=True))

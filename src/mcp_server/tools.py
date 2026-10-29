@@ -4,6 +4,7 @@ import binascii
 import copy
 import enum
 import errno
+import hashlib
 import inspect
 import json
 import logging
@@ -36,12 +37,15 @@ from src.auth.session import (
     current_user_id,
 )
 from src.config import (
+    LIST_TASKS_MAX_TAG_ARGS,
     MAX_CHUNKS_PER_NOTE,
     MAX_IMPORT_URL_CHARS,
     MAX_LINKS_PER_NOTE,
     MAX_MOVE_REWRITE_BYTES,
     MAX_NOTE_BYTES,
     MAX_SEARCH_QUERY_CHARS,
+    TASK_TAG_MAX_CHARS,
+    TASK_TEXT_MAX_CHARS,
     max_move_rewrite_sources,
     settings,
 )
@@ -7270,4 +7274,529 @@ async def delete_file_impl(
     return (
         f"Moved {rel} to {dest}. It is out of the vault's visible tree but still "
         "on disk; pass permanent=True to unlink instead."
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# list_tasks (#350, design D6–D8)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Reads `note_tasks` joined to `notes_metadata` under the total owner mapping,
+# never a file. One `REPEATABLE READ, READ ONLY` snapshot for the page, every
+# header count and the compact-cursor resolution. Every note-controlled field
+# is rendered through `_one_line` and the path through `_escape_task_path`, so
+# a note cannot forge a server-authored line (#344, Codex C-2). The response is
+# bounded by `MAX_READ_RESPONSE_CHARS` with an abbreviated first row, so every
+# page with a match renders one row and its cursor advances (D7).
+
+LIST_TASKS_STATUSES = ("open", "done", "cancelled", "all")
+LIST_TASKS_DEFAULT_LIMIT = 100
+LIST_TASKS_CURSOR_MAX_CHARS = 2048
+LIST_TASKS_CURSOR_VERSION = 1
+#: Fixed bounds of D7, each pinned by `tests/test_list_tasks_render.py`.
+LIST_TASKS_HEADER_MAX = 480
+LIST_TASKS_FOOTER_MAX = 200
+LIST_TASKS_ABBREVIATED_STRUCTURE_MAX = 120
+LIST_TASKS_ECHO_MAX = 64
+#: The path of an abbreviated row may use the room left for path and text
+#: minus this much, so some text always shows.
+_ABBREVIATED_TEXT_RESERVE = 40
+
+_ISO_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+_HEX32_RE = re.compile(r"[0-9a-f]{32}")
+_HEX16_RE = re.compile(r"[0-9a-f]{16}")
+_PATH_ESCAPE_RE = re.compile(r"[^\S ]")
+
+_CURSOR_FOREIGN = (
+    "list_tasks: cursor does not belong to this query; start without one."
+)
+_CURSOR_GONE = (
+    "list_tasks: the note this cursor stopped at is no longer indexed; start "
+    "without a cursor."
+)
+
+
+class _TaskCursorRefused(Exception):
+    def __init__(self, prose: str):
+        super().__init__(prose)
+        self.prose = prose
+
+
+def _task_owner_discriminator(uid: int | None) -> str:
+    """`o`: bound to the owner scope, never to a credential, and no raw id."""
+    scope = "owner:null" if uid is None else f"owner:{uid}"
+    return hashlib.sha256(scope.encode("utf-8")).hexdigest()[:16]
+
+
+def _task_filters_digest(
+    folder: str | None,
+    status: str,
+    due_by: str | None,
+    scheduled_by: str | None,
+    tags: list[str] | None,
+) -> str:
+    """`f`: the call's normalised filters (`limit` excluded)."""
+    normalised = json.dumps(
+        {
+            "folder": folder or "",
+            "status": status,
+            "due_by": due_by or "",
+            "scheduled_by": scheduled_by or "",
+            "tags": sorted(set(tags or [])),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(normalised.encode("utf-8")).hexdigest()[:16]
+
+
+def _task_path_hash(path: str) -> str:
+    """`h`: the first 32 hex of SHA-256 over the path's UTF-8 bytes — the
+    same expression the compact-cursor resolution evaluates in SQL."""
+    return hashlib.sha256(path.encode("utf-8")).hexdigest()[:32]
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def encode_task_cursor(*, owner: str, filters: str, due_key: str, path: str,
+                       line: int, compact: bool) -> str:
+    """The `next` token (design D8): full form carries the path, compact form
+    its hash. Never a `notes_metadata.id`."""
+    payload: dict = {"v": LIST_TASKS_CURSOR_VERSION, "o": owner, "f": filters,
+                     "d": due_key}
+    if compact:
+        payload["h"] = _task_path_hash(path)
+    else:
+        payload["p"] = path
+    payload["l"] = line
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return _b64url(raw.encode("utf-8"))
+
+
+def decode_task_cursor(token: str, *, owner: str, filters: str) -> dict:
+    """Validate a `next` token. Returns `{"d", "l", "p" | "h"}`; raises
+    `_TaskCursorRefused` on any failure (D8's checks, in full)."""
+    try:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", token or ""):
+            raise ValueError("alphabet")
+        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, binascii.Error, UnicodeDecodeError):
+        raise _TaskCursorRefused(_CURSOR_FOREIGN) from None
+    if not isinstance(payload, dict):
+        raise _TaskCursorRefused(_CURSOR_FOREIGN)
+    keys = set(payload)
+    if keys not in ({"v", "o", "f", "d", "p", "l"}, {"v", "o", "f", "d", "h", "l"}):
+        raise _TaskCursorRefused(_CURSOR_FOREIGN)
+    v, o, f, d, line = (payload[k] for k in ("v", "o", "f", "d", "l"))
+    if type(v) is not int or v != LIST_TASKS_CURSOR_VERSION:
+        raise _TaskCursorRefused(_CURSOR_FOREIGN)
+    if not (isinstance(o, str) and _HEX16_RE.fullmatch(o)) or not (
+        isinstance(f, str) and _HEX16_RE.fullmatch(f)
+    ):
+        raise _TaskCursorRefused(_CURSOR_FOREIGN)
+    if not isinstance(d, str) or (d != "infinity" and _parse_iso_date(d) is None):
+        raise _TaskCursorRefused(_CURSOR_FOREIGN)
+    if type(line) is not int or not 1 <= line <= 2_147_483_647:
+        raise _TaskCursorRefused(_CURSOR_FOREIGN)
+    out: dict = {"d": d, "l": line}
+    if "p" in payload:
+        p = payload["p"]
+        if not isinstance(p, str) or not p or len(p) > MAX_PATH_CHARS:
+            raise _TaskCursorRefused(_CURSOR_FOREIGN)
+        out["p"] = p
+    else:
+        h = payload["h"]
+        if not isinstance(h, str) or not _HEX32_RE.fullmatch(h):
+            raise _TaskCursorRefused(_CURSOR_FOREIGN)
+        out["h"] = h
+    # The binding checks: another owner's boundary, or another query's.
+    if o != owner or f != filters:
+        raise _TaskCursorRefused(_CURSOR_FOREIGN)
+    return out
+
+
+def _parse_iso_date(value: str):
+    import datetime as _dt
+
+    if not isinstance(value, str) or not _ISO_DATE_RE.fullmatch(value):
+        return None
+    try:
+        return _dt.date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _escape_task_path(path: str) -> str:
+    """The path, exact and on one line: every whitespace character other than
+    U+0020 — each one `_one_line` would collapse — is shown as an escape."""
+    def _esc(m: re.Match) -> str:
+        ch = m.group(0)
+        return {"\n": "\\n", "\r": "\\r", "\t": "\\t"}.get(ch, f"\\u{ord(ch):04x}")
+
+    return _PATH_ESCAPE_RE.sub(_esc, path)
+
+
+def _cut_escaped_path(path: str, room: int) -> str:
+    """First and last characters of the escaped path around `…`, at most
+    `room` characters, never splitting an escape."""
+    pieces = [_escape_task_path(ch) for ch in path]
+    budget = max(room - 1, 2)
+    head: list[str] = []
+    tail: list[str] = []
+    used = 0
+    i, j = 0, len(pieces) - 1
+    take_head = True
+    while i <= j:
+        piece = pieces[i] if take_head else pieces[j]
+        if used + len(piece) > budget:
+            break
+        used += len(piece)
+        if take_head:
+            head.append(piece)
+            i += 1
+        else:
+            tail.append(piece)
+            j -= 1
+        take_head = not take_head
+    return "".join(head) + "…" + "".join(reversed(tail))
+
+
+def _echo(value: str) -> str:
+    shown = _one_line(value)
+    if len(shown) > LIST_TASKS_ECHO_MAX:
+        shown = shown[: LIST_TASKS_ECHO_MAX - 1] + "…"
+    return shown
+
+
+def render_task_header(*, status: str, folder: str | None, due_by: str | None,
+                       scheduled_by: str | None, tags: list[str] | None,
+                       shown: int, more: bool, not_scanned: int, failed: int,
+                       capped: int, cut_tags: int | None) -> str:
+    parts = [f"Tasks — status: {status}"]
+    if folder:
+        parts.append(f"folder: {_echo(folder)}")
+    if due_by:
+        parts.append(f"due by: {_echo(due_by)}")
+    if scheduled_by:
+        parts.append(f"scheduled by: {_echo(scheduled_by)}")
+    if tags:
+        parts.append(f"tags: {_echo(' '.join('#' + t for t in tags))}")
+    parts += [
+        f"shown: {shown}",
+        f"more: {'yes' if more else 'no'}",
+        f"not yet scanned for tasks: {not_scanned} notes",
+        f"tasks could not be indexed: {failed} notes",
+        f"over the task cap: {capped} notes",
+    ]
+    if cut_tags is not None:
+        parts.append(f"tasks with cut tags: {cut_tags}")
+    return " — ".join(parts)
+
+
+def render_incomplete_notice(not_scanned: int, failed: int) -> str | None:
+    """The closing notice when the list is known to be incomplete."""
+    reasons = []
+    if not_scanned:
+        reasons.append("some notes are not yet scanned for tasks")
+    if failed:
+        reasons.append("some notes' tasks could not be indexed")
+    if not reasons:
+        return None
+    return "Incomplete list: " + " and ".join(reasons) + " (counted above)."
+
+
+def _task_fields(row) -> list[str]:
+    fields = []
+    for label, value in (("due", row["due"]), ("scheduled", row["scheduled"]),
+                         ("start", row["start"]), ("done", row["done_on"])):
+        if value is not None:
+            fields.append(f"{label} {value.isoformat()}")
+    if row["priority"]:
+        fields.append(f"priority {row['priority']}")
+    return fields
+
+
+def render_task_row(row) -> str:
+    """One server-authored line for one task (design D7)."""
+    head = f"- [{row['status_char']}] `{_escape_task_path(row['file_path'])}`:{row['line']}"
+    parts = [head, *_task_fields(row)]
+    if row["tags"]:
+        parts.append("tags " + " ".join("#" + _one_line(t) for t in row["tags"]))
+    if row["tags_cut"]:
+        parts.append("tags cut")
+    if row["heading_path"]:
+        parts.append(f"under: {_one_line(row['heading_path'])}")
+    label = (f"text (cut at {TASK_TEXT_MAX_CHARS} chars):" if row["text_cut"]
+             else "text:")
+    parts.append(f"{label} {_one_line(row['text'])}")
+    return " — ".join(parts)
+
+
+def render_abbreviated_task_row(row, room: int) -> str:
+    """A first row that does not fit in full (design D7): dates and priority
+    kept, tags and heading dropped with a note, text cut to the room, the path
+    cut around `…` only when it alone cannot fit. Ends `— abbreviated`."""
+    notes = []
+    if row["tags"]:
+        notes.append("tags omitted")
+    if row["heading_path"]:
+        notes.append("heading omitted")
+    escaped = _escape_task_path(row["file_path"])
+    marker = f"- [{row['status_char']}] "
+    line_part = f"`:{row['line']}"
+    fields = _task_fields(row)
+
+    def assemble(path_shown: str, path_cut: bool, text_shown: str, text_cut: bool) -> str:
+        parts = [marker + "`" + path_shown + line_part, *fields, *notes]
+        if path_cut:
+            parts.append("path cut")
+        label = "text (cut):" if text_cut else "text:"
+        parts.append(f"{label} {text_shown}")
+        parts.append("abbreviated")
+        return " — ".join(parts)
+
+    text = _one_line(row["text"])
+    skeleton = len(assemble("", True, "", True))
+    path_and_text = max(room - skeleton, 0)
+    path_cut = len(escaped) > path_and_text - _ABBREVIATED_TEXT_RESERVE
+    path_shown = (_cut_escaped_path(row["file_path"], max(path_and_text - _ABBREVIATED_TEXT_RESERVE, 3))
+                  if path_cut else escaped)
+    text_room = max(room - len(assemble(path_shown, path_cut, "", True)), 0)
+    text_cut = bool(row["text_cut"]) or len(text) > text_room
+    return assemble(path_shown, path_cut, text[:text_room], text_cut)
+
+
+def _task_due_key(due) -> str:
+    return "infinity" if due is None else due.isoformat()
+
+
+def render_task_results(rows: list, *, budget: int, header_args: dict,
+                        cursor_args: dict, more_rows: bool) -> str:
+    """The `list_tasks` response (design D7/D8), at most `budget` characters.
+
+    `rows` are the fetched rows in order (at most `limit`); `more_rows` says
+    whether the query had a row past them. The header and the closing notice
+    are reserved first, the footer room next, then rows are appended while
+    each fits; a first row that does not fit is rendered abbreviated.
+    """
+    worst_header = render_task_header(**{**header_args, "shown": 999, "more": True})
+    notice = render_incomplete_notice(header_args["not_scanned"], header_args["failed"])
+    fixed = len(worst_header) + (len(notice) + 1 if notice else 0)
+    # Room for rows before the footer: header + "\n" + rows… + "\n" + footer.
+    room = budget - fixed - 1 - LIST_TASKS_FOOTER_MAX - 1
+
+    rendered: list[str] = []
+    used = 0
+    last = None
+    stopped = False
+    for row in rows:
+        line = render_task_row(row)
+        cost = len(line) + 1
+        if used + cost <= room:
+            rendered.append(line)
+            used += cost
+            last = row
+            continue
+        stopped = True
+        if not rendered:
+            rendered.append(render_abbreviated_task_row(row, room - 1))
+            last = row
+        break
+    more = stopped or more_rows
+    if stopped and rendered and last is rows[-1] and not more_rows:
+        # The abbreviated or last row was the final match: nothing remains.
+        more = len(rendered) < len(rows)
+    header = render_task_header(**{**header_args, "shown": len(rendered), "more": more})
+    lines = [header, *rendered]
+    if notice:
+        lines.append(notice)
+    if more and last is not None:
+        so_far = len("\n".join(lines)) + 1
+        full = "next: " + encode_task_cursor(
+            **cursor_args, due_key=_task_due_key(last["due"]),
+            path=last["file_path"], line=last["line"], compact=False,
+        )
+        if len(full) - len("next: ") <= LIST_TASKS_CURSOR_MAX_CHARS and so_far + len(full) <= budget:
+            lines.append(full)
+        else:
+            lines.append("next: " + encode_task_cursor(
+                **cursor_args, due_key=_task_due_key(last["due"]),
+                path=last["file_path"], line=last["line"], compact=True,
+            ))
+    return "\n".join(lines)
+
+
+def _list_tasks_refusal(message: str) -> BodyOutcome:
+    return _body_refusal(message, "invalid_argument")
+
+
+@_tracked(
+    "list_tasks",
+    ["folder", "status", "due_by", "scheduled_by", "tags", "limit", "cursor"],
+    arg_char_caps={"cursor": LIST_TASKS_CURSOR_MAX_CHARS, "folder": MAX_PATH_CHARS},
+)
+async def list_tasks_impl(
+    folder: str | None = None,
+    status: str = "open",
+    due_by: str | None = None,
+    scheduled_by: str | None = None,
+    tags: list[str] | None = None,
+    limit: int = LIST_TASKS_DEFAULT_LIMIT,
+    cursor: str | None = None,
+) -> str:
+    """Checkbox tasks from the index (#350). See `server.list_tasks`."""
+    from sqlalchemy import Date, Integer, String, and_, bindparam, cast, func, select
+    from src.models.db import NoteMetadata, NoteTask
+    from src.services.filters import folder_prefix_clause
+    from src.services.tasks import TASKS_SINCE_EXTRACTION_VERSION
+
+    # ── argument validation, before any query ──────────────────────────────
+    if status not in LIST_TASKS_STATUSES:
+        return _list_tasks_refusal(
+            f"list_tasks: status must be one of {', '.join(LIST_TASKS_STATUSES)} "
+            f"(got {_echo(str(status))!r})."
+        )
+    dates = {}
+    for name, value in (("due_by", due_by), ("scheduled_by", scheduled_by)):
+        if value is None:
+            continue
+        parsed = _parse_iso_date(value)
+        if parsed is None:
+            return _list_tasks_refusal(
+                f"list_tasks: {name} must be a YYYY-MM-DD date "
+                f"(got {_echo(str(value))!r})."
+            )
+        dates[name] = parsed
+    wanted_tags: list[str] = []
+    if tags is not None:
+        if not isinstance(tags, list) or len(tags) > LIST_TASKS_MAX_TAG_ARGS:
+            return _list_tasks_refusal(
+                f"list_tasks: tags accepts at most {LIST_TASKS_MAX_TAG_ARGS} entries."
+            )
+        for entry in tags:
+            if not isinstance(entry, str):
+                return _list_tasks_refusal("list_tasks: every tags entry must be a string.")
+            stripped = entry[1:] if entry.startswith("#") else entry
+            if not 1 <= len(stripped) <= TASK_TAG_MAX_CHARS:
+                return _list_tasks_refusal(
+                    f"list_tasks: each tags entry must be 1 to {TASK_TAG_MAX_CHARS} "
+                    "characters after a leading '#' is removed."
+                )
+            wanted_tags.append(stripped)
+    limit = _clamp_limit(limit)
+    folder = folder or None
+    uid = current_user_id.get()
+    owner = _task_owner_discriminator(uid)
+    filters = _task_filters_digest(folder, status, due_by, scheduled_by, wanted_tags)
+    boundary = None
+    if cursor:
+        try:
+            boundary = decode_task_cursor(cursor, owner=owner, filters=filters)
+        except _TaskCursorRefused as e:
+            return _list_tasks_refusal(e.prose)
+
+    owner_pred = _note_owner_predicate(uid)
+    join_on = and_(NoteMetadata.id == NoteTask.note_id, owner_pred)
+
+    def scoped(stmt, *, with_tags: bool):
+        if folder:
+            stmt = stmt.where(folder_prefix_clause(folder))
+        if status != "all":
+            stmt = stmt.where(NoteTask.state == status)
+        if "due_by" in dates:
+            stmt = stmt.where(NoteTask.due <= dates["due_by"])
+        if "scheduled_by" in dates:
+            stmt = stmt.where(NoteTask.scheduled <= dates["scheduled_by"])
+        if with_tags and wanted_tags:
+            stmt = stmt.where(NoteTask.tags.contains(wanted_tags))
+        return stmt
+
+    infinity = cast(bindparam("inf", "infinity", type_=String), Date)
+    sort_due = func.coalesce(NoteTask.due, infinity)
+
+    async with async_session() as session:
+        # One snapshot for the page, the counts and the cursor (#344's pattern).
+        await session.execute(
+            text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        )
+        if boundary is not None and "h" in boundary:
+            matches = (await session.execute(
+                select(NoteMetadata.file_path).where(
+                    owner_pred,
+                    func.substr(
+                        func.encode(
+                            func.sha256(func.convert_to(NoteMetadata.file_path, "UTF8")),
+                            "hex",
+                        ),
+                        1,
+                        32,
+                    ) == boundary["h"],
+                ).limit(2)
+            )).scalars().all()
+            if len(matches) != 1:
+                return _list_tasks_refusal(_CURSOR_GONE)
+            boundary["p"] = matches[0]
+
+        not_scanned = (await session.execute(
+            select(func.count()).select_from(NoteMetadata).where(
+                owner_pred,
+                NoteMetadata.extraction_version < TASKS_SINCE_EXTRACTION_VERSION,
+            )
+        )).scalar_one()
+        note_counts = select(
+            func.count().filter(NoteMetadata.tasks_failed.is_(True)),
+            func.count().filter(NoteMetadata.tasks_truncated.is_(True)),
+        ).select_from(NoteMetadata).where(owner_pred)
+        if folder:
+            note_counts = note_counts.where(folder_prefix_clause(folder))
+        failed, capped = (await session.execute(note_counts)).one()
+        cut_tags = None
+        if wanted_tags:
+            cut_tags = (await session.execute(
+                scoped(
+                    select(func.count()).select_from(NoteTask).join(NoteMetadata, join_on),
+                    with_tags=False,
+                ).where(NoteTask.tags_cut.is_(True))
+            )).scalar_one()
+
+        page = scoped(
+            select(
+                NoteTask.status_char, NoteMetadata.file_path, NoteTask.line,
+                NoteTask.due, NoteTask.scheduled, NoteTask.start, NoteTask.done_on,
+                NoteTask.priority, NoteTask.tags, NoteTask.tags_cut,
+                NoteTask.heading_path, NoteTask.text, NoteTask.text_cut,
+            ).select_from(NoteTask).join(NoteMetadata, join_on),
+            with_tags=True,
+        )
+        if boundary is not None:
+            page = page.where(
+                text(
+                    "(coalesce(note_tasks.due, 'infinity'::date), "
+                    "notes_metadata.file_path, note_tasks.line) > "
+                    "(CAST(:cd AS date), CAST(:cp AS varchar), :cl)"
+                ).bindparams(
+                    bindparam("cd", boundary["d"], type_=String),
+                    bindparam("cp", boundary["p"], type_=String),
+                    bindparam("cl", boundary["l"], type_=Integer),
+                )
+            )
+        page = page.order_by(sort_due, NoteMetadata.file_path, NoteTask.line).limit(limit + 1)
+        fetched = [dict(r._mapping) for r in (await session.execute(page)).all()]
+
+    more_rows = len(fetched) > limit
+    rows = fetched[:limit]
+    return render_task_results(
+        rows,
+        budget=settings.max_read_response_chars,
+        header_args=dict(
+            status=status, folder=folder, due_by=due_by, scheduled_by=scheduled_by,
+            tags=wanted_tags, not_scanned=not_scanned, failed=failed, capped=capped,
+            cut_tags=cut_tags,
+        ),
+        cursor_args=dict(owner=owner, filters=filters),
+        more_rows=more_rows,
     )

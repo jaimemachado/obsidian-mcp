@@ -264,6 +264,8 @@ async def test_an_on_disk_rename_keeps_the_tasks_under_the_new_path(sessionmaker
     after = await note(sessionmaker, "new.md")
     assert after.id == before.id, "the pass's id-preserving move"
     assert await tasks_of(sessionmaker, "new.md") == ["follow me"]
+    out = await tools.list_tasks_impl()
+    assert "`new.md`:1" in out and "old.md" not in out
 
 
 async def test_move_note_keeps_the_tasks(sessionmaker, vault):
@@ -274,7 +276,8 @@ async def test_move_note_keeps_the_tasks(sessionmaker, vault):
     assert "Moved" in str(result)
     after = await note(sessionmaker, "Moved/m.md")
     assert after.id == before.id
-    assert await tasks_of(sessionmaker, "Moved/m.md") == ["carried"]
+    out = await tools.list_tasks_impl()
+    assert "`Moved/m.md`:1" in out and "`m.md`" not in out
     await indexer.index_vault()
     assert await tasks_of(sessionmaker, "Moved/m.md") == ["carried"]
 
@@ -302,6 +305,7 @@ async def test_the_v3_to_v4_backfill_stamps_4_and_re_embeds_nothing(
         await session.execute(text("DELETE FROM note_tasks"))
         await session.execute(text("UPDATE notes_metadata SET extraction_version = 3"))
         await session.commit()
+    assert "not yet scanned for tasks: 1 notes" in await tools.list_tasks_impl()
 
     async def unexpected(_chunks):
         pytest.fail("the version-4 bump must not call the embedding provider")
@@ -313,6 +317,7 @@ async def test_the_v3_to_v4_backfill_stamps_4_and_re_embeds_nothing(
     assert after.extraction_version == 4
     assert after.embedded_content_hash == before.embedded_content_hash == after.content_hash
     assert await tasks_of(sessionmaker, "old.md") == ["backfilled"]
+    assert "not yet scanned for tasks: 0 notes" in await tools.list_tasks_impl()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -339,6 +344,9 @@ async def test_the_periodic_pass_commits_around_a_failing_task_derivation(
     assert "n07.md" in await keyword(sessionmaker, "word7")
     read = await tools.read_note_impl("n07.md")
     assert read.error is None
+    out = await tools.list_tasks_impl(limit=500)
+    assert "tasks could not be indexed: 1 notes" in out
+    assert "Incomplete list:" in out
 
 
 async def test_the_startup_pass_applies_the_same_isolation(sessionmaker, vault, monkeypatch):
@@ -438,6 +446,7 @@ async def test_a_task_cap_is_marked_and_is_not_a_skip(sessionmaker, vault, monke
     row = await note(sessionmaker, "big.md")
     assert row.tasks_truncated is True
     assert await tasks_of(sessionmaker, "big.md") == ["t0", "t1", "t2"]
+    assert "over the task cap: 1 notes" in await tools.list_tasks_impl()
     write(vault, "big.md", "- [ ] t0\n")
     await indexer.index_vault()
     assert (await note(sessionmaker, "big.md")).tasks_truncated is False
