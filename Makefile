@@ -371,9 +371,9 @@ test-integration:
 BACKUP_RETAIN_DAYS ?= 30
 BACKUP_RETAIN_MIN ?= 7
 #
-# Five tables are a cache of the vault plus settings and are rebuilt by the
-# indexer after a restore (#348): the index pass rewrites `notes_metadata` and
-# `note_links`, the embed pass refills `note_embeddings`, `indexer_runs` is
+# Six tables are a cache of the vault plus settings and are rebuilt by the
+# indexer after a restore (#348): the index pass rewrites `notes_metadata`,
+# `note_links` and `note_tasks` (#350), the embed pass refills `note_embeddings`, `indexer_runs` is
 # display history nothing reads for a decision, and `indexer_state`'s
 # fingerprints are re-adopted at startup when absent. Their rows are the bulk
 # of every dump (one 1024-dim vector per chunk), so the default dump carries
@@ -386,7 +386,7 @@ BACKUP_RETAIN_MIN ?= 7
 # concurrency evidence — and are always dumped. The same list is written out
 # in deploy/kubernetes/components/db-backup/configmap.yaml, and
 # tests/test_backup_derived_tables.py pins both against src/models/db.py.
-BACKUP_DERIVED_TABLES := notes_metadata note_embeddings note_links indexer_runs indexer_state
+BACKUP_DERIVED_TABLES := notes_metadata note_embeddings note_links note_tasks indexer_runs indexer_state
 BACKUP_EXCLUDE_DATA = $(if $(filter-out 0,$(BACKUP_FULL)),,$(foreach t,$(BACKUP_DERIVED_TABLES),--exclude-table-data=$(t)))
 BACKUP_MODE_NOTE = $(if $(filter-out 0,$(BACKUP_FULL)),$(YELLOW)Full dump (BACKUP_FULL set): derived index tables included$(NC),Derived index tables ($(BACKUP_DERIVED_TABLES)) dumped schema-only; the indexer rebuilds them after a restore. BACKUP_FULL=1 dumps their rows too.)
 

@@ -342,6 +342,12 @@ _NOTE_STAT_COLUMN_MARKER = (
 _DERIVED_UNDER_COLUMN_MARKER = "re-derive progress digest (030_note_derived_under)"
 # Byte identical to `MARKER` in `alembic/versions/031_keyword_head_and_excerpt.py`.
 _BODY_EXCERPT_COLUMN_MARKER = "keyword excerpt (031_keyword_head_and_excerpt)"
+# Migration 032's markers (#350). Byte identical to `TABLE_MARKER`,
+# `TRUNCATED_MARKER` and `FAILED_MARKER` in `alembic/versions/032_note_tasks.py`;
+# declared as the table and column comments so `alembic check` compares them.
+_NOTE_TASKS_TABLE_MARKER = "task rows derived per note (032_note_tasks)"
+_TASKS_TRUNCATED_COLUMN_MARKER = "task-extraction truncation marker (032_note_tasks)"
+_TASKS_FAILED_COLUMN_MARKER = "task-derivation failure marker (032_note_tasks)"
 # The all-or-none CHECK over those four columns. The predicate is the
 # migration's `STAT_PREDICATE`, byte for byte.
 _NOTE_STAT_CHECK_NAME = "ck_notes_metadata_stat_all_or_none"
@@ -492,6 +498,29 @@ class NoteMetadata(Base):
         nullable=False,
         server_default=text("false"),
         comment=_CHUNKS_TRUNCATED_COLUMN_MARKER,
+    )
+    # Set when this note's task extraction hit `MAX_TASKS_PER_NOTE` and the
+    # pass stored only the first N tasks in document order; cleared when a
+    # later extraction completes under the cap. `links_truncated`'s lifecycle,
+    # for its reason: `list_tasks` counts capped notes in every header rather
+    # than presenting a capped set as complete (#350, migration 032).
+    tasks_truncated: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("false"),
+        comment=_TASKS_TRUNCATED_COLUMN_MARKER,
+    )
+    # Set when this note's task derivation failed on the attempt and on its
+    # one retry (design D4 of #350): its task rows are absent, and every
+    # `list_tasks` header counts it. **Not** a quarantine — the note's row,
+    # keyword vector, links and embeddings are untouched. Written only by the
+    # task stage, in the transaction of the attempt for the row's current
+    # hash, and cleared only by a later successful derivation.
+    tasks_failed: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("false"),
+        comment=_TASKS_FAILED_COLUMN_MARKER,
     )
     # Deferred with raise-on-load (#280, design D5). No read path renders the
     # tsvector: `keyword_search` uses it only server-side (`@@`, `ts_rank_cd`),
@@ -646,6 +675,69 @@ class NoteLink(Base):
         Index("ix_note_links_source", "source_note_id"),
         Index("ix_note_links_target", "target_note_id"),
         Index("ix_note_links_target_path", "target_path"),
+    )
+
+
+# The closed sets 032's CHECKs enforce, mirrored from the migration (which
+# pins its own copy) and from `src.services.tasks`.
+NOTE_TASK_STATES = ("open", "done", "cancelled")
+NOTE_TASK_PRIORITIES = ("highest", "high", "medium", "low", "lowest")
+# `NoteTask` has a column named `text`, which shadows `sqlalchemy.text` inside
+# its class body.
+_sql_text = text
+
+
+class NoteTask(Base):
+    """One checkbox list item of a note body (#350, migration 032).
+
+    Derived state with exactly `note_links`' lifecycle: written only by the
+    index pass, beside the link rebuild, in the transaction that wrote the
+    note's row. Keyed by `note_id` with **no path and no owner** (design D1):
+    both come from the note's row through the join, so a task row cannot
+    outlive or precede its note and follows an id-preserving move unwritten.
+    No relationship on `NoteMetadata` loads these.
+    """
+
+    __tablename__ = "note_tasks"
+    _TABLE_MARKER: ClassVar[str] = _NOTE_TASKS_TABLE_MARKER
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    note_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("notes_metadata.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    line: Mapped[int] = mapped_column(Integer, nullable=False)
+    status_char: Mapped[str] = mapped_column(String(1), nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    text_cut: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=_sql_text("false")
+    )
+    due: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    scheduled: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    start: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    done_on: Mapped[datetime.date | None] = mapped_column(Date, nullable=True)
+    priority: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    tags: Mapped[list[str] | None] = mapped_column(ARRAY(String(128)), nullable=True)
+    tags_cut: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=_sql_text("false")
+    )
+    heading_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("note_id", "line", name="uq_note_tasks_note_id_line"),
+        CheckConstraint(
+            "state IN (" + ", ".join(f"'{v}'" for v in NOTE_TASK_STATES) + ")",
+            name="ck_note_tasks_state",
+        ),
+        CheckConstraint(
+            "priority IN (" + ", ".join(f"'{v}'" for v in NOTE_TASK_PRIORITIES) + ")",
+            name="ck_note_tasks_priority",
+        ),
+        Index("ix_note_tasks_note", "note_id"),
+        Index("ix_note_tasks_state_due", "state", "due"),
+        {"comment": _NOTE_TASKS_TABLE_MARKER},
     )
 
 
