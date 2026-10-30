@@ -581,6 +581,14 @@ Two new BLOCKERs were found, both accepted and folded in.
 
 Declined: none.
 
+## Codex spec review, round 3 (2026-10-30)
+
+PASS — both round-2 fixes VERIFIED, no findings. B1 (`/health` exposes only the
+process-wide, non-volumetric `indexer.rechunk`, never a number) and B2 (one
+`IS DISTINCT FROM :CHUNKING_VERSION` predicate on every surface, with the
+higher-stamp rollback scenario) close their failing inputs and do not regress the
+round-1 fixes. Strict OpenSpec validation also passes.
+
 ## Accepted limitations
 
 - **L1** — During the transition, legacy and heading-era vectors of the same
