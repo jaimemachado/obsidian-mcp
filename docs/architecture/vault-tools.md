@@ -780,6 +780,9 @@ here is an extraction-version bump, like the fence and link grammars.
 
 ### `list_tasks`: rendering and the cursor (#350)
 
+- **What it reads**: `note_tasks` (migration 032), joined to `notes_metadata`
+  for the path and the owner, never a file; see "Task extraction (#350)" in
+  [indexing and embeddings](indexing-and-embeddings.md).
 - **One server-authored line per task**: `- [c] `` `path` ``:line`, then any
   present dates, priority, the task's own tags, `under: <heading path>`, and
   `text:` last. Text, heading and tags pass through `_one_line` (every

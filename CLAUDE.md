@@ -437,7 +437,8 @@ registration without them, on a description over 4,000 characters, and on a
 destructive set that drifts from the write bucket.
 
 **Search and read** — `keyword_search`, `semantic_search`, `read_note`,
-`list_notes`, `get_tags`, `get_recent`, `get_vault_guide`.
+`list_notes`, `get_tags`, `get_recent`, `get_vault_guide`, and `list_tasks`
+(see **Tasks** below).
 
 **Graph**
 - `get_backlinks(path, limit)` — notes that link TO `path` (resolved links only).
