@@ -1,22 +1,22 @@
 ## 0. Prerequisites
 
-- [ ] 0.1 Check the base: `git log --oneline` contains ed7d334 (change feed), `alembic/versions/033_content_changed_at.py` exists, and no `034_*` exists on `origin/main`. If a different 034 has landed, stop and renumber with the supervisor.
-- [ ] 0.2 Read `design.md` D1–D8, `docs/architecture/indexing-and-embeddings.md` (chunk-vector reuse D16, the chunk cap, the budget, the fingerprints, the generation lock), `vault-tools.md` "Section addressing" and "The fence grammar every consumer shares", `search.md` (#200 staleness, #280 projection, the harness), and `schema-and-migrations.md` (026/030/032 reconciliation shape).
+- [x] 0.1 Check the base: `git log --oneline` contains ed7d334 (change feed), `alembic/versions/033_content_changed_at.py` exists, and no `034_*` exists on `origin/main`. If a different 034 has landed, stop and renumber with the supervisor.
+- [x] 0.2 Read `design.md` D1–D8, `docs/architecture/indexing-and-embeddings.md` (chunk-vector reuse D16, the chunk cap, the budget, the fingerprints, the generation lock), `vault-tools.md` "Section addressing" and "The fence grammar every consumer shares", `search.md` (#200 staleness, #280 projection, the harness), and `schema-and-migrations.md` (026/030/032 reconciliation shape).
 
 ## 1. Schema: migration 034 and models
 
-- [ ] 1.0 Migration 034 also adds `notes_metadata.embedded_input_digest varchar(64)` (nullable, marked, no default, no backfill) under the same reconcile-or-refuse rules. Include it in every 1.x item below.
-- [ ] 1.1 `src/models/db.py`: `NoteEmbedding.heading_path` (`ARRAY(Text)`, nullable), `section_ordinal` (`Integer`, nullable) and `embed_prefix` (`Text`, nullable), each with its 034 marker comment; `ck_note_embeddings_heading_meta` in `__table_args__`. `NoteMetadata.embedded_chunking_version` (`SmallInteger`, nullable, marker) with `ck_notes_metadata_embedded_chunking_version`. Add a comment block pointing at design D4/D5.
-- [ ] 1.2 `alembic/versions/034_heading_chunks.py` (`revision="034"`, `down_revision="033"`), in the 030/032 shape.
+- [x] 1.0 Migration 034 also adds `notes_metadata.embedded_input_digest varchar(64)` (nullable, marked, no default, no backfill) under the same reconcile-or-refuse rules. Include it in every 1.x item below.
+- [x] 1.1 `src/models/db.py`: `NoteEmbedding.heading_path` (`ARRAY(Text)`, nullable), `section_ordinal` (`Integer`, nullable) and `embed_prefix` (`Text`, nullable), each with its 034 marker comment; `ck_note_embeddings_heading_meta` in `__table_args__`. `NoteMetadata.embedded_chunking_version` (`SmallInteger`, nullable, marker) with `ck_notes_metadata_embedded_chunking_version`. Add a comment block pointing at design D4/D5.
+- [x] 1.2 `alembic/versions/034_heading_chunks.py` (`revision="034"`, `down_revision="033"`), in the 030/032 shape.
   - Pin and assert `search_path`; set and `RESET` `lock_timeout` / `statement_timeout`.
   - Verify every pre-existing same-named column and constraint (type, nullability, no default, marker, exact CHECK definition), and refuse by name before changing anything.
   - Add the columns and comments. Add both CHECKs `NOT VALID`, then `VALIDATE`.
   - No backfill and no index.
   - `downgrade()`, in one transaction: `pg_advisory_xact_lock(8029183045093649969)` written literally; `UPDATE notes_metadata SET embedded_content_hash = NULL WHERE id IN (SELECT note_id FROM note_embeddings WHERE embed_prefix IS NOT NULL)`; `DELETE FROM note_embeddings WHERE embed_prefix IS NOT NULL`; then drop only the marked constraints and columns.
-- [ ] 1.3 Schema gate (`tests/integration/test_schema_check.py` and `make test-schema`).
+- [x] 1.3 Schema gate (`tests/integration/test_schema_check.py` and `make test-schema`).
   - Set `HEAD_REVISION = "034"`.
   - Cases: the fresh shape; the chain from 033 with existing rows, which stay all NULL with vectors untouched; the stamp-back re-run; an impostor of each column (wrong type, unmarked, defaulted) and of each CHECK; both CHECK definitions read through `pg_constraint` and validated; the downgrade's uncertify-and-delete, with mixed pre-034 and prefixed rows; and the downgrade→upgrade round trip with `alembic check` clean after both.
-- [ ] 1.4 Confirm `tests/integration/test_nonsuperuser_migrations_pg.py` passes unchanged, and that `tests/test_backup_derived_tables.py` needs no change (both tables are already derived).
+- [x] 1.4 Confirm `tests/integration/test_nonsuperuser_migrations_pg.py` passes unchanged, and that `tests/test_backup_derived_tables.py` needs no change (both tables are already derived).
 - [ ] 1.5 Run `make test-schema` (never concurrently with `make test-integration`), then `make db-check`: "No new upgrade operations detected".
 
 ## 2. Chunker (offline, `src/services/embeddings.py`)
