@@ -371,8 +371,13 @@ def score(data_dir: Path, arms: list[str] | None = None, *, baseline: str | None
     files = manifest.get("files") or {}
     runs_dir = data_dir / RUNS_DIR
 
+    # Every arm the complete manifest references is validated, not only the
+    # requested subset: a generation with a missing or altered file is not
+    # complete, whichever arms are scored from it.
+    if set(files) != set(manifest_arms):
+        raise UsageError(f"generation {gen} does not list exactly one file per arm")
     staged: dict[str, dict] = {}
-    for spec in arms:
+    for spec in manifest_arms:
         entry = files.get(spec)
         if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
             raise UsageError(f"generation {gen} lists no file for arm {spec!r}")

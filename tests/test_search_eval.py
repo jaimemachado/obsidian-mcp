@@ -798,6 +798,16 @@ def test_a_changed_run_file_or_a_reused_generation_is_refused(tmp_path, armmod):
         score(d, min_queries=1)
 
 
+def test_a_deleted_file_of_an_unrequested_arm_still_refuses_the_generation(tmp_path):
+    d = _fixture_pipeline(tmp_path / "f")
+    m = manifest_of(d)
+    (d / "runs" / m["files"]["fixture-lexical"]["path"]).unlink()
+    with pytest.raises(UsageError, match="fixture-lexical"):
+        score(d, ["fixture-title"], min_queries=1)
+    assert cli_main(["score", "--data", str(d), "--arm", "fixture-title",
+                     "--min-queries", "1"]) == EXIT_USAGE
+
+
 def test_output_is_deduplicated_and_truncated_in_order(tmp_path, armmod):
     d = tmp_path / "d"
     write_data(d, [{"text": "q", "relevant": ["B.md"]}], SNAP)
