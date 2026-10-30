@@ -90,7 +90,7 @@
 
 ## 5. Indexer: backlog, ordering, budget
 
-- [ ] 5.1 One predicate helper for "vectors not current", `embedded_content_hash IS DISTINCT FROM content_hash OR embedded_chunking_version IS DISTINCT FROM :cv`, shared by `_embed_vault_pinned`'s two SQL branches, `_vectors_not_current` in `src/control_panel/routes.py`, and anything else that counts pending. The helper is defined once (SQL text plus SQLAlchemy expression, with a test that they agree on a fixture table).
+- [ ] 5.1 One predicate helper for "vectors not current", `embedded_content_hash IS DISTINCT FROM content_hash OR embedded_chunking_version IS DISTINCT FROM :cv`, and one for "not re-chunked" (`embedded_chunking_version IS DISTINCT FROM :cv`, used by the response marker and the health state). A test greps `src/` for any `embedded_chunking_version <` or `>` comparison. Both are shared by `_embed_vault_pinned`'s two SQL branches, `_vectors_not_current` in `src/control_panel/routes.py`, and anything else that counts pending. The helper is defined once (SQL text plus SQLAlchemy expression, with a test that they agree on a fixture table).
 - [ ] 5.2 Backlog `ORDER BY`: content-stale first, then version-only, each `modified_at DESC`. The selected row carries a `version_only` flag.
 - [ ] 5.3 `EmbedBudget`: applied to version-only notes whatever `_active_scope_count`. Multi-scope passes keep applying it to both segments. At-least-one-note and note-boundary rules unchanged. The stop logs one WARNING per user per pass and is not a failure.
 - [ ] 5.4 Confirm the excluded branch and the `CERTIFIED_EMPTY` branch stamp the version through `certify_embedded`, and that the exclusion sweep's "certification-current" selection is unchanged (design D4: version-only rows are owned by the backlog).
@@ -101,7 +101,7 @@
 - [ ] 6.1 `semantic_search` (service) and `find_related_stmt` project `NoteEmbedding.heading_path` and `section_ordinal`, never `embed_prefix` or `embedding`. The result dict gains `section`, which is `None` when the row is stale or its path is NULL. Update the projection-identity tests (`test_perf_projection_identity_pg.py`) to the new column list.
 - [ ] 6.2 One renderer helper, `_section_locator(section) -> str`: ` · § <change_feed.quote(joined)> (#N)`, ` · § (top of note)`, or `""`; the 160-character path cut keeps the inner components behind `…/`. Use it in `semantic_search_impl` and `find_related_impl` on the result line, after `_degradation_suffix`.
 - [ ] 6.3 The services pass the uncut `chunk_text` (remove `semantic_search`'s `[:500]`). Add one helper, `_preview_line(text, limit=200)`: collapse each maximal `str.isspace()` run to one space, trim, escape the remaining C0/DEL/C1 as `\uXXXX`, then cut. Both renderers use it and keep their own ellipsis. Tests: 600 leading spaces then `answer`; U+001B and U+0085; a forged row.
-- [ ] 6.3a Transition marker: in both tools, run the vector query and an owner-scoped `SELECT count(*) FROM notes_metadata WHERE <owner> AND (embedded_chunking_version IS NULL OR embedded_chunking_version < :cv)` in one `REPEATABLE READ, READ ONLY` transaction. While the count is above zero, emit `index_transition: N notes not yet re-chunked; cross-generation ranking is approximate, re-run after the backlog drains` directly after the header, on every query-running path including empty results. Render tests: present, absent at 0, owner-scoped, on the empty path.
+- [ ] 6.3a Transition marker: in both tools, run the vector query and an owner-scoped `SELECT count(*) FROM notes_metadata WHERE <owner> AND embedded_chunking_version IS DISTINCT FROM :cv` (the one predicate of task 5.1; never `<`) in one `REPEATABLE READ, READ ONLY` transaction. While the count is above zero, emit `index_transition: N notes not yet re-chunked; cross-generation ranking is approximate, re-run after the backlog drains` directly after the header, on every query-running path including empty results. Render tests: present, absent at 0, owner-scoped, on the empty path.
 - [ ] 6.4 Docstrings in `src/mcp_server/server.py` for `semantic_search` and `find_related`: the locator's two forms, its omission on stale and pre-034 rows, and the `read_note(path, section="#N")` follow-up, in peer wording. Check the tools-list fixtures (`tools_list_schema_additions.json` and any description pins) and update only what the description change requires.
 - [ ] 6.5 Render tests:
   - both locator forms;
@@ -122,11 +122,12 @@
   - after convergence every row has a prefix and every note has version 1;
   - the backlog is empty and the pending count is zero.
 - [ ] 7.1a Transition membership (Codex r1 B1): with `limit=1`, legacy note A nearer than B before deploy, and a budget that re-embeds B on pass 1 and A on pass 2, assert:
-  - after pass 1 the response carries `index_transition:` whichever note it returns, and `/health` `indexer.rechunk_pending` is at least 1 with `status` `ok`;
-  - after pass 2 the line is absent and `rechunk_pending` is 0;
+  - after pass 1 the response carries `index_transition:` whichever note it returns, and `/health` reports `indexer.rechunk: "in_progress"` with `status` `ok` and no transition number in the body;
+  - after pass 2 the line is absent and `indexer.rechunk` is `"complete"`;
+  - rollback (Codex r2 B2): with `CHUNKING_VERSION` patched to 2, re-embed B and C, then patch it back to 1 with no schema downgrade. The marker counts B and C and stays until every note in scope is stamped 1. The backlog re-selects B and C, and no version-2 row is reused;
   - another tenant's legacy notes never add the line to this caller.
 
-  Implement `indexer_health`'s `rechunk_pending` as an in-process per-scope count set by each embed stage, summed for `/health`, never part of `status`.
+  Implement `indexer_health`'s per-scope count in process memory, set by each embed stage under the one predicate. `/health` exposes only `indexer.rechunk: "in_progress" | "complete"`, never the count, never in `status`. Document this privacy contract in `indexing-and-embeddings.md`, beside the existing "counts only, no path/error/user id" rule: the field is non-volumetric because `/health` is unauthenticated.
 - [ ] 7.2 Ordering and budget: with version-only notes pending and one edited note, the edited note is embedded first; single-user mode stops at the time budget at a note boundary with no run error.
 - [ ] 7.3 Reuse on PostgreSQL: append, inserted heading, tag change, and a reset racing the provider call (extend `test_perf_chunk_reuse_pg.py`).
 - [ ] 7.4 End-to-end parity: index a fixture vault, then for every stored row with ordinal N ≥ 1 call `read_note_impl(path, section="#N")` and assert the containment of design D1.

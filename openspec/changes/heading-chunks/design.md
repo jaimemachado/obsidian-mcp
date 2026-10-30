@@ -265,8 +265,14 @@ certifying branch: embedded, certified-empty and excluded.
   approximate, re-run after the backlog drains`. N is owner-scoped and read
   in the same `REPEATABLE READ, READ ONLY` transaction as the vector query.
   The line appears on the empty path too, and is absent at zero. `/health`
-  reports `indexer.rechunk_pending` as a count only, which never changes
-  `status`. The ranking itself is still mixed (L1). A wipe would have avoided
+  reports only `indexer.rechunk: "in_progress" | "complete"`, process-wide and
+  non-volumetric, because the endpoint is unauthenticated and a count would be
+  tenant-derived (Codex r2 B1). It never changes `status`. Exact per-owner
+  counts stay on the panel and in the owner-scoped marker. Every surface
+  (marker, backlog, dashboard, progress endpoint, health) uses one predicate,
+  `embedded_chunking_version IS DISTINCT FROM :CHUNKING_VERSION`. A rollback
+  to a lower version therefore re-selects and marks notes stamped higher
+  (Codex r2 B2). The ranking itself is still mixed (L1). A wipe would have avoided
   the mix but left semantic search returning nothing for hours, which is
   worse. A new ADDED requirement in embedding-providers states the boundary:
   model identity is global and refuses, while the chunking format is per note
@@ -499,7 +505,7 @@ fields hold no query text and no path.
   with `§`. Nothing is stale on account of the transition. Ranking is a mix of
   the two (L1), so every response carries the `index_transition: N …` line
   until the caller's scope has drained, and `/health` shows
-  `indexer.rechunk_pending`. The dashboard's pending count starts near the note count and
+  `indexer.rechunk: "in_progress"`. The dashboard's pending count starts near the note count and
   falls each pass. Each budget stop writes one WARNING per tenant per pass and
   no run error. `/health` stays `ok` unless the provider fails. Query embeddings
   share Ollama with the batches, so a search may wait up to one batch, about
@@ -560,6 +566,18 @@ accepted and folded in.
 | M2 | MAJOR | The follow-up scenario required raw-body containment, which a chunk spanning a removed fence cannot meet. | The scenario now uses fence-cleaned containment, the same contract as index-integrity and task 7.4, and still requires the ordinal to resolve to the correct raw section. |
 | m1 | MINOR | `_one_line` trims, contradicting "no other change", and the service cut at 500 before normalising. | The service passes the uncut chunk. The normalisation is defined exactly (collapse, trim, escape C0/C1/DEL, cut at 200), and the requirement and the `_preview_line` helper match. |
 | n1 | NIT | The repository's k3s bundle is `Recreate` with one replica and migrates in an init container, so it has no overlap. | L2 and the D4 note are rewritten so the window applies only to externally modified deployments. |
+
+Declined: none.
+
+## Codex spec review, round 2 (2026-10-30)
+
+FAIL on 59d6ece. All six round-1 fixes were VERIFIED (B1, B2, M1, M2, m1, n1).
+Two new BLOCKERs were found, both accepted and folded in.
+
+| # | Severity | Finding | Resolution |
+|---|---|---|---|
+| B1 | BLOCKER | `/health` is unauthenticated, and `indexer.rechunk_pending` was an exact, tenant-derived count. | The number is removed. `/health` carries only `indexer.rechunk: "in_progress" \| "complete"`, which is process-wide and non-volumetric. It never affects `status` or the HTTP code. Its privacy contract is documented beside the "counts only, no path/error/user id" rule (task 7.1a). Exact counts stay on the authenticated panel and in the owner-scoped `index_transition:` line. |
+| B2 | BLOCKER | The marker used `NULL or < CHUNKING_VERSION`, so after a Recreate rollback to a lower version, notes stamped higher read as complete while the backlog (`IS DISTINCT FROM`) still re-selected them. | One owner-scoped predicate everywhere: `embedded_chunking_version IS DISTINCT FROM :CHUNKING_VERSION`, for the marker, backlog, dashboard, progress endpoint and health state. Added the higher-stamp rollback scenario (version 2 re-embeds B and C, a rollback to 1 keeps the marker until every note matches, and the backlog re-selects B and C) and a grep test against `<`/`>` comparisons (tasks 5.1, 7.1a). |
 
 Declined: none.
 

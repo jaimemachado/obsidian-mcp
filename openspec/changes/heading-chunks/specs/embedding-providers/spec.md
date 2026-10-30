@@ -50,7 +50,7 @@ This is not the per-row model identity the fingerprint requirement forbids. That
 
 #### Scenario: A chunking bump does not refuse startup
 - **WHEN** a build with a higher `CHUNKING_VERSION` starts over an index whose stored fingerprint matches its configuration
-- **THEN** startup SHALL proceed silently and every note with a lower or NULL stamp SHALL be in the embed backlog
+- **THEN** startup SHALL proceed silently and every note whose stamp `IS DISTINCT FROM` the running version, whether lower, higher or NULL, SHALL be in the embed backlog
 
 #### Scenario: A model change still refuses
 - **WHEN** the configured model differs from the stored fingerprint's, whatever the chunking version

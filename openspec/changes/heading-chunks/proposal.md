@@ -56,7 +56,9 @@ change. It is a separate change after this one.
   and so the vector space, is unchanged, but mixed generations still change
   ranking. So while the caller's scope has notes on an older version, every
   vector-search response carries an `index_transition: N notes not yet
-  re-chunked; …` line, and `/health` reports `indexer.rechunk_pending` (D4).
+  re-chunked; …` line. `/health` reports only the non-volumetric `indexer.rechunk:
+  in_progress | complete`. Every surface uses one rollback-safe predicate,
+  `IS DISTINCT FROM CHUNKING_VERSION` (D4).
   Version-only notes
   are taken after content-changed notes and are always held to the per-tenant embed
   budget, so the re-embed runs in the background over several passes.
