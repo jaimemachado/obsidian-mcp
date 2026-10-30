@@ -890,6 +890,76 @@ deployment; on a compose-file deployment the equivalents are plain
   CVE scan) work from a checkout regardless of which compose file runs
   the container.
 
+### Measuring search quality
+
+Any change to the search path (ranking, chunking, the embedding model or
+provider, query parsing, fusion, a reranker) is measured with `make
+search-eval` on judgments mined from your own usage log: a search followed,
+within two minutes, by a successful `read_note` of one of the paths it
+returned, by the same API key or OAuth grant. The design and every rule are
+in [search](docs/architecture/search.md#search-evaluation-harness-356).
+`make search-eval` with no arguments runs on a committed synthetic fixture
+and needs nothing; the real run is this path, from a checkout with
+`requirements-dev.txt` installed:
+
+1. **Export.** `make search-eval-export [DAYS=90] USER_ID=<your user id>`.
+   It runs one read-only transaction holding one `SELECT` through the same
+   channel as `make db-backup` (`DB_BACKEND=docker` or `cnpg`, set in
+   `Makefile.local`), and writes the `keyword_search`, `semantic_search` and
+   `read_note` rows of the last `DAYS` days (1 to 365) to
+   `.search-eval/usage-export.jsonl` (`SEARCH_EVAL_DIR` to move it): a `0700`
+   directory, a `0600` file, git-ignored. **It is tenant data**: query text,
+   the paths agents read, owner ids. Never commit it, upload it or paste it
+   into an issue. On a multi-user deployment `USER_ID=` is required for a
+   report you will attach to a PR; an unfiltered export covers every user
+   and is for your private use only. `SEARCH_EVAL_DB_NAME` (default
+   `obsidian_mcp`, the name `make db-backup` dumps) names the database to
+   export from.
+2. **Back up with the derived tables.** `BACKUP_FULL=1 make db-backup`. The
+   default dump stores `notes_metadata` and `note_embeddings` as schema
+   only, and replay needs their rows.
+3. **Restore it into a scratch database**, never over the live one. For
+   example, on a throwaway pgvector container bound to loopback:
+
+   ```sh
+   docker run --rm -d --name omcp-eval -e POSTGRES_PASSWORD=<scratch password> \
+       -p 127.0.0.1:55499:5432 pgvector/pgvector:pg16
+   docker exec omcp-eval createuser -U postgres obsidian_mcp
+   docker exec omcp-eval createdb -U postgres eval_copy
+   gunzip -c <the backup>.sql.gz | docker exec -i omcp-eval psql -q -U postgres -d eval_copy
+   ```
+
+   `SEARCH_EVAL_DATABASE_URL` is then
+   `postgresql+asyncpg://postgres:<scratch password>@127.0.0.1:55499/eval_copy`.
+   It is the only replay target the harness documents; it never reads
+   `DATABASE_URL`.
+4. **Snapshot, before any candidate.**
+   `make search-eval-snapshot SEARCH_EVAL_DATA=.search-eval SEARCH_EVAL_DATABASE_URL=<scratch copy>`
+   records which indexed notes each arm can reach. Taken after a candidate
+   was applied, it would hide that candidate's lost notes as drift; the
+   harness cannot check the order. An existing snapshot is never replaced unless
+   you pass `FORCE=1`.
+5. **Apply the candidate to the copy**, if it changes indexed data (a
+   migration, a re-chunk, a re-embed).
+6. **Score.**
+   `make search-eval SEARCH_EVAL_DATA=.search-eval SEARCH_EVAL_DATABASE_URL=<scratch copy> ARMS="keyword semantic <candidate>" BASELINE=keyword`.
+   It mines the export (plus `.search-eval/manual.jsonl`, operator-written
+   judgments, when present), replays every arm against the copy and prints
+   a table; `report.json` lands next to the export. The built-in arms call
+   the server's own search services, so run it in an environment that
+   carries the server's search settings (`FTS_CONFIGS`, the embedding
+   provider settings, and a `SECRET_KEY`, which the settings module needs
+   to import). `MIN_QUERIES` (50) and `SEED` (0) are overridable.
+7. **Attach `report.json` to the PR only if it says `attachable: true`.** It
+   carries metrics, counts and hashes, no query text and no note paths. A
+   `CORPUS_LOSS` verdict means the candidate lost searchable notes for that
+   arm, and the run is not evidence. `INSUFFICIENT_DATA` means too few judged
+   queries for a verdict. A failed or running manifest means the run did not
+   finish: re-run it; `score` never falls back to an earlier run. There is no
+   pass/fail threshold: the reviewer reads the deltas against the baseline.
+
+Drop the scratch container afterwards (`docker rm -f omcp-eval`).
+
 ## Upgrading: split database roles
 
 **Who needs this:** a deployment from `docker-compose.simple.yml` or

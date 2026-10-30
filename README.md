@@ -306,6 +306,10 @@ the wire, so none is cut off by a client's description limit.
   could not be indexed, so an empty list is never a silent "nothing open"
 - `get_vault_guide()`, the Obsidian primer plus this vault's
   `CLAUDE.md`, served live
+- Retrieval changes are measured with `make search-eval` against
+  judgments mined from the operator's own usage log (a search followed by
+  a read of one of its results); see the
+  [search evaluation harness](docs/architecture/search.md#search-evaluation-harness-356)
 
 ### Read and write
 - `read_note(path, section?, offset=0, limit?)` returns a **structured

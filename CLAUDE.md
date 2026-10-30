@@ -71,6 +71,13 @@ hostnames) must stay out of tracked files. The mechanism:
 - `make test-schema` — schema gate: migrations vs. models on a throwaway
   pgvector container (run before any deploy that carries a migration)
 - `make audit` — pip-audit dependency scan
+- `make search-eval` — retrieval metrics on the synthetic fixture (no DB);
+  with `SEARCH_EVAL_DATA` / `SEARCH_EVAL_DATABASE_URL`, on judgments mined from
+  the usage log against a restored copy
+- `make search-eval-export` — read-only export of search/read rows into
+  `.search-eval/` (tenant data, git-ignored; `USER_ID=` for an attachable report)
+- `make search-eval-snapshot` — pre-candidate corpus snapshot of the restored
+  copy (see [search](docs/architecture/search.md#search-evaluation-harness-356))
 - `make reindex` / `make reset-embeddings` / `make rebuild-tsvectors` — index
   maintenance (see [indexing and embeddings](docs/architecture/indexing-and-embeddings.md))
 - `make db-backup` / `make db-restore` — database dump and restore
@@ -99,6 +106,8 @@ specific to this MCP server.
 | Schema drift | `make db-check` (`docker exec obsidian-mcp alembic check`) |
 | Schema gate (any change carrying a migration) | `make test-schema` |
 | Integration suite (real Postgres) | `make test-integration` |
+| Search-quality fixture | `make search-eval` |
+| Search eval (any search-path change) | `make search-eval-snapshot` then `make search-eval SEARCH_EVAL_DATA=.search-eval SEARCH_EVAL_DATABASE_URL=<restored BACKUP_FULL=1 copy>` — attach `report.json` only if `attachable: true` (`USER_ID=` export on multi-user), incumbent as `BASELINE`; `CORPUS_LOSS` invalidates |
 | Deploy | merge to `main` → CI → `image` workflow → Flux (homelab k3s); `make deploy` for a compose host |
 
 **`tests/integration/` skips itself without a database.** Those modules are
@@ -482,7 +491,7 @@ summaries.
 | [vault-roots-and-tenancy.md](docs/architecture/vault-roots-and-tenancy.md) | `APIKeyMiddleware`, `_vault_root`, owner predicates, publication confirmation, the vault-root overlap guard (`src/services/vault_overlap.py`, the snapshot, the five pass entry points) |
 | [vault-tools.md](docs/architecture/vault-tools.md) | any note or file tool: frontmatter, symlinks, anchored writes, section addressing, size caps |
 | [file-transfer.md](docs/architecture/file-transfer.md) | `src/transfer/`, `src/services/vault_fs.py`, the publish gate, SSRF policy, the write-bucket charge at redemption |
-| [search.md](docs/architecture/search.md) | `semantic_search` / `keyword_search` / `find_related` and every `SET LOCAL` they issue |
+| [search.md](docs/architecture/search.md) | `semantic_search` / `keyword_search` / `find_related` and every `SET LOCAL` they issue; `scripts/search_eval/` (the search evaluation harness) |
 | [indexing-and-embeddings.md](docs/architecture/indexing-and-embeddings.md) | the indexer loop, the embed pass, tsvector writers, provider abstraction |
 | [security-event-logging.md](docs/architecture/security-event-logging.md) | `src/logging_setup.py`, `src/services/security_events.py`, and any call site that logs a refusal: the field allow-list, the event catalogue, the suppressor |
 | [rate-limits.md](docs/architecture/rate-limits.md) | `src/services/rate_limits.py`, `src/services/concurrency.py`, `src/services/pool_budget.py`, `src/services/concurrency_counters.py`, `src/services/concurrency_readiness.py`, `src/services/refusals.py`, the pool subclass in `src/database.py`, the failed-auth budget in `APIKeyMiddleware`, the gate order in `_tracked`, the worker count, the key-creation budget and active-key cap (`src/services/api_keys.py`), and every `MCP_RATE_LIMIT_*` / `MCP_AUTH_FAILURE_*` / `MCP_CONCURRENCY_*` / `KEY_CREATION_*` / `KEY_MAX_ACTIVE_PER_ACCOUNT` / `DEFAULT_DAILY_REQUEST_LIMIT` setting |
