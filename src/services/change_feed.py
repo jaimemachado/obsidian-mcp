@@ -492,8 +492,8 @@ async def purge_scope(session, user_id: int) -> None:
 
 
 async def discard_scope(session, user_id: int | None) -> None:
-    """A provenance discard (D5): the previous root's events go with its rows,
-    the watermark rises to `last_seq` so an old cursor reads
+    """A provenance discard (D5): the previous root's events and durable gap
+    rows go with its rows, the watermark rises to `last_seq` so an old cursor reads
     `history_truncated`, and one `reset` line starts the new root's history.
     In the discard's own transaction; failures propagate (all or nothing)."""
     await lock_scope(session, user_id)
@@ -517,6 +517,10 @@ async def discard_scope(session, user_id: int | None) -> None:
         ),
         {"at": max(newest) if newest else None, **params},
     )
+    # A durable `write_failed` gap recorded under the previous root describes
+    # that root's events; consumed by the new root's next append it would
+    # claim the new feed is incomplete (Codex implementation review r1).
+    await session.execute(text(f"DELETE FROM note_event_gaps WHERE {owner}"), params)
     await append_events(session, user_id, [Event("reset")], source=SOURCE_INDEX,
                         bounded=False)
 
@@ -605,13 +609,19 @@ async def _prune_scope(session_factory, uid, cutoff, cap) -> int:
             if beyond is not None:
                 threshold = beyond
             if cutoff is not None:
-                aged = (await session.execute(
-                    text(f"SELECT max(seq) FROM note_events WHERE {owner} "
-                         "AND occurred_at < :cutoff"),
+                # The expired *prefix*: everything before the oldest event that
+                # has not expired. `occurred_at` is a transaction's start, not
+                # monotone in seq, so `max(seq) WHERE occurred_at < cutoff`
+                # could delete an unexpired event committed with a lower seq
+                # (Codex implementation review r1). A non-prefix row is never
+                # deleted, so `pruned_through_seq` stays a true watermark.
+                oldest_live = (await session.execute(
+                    text(f"SELECT min(seq) FROM note_events WHERE {owner} "
+                         "AND occurred_at >= :cutoff"),
                     {"cutoff": cutoff, **params},
                 )).scalar()
-                if aged is not None:
-                    threshold = aged if threshold is None else max(threshold, aged)
+                aged = newest if oldest_live is None else oldest_live - 1
+                threshold = aged if threshold is None else max(threshold, aged)
             if threshold is None:
                 await session.rollback()
                 return removed
