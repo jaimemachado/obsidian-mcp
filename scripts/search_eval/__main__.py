@@ -71,8 +71,8 @@ def _cmd_run(args) -> int:
     if outcome.exit_code == EXIT_OK:
         print(f"search-eval: generation {m['generation']} complete ({len(m['arms'])} arm(s))")
     else:
-        print(f"search-eval: generation {m['generation']} FAILED: {m.get('failed_arm')}: "
-              f"{m.get('error')}", file=sys.stderr)
+        print(f"search-eval: generation {m['generation']} FAILED ({m.get('error')})",
+              file=sys.stderr)
     return outcome.exit_code
 
 

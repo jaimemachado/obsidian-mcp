@@ -236,18 +236,27 @@ _HEX = re.compile(r"[0-9a-f]{16,64}")
 #: names); every other key is a fixed field name and is not checked.
 _DATA_KEYED = frozenset({"deltas", "options"})
 
+#: Values under these keys are produced by this code or supplied by the
+#: operator (the generation id, which `run` validates; arm labels; option
+#: keys and values). They are ordinary words and stamps, so a substring test
+#: against query text would refuse real data sets (a query `2026` inside a
+#: UTC-stamp generation, a query `hybrid` inside an arm label); they are
+#: checked for exact equality only.
+_EXACT_ONLY = frozenset({"generation", "arm", "baseline"})
 
-def _strings(value: Any, parent: str | None = None):
+
+def _strings(value: Any, parent: str | None = None, exact: bool = False):
+    """Yield `(string, exact_only)` for every string the report carries."""
     if isinstance(value, dict):
         for k, v in value.items():
             if parent in _DATA_KEYED:
-                yield k
-            yield from _strings(v, k)
+                yield k, True
+            yield from _strings(v, k, exact or parent == "options" or k in _EXACT_ONLY)
     elif isinstance(value, list):
         for v in value:
-            yield from _strings(v, parent)
+            yield from _strings(v, parent, exact)
     elif isinstance(value, str):
-        yield value
+        yield value, exact
 
 
 class ReportLeak(RuntimeError):
@@ -258,17 +267,20 @@ def assert_no_leak(serialized: str, texts: set[str], paths: set[str]) -> None:
     """No string in the report equals, or contains, a query text or a note path.
 
     Fixed vocabulary and hex digests are skipped: they are produced by this
-    code. Every other string (arm labels, option values, the generation) must
-    not equal any text or path, and must not contain any path or any text of
-    four or more characters.
+    code. The generation, arm labels and option keys and values must not
+    equal any text or path. Every other string must not equal any text or
+    path, and must not contain any path or any text of four or more
+    characters.
     """
     report = json.loads(serialized)
     long_texts = {t for t in texts if len(t) >= 4}
-    for s in _strings(report):
+    for s, exact_only in _strings(report):
         if s in _VOCABULARY or _HEX.fullmatch(s):
             continue
         if s in texts or s in paths:
             raise ReportLeak("the report would contain a query text or a note path")
+        if exact_only:
+            continue
         if any(p in s for p in paths) or any(t in s for t in long_texts):
             raise ReportLeak("the report would contain a query text or a note path")
 
@@ -337,7 +349,7 @@ def score(data_dir: Path, arms: list[str] | None = None, *, baseline: str | None
     gen = manifest.get("generation")
     status = manifest.get("status")
     if status != "complete":
-        detail = f": {manifest.get('failed_arm')}: {manifest.get('error')}" if status == "failed" else ""
+        detail = f" ({manifest.get('error')})" if status == "failed" else ""
         raise UsageError(f"generation {gen} is {status!r}{detail}; re-run `run` "
                          "(score never falls back to an earlier generation)")
     selection = manifest.get("selection") or {}

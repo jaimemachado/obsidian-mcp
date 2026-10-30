@@ -16,8 +16,9 @@ Order, which is the atomicity contract:
 4. Any exception from the engine, a factory or an arm, and any answer of the
    wrong type, aborts the whole run: there is no per-query catch, no "treat as
    empty" and no retry. The manifest is rewritten with `status: "failed"`, the
-   failing arm and the error (type and message, with the query text redacted),
-   and `run` exits 1. Staged files stay on disk, unreferenced.
+   failing arm and the error (the exception type and the arm label only; the
+   message, which can quote query text, is printed to stderr), and `run`
+   exits 1. Staged files stay on disk, unreferenced.
 5. Only after every arm answered every selected query is the manifest
    rewritten with `status: "complete"` and each staged file's sha256.
 
@@ -30,6 +31,7 @@ own `run` recorded on its own database.
 from __future__ import annotations
 
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -80,12 +82,6 @@ def _eval_query(q: dict) -> EvalQuery:
         tags=q["tags"], frontmatter=q["frontmatter"], query_class=q["class"],
         sources=frozenset(q["sources"]),
     )
-
-
-def _redact(message: str, text: str | None) -> str:
-    if text:
-        message = message.replace(text, "<query>")
-    return message[:300]
 
 
 def _loss(arm_membership: str, selected: list[str], data: DataDir, judged: dict[str, set[str]],
@@ -160,7 +156,6 @@ async def run_generation(
 
     engine = None
     current: ResolvedArm | None = None
-    current_text: str | None = None
     try:
         if needs_db:
             from scripts.search_eval.db import fetch_membership, open_readonly
@@ -175,7 +170,7 @@ async def run_generation(
         ensure_private_dir(gen_dir)
         files: dict[str, dict] = {}
         for arm in arms:
-            current, current_text = arm, None
+            current = arm
             meta = {
                 "arm": arm.spec, "label": arm.label, "membership": arm.membership,
                 "options": options, "depth": depth, "generation": generation,
@@ -201,7 +196,6 @@ async def run_generation(
                 runs = {}
                 for qid in selected:
                     q = data.queries[qid]
-                    current_text = q["text"]
                     out = await fn(_eval_query(q), depth)
                     if not isinstance(out, list) or not all(isinstance(p, str) for p in out):
                         raise ArmOutputError(
@@ -209,7 +203,6 @@ async def run_generation(
                             + ("" if not isinstance(out, list) else " with a non-string element")
                         )
                     runs[qid] = dedup(out)[:depth]
-                current_text = None
                 loss, before = _loss(arm.membership, selected, data, drift.judged, replay)
                 meta.update({"source": "replay", "corpus_loss": loss,
                              "unsearchable_before": before, "missing_queries": []})
@@ -221,11 +214,17 @@ async def run_generation(
         atomic_write(manifest_path, pretty_json(manifest))
         return RunOutcome(EXIT_OK, manifest)
     except Exception as e:  # noqa: BLE001 - any failure fails the generation
+        label = current.label if current is not None else None
+        # The manifest records the exception type and the arm only (D4): an
+        # exception message can quote query text. The full message goes to
+        # the operator's terminal and nowhere else.
+        print(f"search-eval: generation {generation} failed in arm {label}: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
         manifest = {
             **manifest,
             "status": "failed",
-            "failed_arm": current.label if current is not None else None,
-            "error": f"{type(e).__name__}: {_redact(str(e), current_text)}",
+            "failed_arm": label,
+            "error": f"{type(e).__name__} in arm {label}" if label else type(e).__name__,
         }
         atomic_write(manifest_path, pretty_json(manifest))
         return RunOutcome(EXIT_FAILURE, manifest)

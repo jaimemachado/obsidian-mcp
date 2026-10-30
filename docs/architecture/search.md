@@ -754,8 +754,8 @@ embedding-model trial as `runfile:<path>`, a staged arm file the harness's
 own `run` wrote on a re-embedded copy with the same qrels, snapshot and
 selection hashes, published by a complete manifest. Every `run` is a
 **generation**: `runs/manifest.json` is written `running` before any factory
-executes, rewritten `failed` (failing arm, exception type and message with
-the query text redacted, exit 1) on any exception or any answer that is not a
+executes, rewritten `failed` (the failing arm and the exception type only, since a
+message can quote query text; the message goes to stderr; exit 1) on any exception or any answer that is not a
 list of strings, and `complete` with every staged file's sha256 only after
 every arm answered every selected query. `score` reads only that manifest,
 never an earlier generation, and exits 64 unless it is complete and its

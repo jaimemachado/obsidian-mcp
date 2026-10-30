@@ -692,6 +692,37 @@ def _seventy(d: Path):
     write_data(d, [{"text": f"query number {i:02d}", "relevant": ["A.md"]} for i in range(70)], SNAP)
 
 
+def test_a_short_query_inside_a_default_generation_stamp_still_scores(tmp_path, armmod):
+    """A query `2026` and a UTC-stamp generation that contains its year (#356 review)."""
+    from scripts.search_eval.__main__ import _default_generation
+
+    generation = _default_generation()
+    year = generation[:4]
+    d = tmp_path / "d"
+    manual = tmp_path / "manual.jsonl"
+    manual.write_text("".join(json.dumps({"user_id": 1, "text": t, "relevant": ["A.md"]}) + "\n"
+                              for t in sorted({"2026", year})))
+    (tmp_path / "export.jsonl").write_text("")
+    write_mine(export=tmp_path / "export.jsonl", out=d, manual=manual)
+    (d / "corpus-snapshot.json").write_text(canonical_json(SNAP))
+    assert run(d, [f"{armmod}:fixed_a"], generation=generation).exit_code == EXIT_OK
+    res = score(d, min_queries=1)
+    assert res.exit_code == EXIT_OK
+    assert year in res.report["generation"]
+
+
+def test_an_arm_label_equal_to_a_query_text_trips_the_check(tmp_path, monkeypatch):
+    mod = tmp_path / "hybrid_mod.py"
+    mod.write_text(ARM_MODULE)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    d = tmp_path / "d"
+    write_data(d, [{"text": "hybrid_mod:fixed_a", "relevant": ["A.md"]}], SNAP)
+    assert run(d, ["hybrid_mod:fixed_a"]).exit_code == EXIT_OK
+    with pytest.raises(ReportLeak):
+        score(d, min_queries=1)
+    assert cli_main(["score", "--data", str(d), "--min-queries", "1"]) == EXIT_FAILURE
+
+
 def test_a_failed_generation_cannot_be_scored_from_an_earlier_one(tmp_path, armmod):
     d = tmp_path / "d"
     _seventy(d)
@@ -704,8 +735,8 @@ def test_a_failed_generation_cannot_be_scored_from_an_earlier_one(tmp_path, armm
     m = manifest_of(d)
     assert (m["generation"], m["status"]) == ("G2", "failed")
     assert m["failed_arm"] == f"{armmod}:raise_at_61"
-    assert m["error"].startswith("RuntimeError: boom on <query>"), "query text is redacted"
-    assert "query number" not in json.dumps(m)
+    assert m["error"] == f"RuntimeError in arm {armmod}:raise_at_61", "type and arm only (D4)"
+    assert "query number" not in json.dumps(m) and "boom" not in json.dumps(m)
     assert {p.name: p.read_bytes() for p in (d / "runs" / "G1").iterdir()} == g1
     assert "G1" not in json.dumps(m.get("files", {}))
     with pytest.raises(UsageError, match="G2"):
@@ -731,7 +762,7 @@ def test_wrong_output_types_abort_the_run(tmp_path, armmod, arm):
     out = run(d, [f"{armmod}:{arm}"])
     assert out.exit_code == EXIT_FAILURE
     assert manifest_of(d)["status"] == "failed"
-    assert manifest_of(d)["error"].startswith("ArmOutputError")
+    assert manifest_of(d)["error"] == f"ArmOutputError in arm {armmod}:{arm}"
     with pytest.raises(UsageError):
         score(d, min_queries=1)
 
@@ -815,9 +846,13 @@ def test_the_report_holds_no_query_text_or_path(tmp_path):
         assert p not in blob, p
     with pytest.raises(ReportLeak):
         assert_no_leak(json.dumps({"options": {"x": "Ops/Runbook.md"}}), set(), {"Ops/Runbook.md"})
+    # Arm labels, the generation and options are operator words: exact match only.
+    assert_no_leak(json.dumps({"arms": [{"arm": "my deploy runbook arm"}]}),
+                   {"deploy runbook"}, set())
     with pytest.raises(ReportLeak):
-        assert_no_leak(json.dumps({"arms": [{"arm": "my deploy runbook arm"}]}),
-                       {"deploy runbook"}, set())
+        assert_no_leak(json.dumps({"arms": [{"arm": "deploy runbook"}]}), {"deploy runbook"}, set())
+    with pytest.raises(ReportLeak):
+        assert_no_leak(json.dumps({"deltas": {"hybrid": {}}}), {"hybrid"}, set())
     assert_no_leak(json.dumps({"verdict": "OK", "arms": [{"membership": "keyword"}]}),
                    {"keyword"}, set())
 
