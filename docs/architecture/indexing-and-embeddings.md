@@ -2477,7 +2477,7 @@ the stale vectors for ever.
 
 `get_changes` reads `note_events`, the durable record of what changed in a
 scope. The index pass is one of its two writers; the full contract is in
-`openspec/changes/change-feed/design.md` (archived with the change) and
+`openspec/changes/archive/2026-10-30-change-feed/design.md` and
 `src/services/change_feed.py`.
 
 **`content_changed_at` is stamped in exactly one statement.** The batch
