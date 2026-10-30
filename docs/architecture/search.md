@@ -799,7 +799,7 @@ is `1` when the export ran with `USER_ID=` (every row carries the same
 `user_filter` and that `user_id`, or `mine --user-id` filtered it), or when
 the deployment has at most one user and the export at most one distinct
 `user_id`; anything else, including an empty export, is `"multi"`.
-`attachable` is `provenance.users == 1`. A non-attachable report is still
+Under a user filter, another owner's manual judgment is excluded and counted (`manual_excluded_other_owner`), and a manual judgment for an owner outside the evidence makes the provenance `"multi"`. `attachable` is `provenance.users == 1`. A non-attachable report is still
 written for the operator's private use, and its table starts with `NOT
 ATTACHABLE (multi-user provenance)`. Only an attachable report may be
 attached to a PR.

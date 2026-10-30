@@ -930,6 +930,28 @@ def test_the_fixture_filtered_to_one_user_is_attachable(tmp_path):
     assert res.report["provenance"] == {"users": 1, "basis": "user_filter"}
     assert res.report["attachable"] is True
     assert res.table.splitlines()[0] != NOT_ATTACHABLE_LINE
+    # The fixture's user-2 manual line ("journal today") stays out of a user-1 report.
+    owners = {json.loads(x)["user_id"] for x in (d / "queries.jsonl").read_text().splitlines()}
+    assert owners == {1}
+    assert res.report["counts"]["per_source"]["manual"] == 1
+    assert res.report["mine"]["manual_excluded_other_owner"] == 1
+
+
+def test_manual_judgments_of_another_owner_never_ride_an_attachable_provenance():
+    manual = parse_manual_lines([json.dumps({"user_id": 2, "text": "journal today",
+                                             "relevant": ["Journal/Today.md"]})])
+    rows = [srch(0, "q", ["A.md"], who="U1"), rd(5, "A.md", who="U1")]
+    filtered = mine(rows, manual=manual, user_filter=1)
+    assert {q["user_id"] for q in filtered.queries} == {1}
+    assert filtered.report["manual_excluded_other_owner"] == 1
+    assert filtered.report["provenance"]["users"] == 1
+    # From the export's own USER_ID= filter, too.
+    exported = mine([{**r, "user_filter": "1"} for r in rows], manual=manual)
+    assert exported.report["manual_excluded_other_owner"] == 1
+    assert exported.report["provenance"] == {"users": 1, "basis": "user_filter"}
+    # A single-user deployment with another owner's manual line is not single-user.
+    single = mine([{**r, "deployment_users": 1} for r in rows], manual=manual)
+    assert single.report["provenance"] == {"users": "multi", "basis": "manual_other_owner"}
 
 
 def test_the_cli_pipeline_writes_owner_only_files(tmp_path):

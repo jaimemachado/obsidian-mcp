@@ -419,11 +419,22 @@ def mine(rows: list[dict], *, window_seconds: float = DEFAULT_WINDOW_SECONDS,
     without_judgment = sum(1 for q in queries.values() if not q.relevant)
     emitted = {qid: q for qid, q in queries.items() if q.relevant}
 
+    provenance = derive_provenance(rows, user_filter=user_filter)
+    # Under a user filter (the export's USER_ID= or `--user-id`) the report may
+    # carry one owner only, so another owner's manual judgment is excluded and
+    # counted rather than let in under an attachable provenance.
+    owner_filter = user_filter
+    if owner_filter is None and provenance["basis"] == "user_filter":
+        owner_filter = int(rows[0]["user_filter"])
     n_manual_lines = 0
+    n_manual_other_owner = 0
     n_both = 0
     if manual:
         for m in manual:
             n_manual_lines += 1
+            if owner_filter is not None and m["user_id"] != owner_filter:
+                n_manual_other_owner += 1
+                continue
             qid = m["qid"]
             q = emitted.get(qid)
             if q is None and qid in queries:
@@ -441,6 +452,12 @@ def mine(rows: list[dict], *, window_seconds: float = DEFAULT_WINDOW_SECONDS,
             if m.get("class"):
                 q.explicit_class = m["class"]
         n_both = sum(1 for q in emitted.values() if q.sources == {"mined", "manual"})
+
+    if provenance["users"] == 1:
+        # Every judgment that enters the report counts, manual ones included.
+        allowed = {owner_filter} if owner_filter is not None else {r.get("user_id") for r in rows}
+        if {q.user_id for q in emitted.values()} - allowed:
+            provenance = {"users": "multi", "basis": "manual_other_owner"}
 
     out_queries = [emitted[qid].as_dict() for qid in sorted(emitted)]
     qrels = {qid: {p: 1 for p in sorted(emitted[qid].relevant)} for qid in sorted(emitted)}
@@ -465,7 +482,8 @@ def mine(rows: list[dict], *, window_seconds: float = DEFAULT_WINDOW_SECONDS,
         "n_both_sources": n_both,
         "per_class": {c: class_counts.get(c, 0) for c in CLASSES},
         "per_source": {s: source_counts.get(s, 0) for s in ("mined", "manual")},
-        "provenance": derive_provenance(rows, user_filter=user_filter),
+        "manual_excluded_other_owner": n_manual_other_owner,
+        "provenance": provenance,
     }
     return MineResult(queries=out_queries, qrels=qrels, report=report)
 

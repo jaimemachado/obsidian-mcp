@@ -226,7 +226,7 @@ _VOCABULARY = frozenset({
     *METRICS, "novel@10", *SLICES, *MEMBERSHIPS, *CLASSES, "mined", "manual",
     VERDICT_OK, VERDICT_INSUFFICIENT, VERDICT_LOSS, "multi", "unknown",
     "empty", "user_filter", "inconsistent_user_filter",
-    "single_user_deployment", "multi_user",
+    "single_user_deployment", "multi_user", "manual_other_owner",
     "keyword", "semantic", "fixture-lexical", "fixture-title",
 })
 _HEX = re.compile(r"[0-9a-f]{16,64}")
@@ -493,7 +493,7 @@ def score(data_dir: Path, arms: list[str] | None = None, *, baseline: str | None
         "mine": {k: mr.get(k) for k in (
             "rows_total", "malformed_lines", "usable_searches", "usable_reads", "excluded",
             "credited_reads", "judgments", "unattributed_reads", "queries_without_judgment",
-            "manual_lines",
+            "manual_lines", "manual_excluded_other_owner",
         )},
         "arms": arm_reports,
         "baseline": label_of[baseline] if baseline is not None else None,
