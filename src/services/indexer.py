@@ -88,6 +88,7 @@ from src.services.links import (
 )
 from src.oauth.grants import lock_account_guard
 from src.services.tasks import extract_tasks_bounded, frontmatter_line_offset
+from src.services.note_hash import canonical_note_text_strict, text_hash
 from src.services import vault_overlap
 from src.services.transfer import canonical_vault_root
 from src.services.vault import (
@@ -725,7 +726,10 @@ logger = logging.getLogger(__name__)
 
 
 def _content_hash(content: str) -> str:
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+    """The note hash of already-canonical text: `note_hash.text_hash`, so the
+    pass's `content_hash` equals `canonical_note_hash` of the file's bytes
+    (#351, D3) — one definition shared with every change-feed event."""
+    return text_hash(content)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1979,18 +1983,28 @@ def read_note_at(
     that could describe a different file from the one that was hashed. Not the
     reason for the anchoring; a free consequence of it.
 
-    Text mode with the default universal-newline translation, exactly as the
-    `Path.read_text` it replaces — a binary read would leave `\\r\\n` intact and
-    silently change every CRLF note's `content_hash`, forcing a re-embed.
+    The text is `note_hash.canonical_note_text_strict` of the bytes read
+    (#351, D3): a strict UTF-8 decode, `\\r\\n` and lone `\\r` translated to
+    `\\n` exactly as the text-mode read it replaced (`Path.read_text`'s
+    universal newlines — a binary read that kept `\\r\\n` would silently change
+    every CRLF note's `content_hash` and force a re-embed), and U+0000
+    removed. The same function computes every change-feed event's hash, so a
+    tool's event and the pass's row agree on a CRLF or NUL note.
+    `tests/test_note_hash.py` pins it against the old text-mode read.
     """
     fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC, dir_fd=parent_fd)
     try:
         stat = os.fstat(fd)
-        with open(fd, "r", encoding="utf-8", errors="strict", closefd=False) as handle:
-            text_ = handle.read()
+        with open(fd, "rb", closefd=False) as handle:
+            data = handle.read()
     finally:
         os.close(fd)
-    nul = text_.count("\x00")
+    # Raises `UnicodeDecodeError` on bytes that are not UTF-8, exactly as the
+    # strict text-mode read did; every caller's not-indexable branch keys on it.
+    text_ = canonical_note_text_strict(data)
+    # A 0x00 byte in UTF-8 is only ever U+0000, so the bytes' count is the
+    # number of characters the canonical text removed.
+    nul = data.count(b"\x00")
     if nul:
         logger.warning(
             "Removed %d NUL character(s) from %s before indexing; the file on "
@@ -1998,7 +2012,6 @@ def read_note_at(
             nul,
             _loggable_path(rel if rel is not None else name),
         )
-        text_ = text_.replace("\x00", "")
     return text_, stat
 
 
