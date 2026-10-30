@@ -5,6 +5,7 @@
 
 ## 1. Schema: migration 034 and models
 
+- [ ] 1.0 Migration 034 also adds `notes_metadata.embedded_input_digest varchar(64)` (nullable, marked, no default, no backfill) under the same reconcile-or-refuse rules. Include it in every 1.x item below.
 - [ ] 1.1 `src/models/db.py`: `NoteEmbedding.heading_path` (`ARRAY(Text)`, nullable), `section_ordinal` (`Integer`, nullable) and `embed_prefix` (`Text`, nullable), each with its 034 marker comment; `ck_note_embeddings_heading_meta` in `__table_args__`. `NoteMetadata.embedded_chunking_version` (`SmallInteger`, nullable, marker) with `ck_notes_metadata_embedded_chunking_version`. Add a comment block pointing at design D4/D5.
 - [ ] 1.2 `alembic/versions/034_heading_chunks.py` (`revision="034"`, `down_revision="033"`), in the 030/032 shape.
   - Pin and assert `search_path`; set and `RESET` `lock_timeout` / `statement_timeout`.
@@ -57,7 +58,8 @@
   - return nothing unless the fingerprint is `MATCH` and the version equals `CHUNKING_VERSION`;
   - key on `(embed_prefix, chunk_text)`, skipping NULL prefixes.
 - [ ] 3.4 `_generation_matches`: `reused_rows` maps row id to `(chunk_text, embed_prefix)`, and the under-lock recheck compares both.
-- [ ] 3.5 `certify_embedded`: the conditional UPDATE also sets `embedded_chunking_version = CHUNKING_VERSION`, and `expire_on` expires both attributes. The legacy uncertified path (tests only) sets both.
+- [ ] 3.5 `certify_embedded`: the conditional UPDATE also sets `embedded_chunking_version = CHUNKING_VERSION` and `embedded_input_digest = <sha256 of the canonical JSON of the ordered provider inputs>` (`[]` for empty or excluded notes, so every caller passes the inputs or the empty list). `expire_on` expires all three attributes. The legacy uncertified path (tests only) sets them too.
+- [ ] 3.5a Invalidation on prefix inputs (design D3a): every index-pass statement that writes `title` or `tags` with an unchanged `content_hash` (extraction-version re-upsert, re-derive, the id-preserving move branch) also sets `embedded_content_hash = NULL` in the same statement when either is `IS DISTINCT FROM` the new value. Add the full-hash backstop: for each certified note read under the current chunking version, recompute the input digest and clear certification in the pass transaction on a mismatch or NULL. Tests: a tag-grammar bump with identical cleaned text invalidates; unchanged title and tags do not; the backstop catches a hand-corrupted digest; no provider call is made by the backstop.
 - [ ] 3.6 Tests:
   - prefix shape, caps, tags omitted when long, title-only for section 0;
   - reuse hits on an append;
@@ -98,7 +100,8 @@
 
 - [ ] 6.1 `semantic_search` (service) and `find_related_stmt` project `NoteEmbedding.heading_path` and `section_ordinal`, never `embed_prefix` or `embedding`. The result dict gains `section`, which is `None` when the row is stale or its path is NULL. Update the projection-identity tests (`test_perf_projection_identity_pg.py`) to the new column list.
 - [ ] 6.2 One renderer helper, `_section_locator(section) -> str`: ` · § <change_feed.quote(joined)> (#N)`, ` · § (top of note)`, or `""`; the 160-character path cut keeps the inner components behind `…/`. Use it in `semantic_search_impl` and `find_related_impl` on the result line, after `_degradation_suffix`.
-- [ ] 6.3 Previews in both tools go through `_one_line` before the 200-character cut.
+- [ ] 6.3 The services pass the uncut `chunk_text` (remove `semantic_search`'s `[:500]`). Add one helper, `_preview_line(text, limit=200)`: collapse each maximal `str.isspace()` run to one space, trim, escape the remaining C0/DEL/C1 as `\uXXXX`, then cut. Both renderers use it and keep their own ellipsis. Tests: 600 leading spaces then `answer`; U+001B and U+0085; a forged row.
+- [ ] 6.3a Transition marker: in both tools, run the vector query and an owner-scoped `SELECT count(*) FROM notes_metadata WHERE <owner> AND (embedded_chunking_version IS NULL OR embedded_chunking_version < :cv)` in one `REPEATABLE READ, READ ONLY` transaction. While the count is above zero, emit `index_transition: N notes not yet re-chunked; cross-generation ranking is approximate, re-run after the backlog drains` directly after the header, on every query-running path including empty results. Render tests: present, absent at 0, owner-scoped, on the empty path.
 - [ ] 6.4 Docstrings in `src/mcp_server/server.py` for `semantic_search` and `find_related`: the locator's two forms, its omission on stale and pre-034 rows, and the `read_note(path, section="#N")` follow-up, in peer wording. Check the tools-list fixtures (`tools_list_schema_additions.json` and any description pins) and update only what the description change requires.
 - [ ] 6.5 Render tests:
   - both locator forms;
@@ -118,6 +121,12 @@
   - one pass re-embeds within the budget; mixed results render correctly;
   - after convergence every row has a prefix and every note has version 1;
   - the backlog is empty and the pending count is zero.
+- [ ] 7.1a Transition membership (Codex r1 B1): with `limit=1`, legacy note A nearer than B before deploy, and a budget that re-embeds B on pass 1 and A on pass 2, assert:
+  - after pass 1 the response carries `index_transition:` whichever note it returns, and `/health` `indexer.rechunk_pending` is at least 1 with `status` `ok`;
+  - after pass 2 the line is absent and `rechunk_pending` is 0;
+  - another tenant's legacy notes never add the line to this caller.
+
+  Implement `indexer_health`'s `rechunk_pending` as an in-process per-scope count set by each embed stage, summed for `/health`, never part of `status`.
 - [ ] 7.2 Ordering and budget: with version-only notes pending and one edited note, the edited note is embedded first; single-user mode stops at the time budget at a note boundary with no run error.
 - [ ] 7.3 Reuse on PostgreSQL: append, inserted heading, tag change, and a reset racing the provider call (extend `test_perf_chunk_reuse_pg.py`).
 - [ ] 7.4 End-to-end parity: index a fixture vault, then for every stored row with ordinal N ≥ 1 call `read_note_impl(path, section="#N")` and assert the containment of design D1.
@@ -126,8 +135,8 @@
 
 ## 8. Search-evaluation harness
 
-- [ ] 8.1 For DB-backed arms whose membership includes `semantic`, record `retrieval_fingerprint` and `legacy_chunked_notes` in the staged `meta` and in the report's arm entry. `legacy_chunked_notes` is one read-only `SELECT`, null when the column is absent. A `runfile:` arm carries its meta's values or null. Fixture arms gain no key.
-- [ ] 8.2 Tests: the fixture golden file is unchanged; an integration test on a copy gives `legacy_chunked_notes` 0 after a re-embed and N before; a runfile without the fields scores with nulls; the report-content check (no query text, no paths) still passes.
+- [ ] 8.1 For DB-backed arms whose membership includes `semantic`, record `retrieval_fingerprint` and `legacy_chunked_notes` in the staged `meta` and in the report's arm entry. `legacy_chunked_notes` is one read-only `SELECT` with the provenance owner's predicate (the export's `USER_ID`, NULL-safe), covering all owners only for a `"multi"` report. It is null when the column is absent. A `runfile:` arm carries its meta's values or null. Fixture arms gain no key.
+- [ ] 8.2 Tests: two tenants, `USER_ID=7` export, user 8 with 37 legacy notes. The staged meta and report carry 0, and mutating user 8's rows changes no byte of either (Codex r1 B2). The fixture golden file is unchanged; an integration test on a copy gives `legacy_chunked_notes` 0 after a re-embed and N before; a runfile without the fields scores with nulls; the report-content check (no query text, no paths) still passes.
 - [ ] 8.3 Operator run, before the PR is opened for merge (design D8 steps 1–6): baseline generation from the incumbent tag on the pre-034 copy; upgrade and re-embed with the candidate image; candidate generation with `runfile:` baseline. Record in this file the chunk count after re-embed, the per-pass durations, and the total re-embed time (these replace the design's estimate band), and attach `report.json` to the PR if `attachable: true`. `CORPUS_LOSS` or `legacy_chunked_notes > 0` means the run is not evidence.
 - [ ] 8.4 Re-run `tests/integration/test_search_recall.py` against the re-embedded copy's chunk count. If filtered recall drops below the SLO, record it and the `hnsw.max_scan_tuples` remedy before shipping (design Risks).
 

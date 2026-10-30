@@ -203,6 +203,35 @@ A rename that changes a stem-derived title already clears
 `embedded_content_hash` (both move paths, #127). The prefix changes, so that
 note is re-embedded in full. A folder move keeps the title and stays free.
 
+## D3a: The certification covers the exact provider input (Codex r1 M1)
+
+Before this change, `embedded_content_hash` plus the cleaned-text comparison of
+an extraction-version bump proved a stored vector current. Now the provider
+input also depends on the title and tags. Those can change while the bytes do
+not (a rename) and while the cleaned text does not (a tag-grammar revision).
+Three mechanisms cover this, all in this change:
+
+1. **`notes_metadata.embedded_input_digest`** (`varchar(64)`, migration 034).
+   It is the SHA-256 hex of the canonical JSON of the ordered list of provider
+   inputs (`embedding_input(prefix, chunk)` per chunk, `[]` for an empty or
+   excluded note), stamped by `certify_embedded` in the same conditional
+   UPDATE as the hash and the chunking version.
+2. **Transactional invalidation on a changed prefix input.** Some index-pass
+   statements rewrite a row's `title` or `tags` while its `content_hash` is
+   unchanged: the extraction-version re-upsert, the re-derive, and both move
+   paths. These statements add `embedded_content_hash = CASE WHEN title IS
+   DISTINCT FROM :t OR tags IS DISTINCT FROM :g THEN NULL ELSE
+   embedded_content_hash END`. The moves already clear it unconditionally, and
+   the existing index-integrity grammar requirement is MODIFIED so that a
+   differing title or tags counts as grammar-attributable invalidation.
+   Headings come from the bytes. A heading-scan change is a `CHUNKING_VERSION`
+   bump by rule.
+3. **The full-hash backstop.** The full-hash pass already reads every file.
+   For each certified note it reads under the current chunking version, it
+   recomputes the input digest (CPU only, no provider call) and clears
+   certification on a mismatch or a NULL digest. That bounds any missed
+   invalidation path to `INDEX_FULL_HASH_INTERVAL_HOURS`.
+
 ## D4: The re-embed is a per-note chunking-version backlog, outside the fingerprint
 
 **This departs from the brief's recommendation, and the reason is the two facts
@@ -225,10 +254,23 @@ certifying branch: embedded, certified-empty and excluded.
   *models* in one column make cosine distance meaningless. Here the model,
   dimension and provider are unchanged and stay in the refusing fingerprint.
   Legacy and heading-era vectors are the same model's embeddings of
-  overlapping text, in one space. Mixing them during the transition affects
-  ranking (L1), not correctness. A new ADDED requirement in embedding-providers
-  states the boundary: model identity is global and refuses; the chunking
-  format is per note and re-selects.
+  overlapping text, in one space. **Mixing them is not correctness-safe for a
+  bounded page** (Codex r1 B1). A prefix changes a note's distance to a query,
+  so a re-embedded note can push a still-legacy note out of the top `limit`,
+  and that page would then omit a note that was reachable before the deploy.
+  So the transition is *declared* rather than hidden. While any note in the
+  caller's scope is on an older chunking version, every `semantic_search` and
+  `find_related` response carries, directly after its header, the line
+  `index_transition: N notes not yet re-chunked; cross-generation ranking is
+  approximate, re-run after the backlog drains`. N is owner-scoped and read
+  in the same `REPEATABLE READ, READ ONLY` transaction as the vector query.
+  The line appears on the empty path too, and is absent at zero. `/health`
+  reports `indexer.rechunk_pending` as a count only, which never changes
+  `status`. The ranking itself is still mixed (L1). A wipe would have avoided
+  the mix but left semantic search returning nothing for hours, which is
+  worse. A new ADDED requirement in embedding-providers states the boundary:
+  model identity is global and refuses, while the chunking format is per note
+  and re-selects.
 - **The stored fingerprint is untouched** (`v` stays 1), so the deploy neither
   refuses nor resets. A later chunking change is one constant bump plus its
   tests.
@@ -247,16 +289,20 @@ certifying branch: embedded, certified-empty and excluded.
   increments no failure counter unless the provider actually fails, in which
   case the existing per-scope accounting applies as it would to any backlog.
 
-**Rolling-deploy overlap (L2).** The k3s rollout may run the 033 build for a few
-minutes after 034 has migrated. The old build's `certify_embedded` does not
-touch the new column, and its rows carry NULL locators. A note it embeds is
-either still unstamped (so it is re-selected, which is correct) or was stamped
-by the new build moments earlier (it keeps legacy rows until its next edit).
-Compose `make deploy` stops the app before migrating, so it has no window.
+**No build overlap in the supported deployments (L2).** The repository's
+Kubernetes bundle (`deploy/kubernetes/base/deployment.yaml`) runs one replica
+with `strategy: Recreate`, and migration 034 runs in the replacement pod's
+init container. Compose `make deploy` stops the app before migrating. In
+neither path can a 033 process write after 034 has migrated. Only a
+deployment modified outside the repository has such a window, for example
+one with a rolling update or a second replica. There, a note that the 033
+build re-embeds after the 034 build stamped it keeps legacy rows (NULL
+locator, never reused) until its next edit or the next full-hash backstop
+(D3a). A note that is still unstamped is simply re-selected.
 
 ## D5: Migration 034
 
-The four columns, all nullable, with no default, no backfill and no index:
+The five columns, all nullable, with no default, no backfill and no index:
 
 | table | column | type | note |
 |---|---|---|---|
@@ -264,6 +310,7 @@ The four columns, all nullable, with no default, no backfill and no index:
 | `note_embeddings` | `section_ordinal` | `integer` | `0` for section 0; integer because a 10 MiB note can hold more than 32,767 headings |
 | `note_embeddings` | `embed_prefix` | `text` | at most 300 characters, enforced by the app |
 | `notes_metadata` | `embedded_chunking_version` | `smallint` | NULL means pre-034 |
+| `notes_metadata` | `embedded_input_digest` | `varchar(64)` | NULL means pre-034, or never certified since (D3a) |
 
 - `ck_note_embeddings_heading_meta`: all three row columns NULL, or all three
   non-NULL with `section_ordinal >= 0` and `(section_ordinal = 0) =
@@ -323,9 +370,17 @@ line, so an agent can check it.
 **Previews go on one line in both tools.** Today `semantic_search` prints
 `chunk[:200]` raw, so a chunk holding `\n- **Forged** (`x.md`) — similarity:
 0.999` prints a line identical to a server row. `find_related` replaces `\n`
-only. Both now render the preview through `_one_line` (every whitespace run,
-`\r` and U+2028/U+2029 included, becomes one space) before the 200-character
-cut. The text is not otherwise changed.
+only. The service now passes the **uncut** `chunk_text` (it used to cut at 500
+before rendering). One helper, `_preview_line(text, 200)`, then:
+1. collapses every maximal run of `str.isspace()` characters (CR, LF, tab,
+   U+2028 and U+2029 included) to one space;
+2. trims leading and trailing spaces;
+3. escapes the remaining C0 controls, DEL and C1 controls as `\uXXXX`;
+4. cuts at 200 characters.
+
+Each tool keeps its existing ellipsis. Trimming is a stated change. A chunk of
+600 spaces followed by `answer` previews as `answer` (Codex r1 m1). The helper
+is not `_one_line`, which escapes nothing.
 
 Each row grows by at most about 185 characters. At the 50-row maximum that is
 under 10k characters, inside the response bounds.
@@ -442,7 +497,9 @@ fields hold no query text and no path.
   throughout. A note not yet re-embedded answers from its legacy vectors, with
   its preview and no `§`. A re-embedded note answers from heading-era vectors
   with `§`. Nothing is stale on account of the transition. Ranking is a mix of
-  the two (L1). The dashboard's pending count starts near the note count and
+  the two (L1), so every response carries the `index_transition: N …` line
+  until the caller's scope has drained, and `/health` shows
+  `indexer.rechunk_pending`. The dashboard's pending count starts near the note count and
   falls each pass. Each budget stop writes one WARNING per tenant per pass and
   no run error. `/health` stays `ok` unless the provider fails. Query embeddings
   share Ollama with the batches, so a search may wait up to one batch, about
@@ -458,9 +515,10 @@ fields hold no query text and no path.
   bounded per tick by the budget and measured on the copy first. If it is
   unacceptable at that point, pause from the panel. The backlog resumes where
   it stopped.
-- **Mixed ranking during the transition** (L1). It is bounded by the re-embed
-  duration and is the same model space. The harness measures the end state, not
-  the transition.
+- **Mixed ranking during the transition** (L1). It can change which notes fit
+  on a bounded page. That is declared on every response by the
+  `index_transition:` line, and it is bounded by the re-embed duration. The
+  harness measures the end state, not the transition.
 - **More, smaller chunks.** The halfvec HNSW index grows proportionally (45 MB
   today, about 60–110 MB). The `hnsw.max_scan_tuples` (20,000) note in
   search.md becomes relevant above 20k chunks. Filtered recall is re-checked by
@@ -489,19 +547,35 @@ fields hold no query text and no path.
    included (D4).
 8. **No prefix on/off setting** (D2). The README default model is unchanged.
 
-## Codex spec review
+## Codex spec review, round 1 (2026-10-30)
 
-No rounds yet. Rounds will be recorded here as they happen, each with its
-findings and what was folded in or declined.
+FAIL on d2503a4, with 2 BLOCKER, 2 MAJOR, 1 MINOR and 1 NIT. All six were
+accepted and folded in.
+
+| # | Severity | Finding | Resolution |
+|---|---|---|---|
+| B1 | BLOCKER | A mixed-generation bounded page can silently omit a note that was reachable before deploy, because prefixed vectors move distances. The claim that mixing was correctness-safe was false, and index-integrity promised "the same notes". | The gradual re-embed is kept (a wipe would leave semantic search dark for hours). The safety claim is removed. A transition contract is added: the owner-scoped `index_transition: N …` line, read from the same snapshot, appears on every `semantic_search` / `find_related` response while N > 0, empty path included. `/health` gets an `indexer.rechunk_pending` count. A `limit=1` two-pass membership scenario and test are added (task 7.1a). L1 is restated as the residual. |
+| B2 | BLOCKER | `legacy_chunked_notes` was unscoped, so an attachable `USER_ID=` report could disclose another tenant's state. | The count is scoped to the arm's provenance owner, and covers all owners only for a `"multi"`, non-attachable report. A two-tenant scenario and test are added (task 8.2). |
+| M1 | MAJOR | Tags and title are now in the provider input, so identical cleaned text no longer proves a vector current. A tag-grammar revision would leave stale prefixes in place permanently. | D3a adds `embedded_input_digest` (migration 034), clears certification in the same statement on a changed title or tags, MODIFIES the index-integrity grammar requirement, and adds a full-hash backstop that recomputes the digest. |
+| M2 | MAJOR | The follow-up scenario required raw-body containment, which a chunk spanning a removed fence cannot meet. | The scenario now uses fence-cleaned containment, the same contract as index-integrity and task 7.4, and still requires the ordinal to resolve to the correct raw section. |
+| m1 | MINOR | `_one_line` trims, contradicting "no other change", and the service cut at 500 before normalising. | The service passes the uncut chunk. The normalisation is defined exactly (collapse, trim, escape C0/C1/DEL, cut at 200), and the requirement and the `_preview_line` helper match. |
+| n1 | NIT | The repository's k3s bundle is `Recreate` with one replica and migrates in an init container, so it has no overlap. | L2 and the D4 note are rewritten so the window applies only to externally modified deployments. |
+
+Declined: none.
 
 ## Accepted limitations
 
 - **L1** — During the transition, legacy and heading-era vectors of the same
-  model coexist, so a note's rank depends on whether it has been re-embedded
-  yet. This is bounded by the re-embed duration.
-- **L2** — In a rolling deploy, a note the 033 build re-embeds after the 034
-  build stamped it keeps legacy rows until its next edit or a reset. Compose
-  deploys have no such window.
+  model coexist. A note's rank, and so whether it fits on a bounded page,
+  depends on whether it has been re-embedded yet. The page is never presented
+  as complete: the `index_transition:` line marks every response until the
+  caller's scope drains. The mixed ranking itself is the residual, bounded by
+  the re-embed duration.
+- **L2** — Only in a deployment modified outside the repository (a rolling
+  update or a second replica) can the 033 build write after 034 migrated. A
+  note it re-embeds after the 034 build stamped it keeps legacy rows until its
+  next edit or the next full-hash backstop. The repository's Recreate
+  Kubernetes bundle and compose deploys have no such window.
 - **L3** — An edit not yet scanned leaves a fresh-looking row whose `#N` may
   name a different section, which is the existing staleness bound.
   `read_note`'s `heading` field lets the agent check.

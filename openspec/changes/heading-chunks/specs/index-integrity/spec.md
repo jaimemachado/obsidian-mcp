@@ -54,14 +54,35 @@ For every chunk, the input `embed_note` sends to the provider SHALL be `embed_pr
 - **WHEN** a six-level heading path's breadcrumb exceeds 300 characters
 - **THEN** the prefix SHALL keep the title and the innermost heading, SHALL replace outer headings with `…`, and SHALL be at most 300 characters
 
-### Requirement: Notes embedded under an older chunking version SHALL be re-selected per note, held to the embed budget in every mode, and SHALL NOT be marked stale
+### Requirement: Notes embedded under an older chunking version SHALL be re-selected per note, held to the embed budget in every mode, and the transition SHALL be declared on every vector-search response
 `certify_embedded` SHALL stamp `notes_metadata.embedded_chunking_version = CHUNKING_VERSION` in the same conditional UPDATE that stamps `embedded_content_hash`, on every certifying branch (embedded, certified-empty, excluded). The embed backlog SHALL select a note whose `embedded_content_hash` is not current **or** whose `embedded_chunking_version IS DISTINCT FROM CHUNKING_VERSION`, through one predicate shared with the dashboard pending count and the re-embedding progress endpoint. It SHALL take content-stale notes first and version-only notes after them, each by `modified_at` descending. The per-tenant embed budget SHALL apply to the version-only notes whatever the number of active scopes, with the existing note-boundary and at-least-one-note rules. A budget stop SHALL remain a non-failure.
 
-The staleness annotation SHALL remain `embedded_content_hash IS DISTINCT FROM content_hash`, so a note selected only for its chunking version SHALL be reported fresh and keep its preview. Its stored vectors SHALL be served until its new rows commit, which replace all of them in one transaction. A version change SHALL NOT clear `embedded_content_hash`, SHALL NOT alter the stored embedding fingerprint and SHALL NOT refuse startup. The re-embed's length SHALL NOT by itself increment any indexer health counter.
+The staleness annotation SHALL remain `embedded_content_hash IS DISTINCT FROM content_hash`, so a note selected only for its chunking version SHALL be reported fresh and keep its preview. Its stored vectors SHALL be served until its new rows commit, which replace all of them in one transaction. A version change SHALL NOT clear `embedded_content_hash`, SHALL NOT alter the stored embedding fingerprint and SHALL NOT refuse startup.
+
+**Mixed generations change ranking, and therefore membership at the cutoff.** A prefixed vector and a legacy vector of the same model sit at different distances from the same query. A re-embedded note can therefore displace a still-legacy note from a bounded page, so such a page is not a complete answer and the system SHALL NOT present it as one. While any note in the caller's owner scope has `embedded_chunking_version` NULL or below `CHUNKING_VERSION`, every `semantic_search` and `find_related` response SHALL carry this line on its own, directly after the header: `index_transition: N notes not yet re-chunked; cross-generation ranking is approximate, re-run after the backlog drains`.
+- N SHALL be the owner-scoped count of such notes, read in the same `REPEATABLE READ, READ ONLY` transaction as the vector query.
+- The line SHALL be present on every return path that runs the query, the empty result included.
+- The line SHALL be absent when N is zero.
+
+The ranking itself remains mixed during the transition. That is a declared limitation.
+
+The length of the re-embed SHALL NOT by itself increment any indexer health counter or degrade `/health`. `/health` SHALL report the backlog as a count only, `indexer.rechunk_pending`: the sum of the per-scope counts observed by the most recent embed stage of each scope, held in process memory. That count SHALL NOT affect `status`.
 
 #### Scenario: First passes after deploy
 - **WHEN** the 034 build starts over a fully embedded pre-034 index
-- **THEN** startup SHALL proceed, every note SHALL be in the backlog, and `semantic_search` SHALL return the same notes it returned before, unmarked as stale, until each note's new rows commit
+- **THEN** startup SHALL proceed and every note SHALL be in the backlog
+- **AND** every note SHALL remain reachable by `semantic_search` and SHALL NOT be marked stale
+- **AND** every response SHALL carry the `index_transition:` line
+
+#### Scenario: Membership at the cutoff across budgeted passes
+- **WHEN** a search runs with `limit=1`, legacy note A was nearer the query than note B before deploy, B is re-embedded on the first budgeted pass and A on the second
+- **THEN** after the first pass the response SHALL carry the `index_transition:` line, whichever note it returns
+- **AND** after the first pass `/health` SHALL report `indexer.rechunk_pending` of at least 1, with `status` `ok`
+- **AND** after the second pass the response SHALL carry no `index_transition:` line, and `indexer.rechunk_pending` SHALL be 0
+
+#### Scenario: The marker is owner-scoped
+- **WHEN** another tenant has legacy notes and the caller's scope has none
+- **THEN** the caller's responses SHALL carry no `index_transition:` line
 
 #### Scenario: Single-user transition is spread over passes
 - **WHEN** a single-user deployment's backlog holds only version-only notes whose embedding exceeds the time budget
@@ -77,7 +98,29 @@ The staleness annotation SHALL remain `embedded_content_hash IS DISTINCT FROM co
 
 #### Scenario: Excluded and empty notes converge without a provider call
 - **WHEN** a pre-034 note is excluded or cleans to zero chunks
-- **THEN** it SHALL be stamped with the current chunking version without a provider call and not selected again
+- **THEN** it SHALL be stamped with the current chunking version without a provider call, and SHALL NOT be selected again
+
+### Requirement: The certification SHALL cover a digest of the exact provider input, and a change to any derived value in that input SHALL invalidate the note in the same transaction
+`certify_embedded` SHALL stamp `notes_metadata.embedded_input_digest`, in the same conditional UPDATE as `embedded_content_hash`. The digest is the SHA-256 hex of the canonical encoding of the ordered list of provider inputs: `embedding_input(prefix, chunk)` for every chunk, and the empty list for a certified-empty or excluded note.
+
+Some index-pass statements change a row's title or tags while leaving `content_hash` unchanged: a re-derive, an extraction-version re-upsert, and either move path. When the stored title or tags are distinct from the new ones, such a statement SHALL also set `embedded_content_hash = NULL`, in that same statement, so the backlog re-selects the note.
+
+A change to the heading scan, or to any other part of sectioning, SHALL bump `CHUNKING_VERSION`.
+
+As a backstop, every full-hash pass SHALL recompute, for each certified note it reads, the digest of the inputs the current code would send. In the pass transaction, it SHALL clear `embedded_content_hash` for every note whose chunking version is current and whose stored digest is NULL or differs. The comparison makes no provider call.
+
+#### Scenario: A tag-grammar change with identical cleaned text
+- **WHEN** an extraction-version bump changes a note's extracted tags while its cleaned-for-embedding text is identical under both versions
+- **THEN** the re-deriving pass SHALL clear the note's `embedded_content_hash` in the same transaction
+- **AND** the next embed pass SHALL re-embed the note with the new tags line
+
+#### Scenario: Unchanged inputs are not invalidated
+- **WHEN** a re-derive rewrites a row whose title and tags are unchanged
+- **THEN** `embedded_content_hash` SHALL be unchanged
+
+#### Scenario: The full-hash backstop
+- **WHEN** a certified note's stored input digest differs from the digest of its current provider inputs
+- **THEN** the next full-hash pass SHALL clear its certification, and a later embed pass SHALL re-embed it
 
 ## MODIFIED Requirements
 
@@ -126,3 +169,60 @@ A note whose chunks are all reusable SHALL make no provider call. It SHALL NOT b
 #### Scenario: An all-reuse note loses a reset race without an attempt
 - **WHEN** every chunk of a note is reusable and a reset deletes the stored rows between the lookup and the under-lock check
 - **THEN** the outcome SHALL be `GENERATION_MISMATCH`, nothing SHALL be written, and the pass's attempt count SHALL be unchanged
+
+### Requirement: A masker grammar change forces re-derivation without corrupting note identity
+
+Link rows, inline tags, and embedded vectors are derived through the shared fence recognizer, but re-derivation is normally gated on `content_hash`, which does not change when only the grammar changes. A grammar change SHALL therefore ship with a versioned re-derivation mechanism: a per-note extraction-version marker, distinct from `content_hash`, compared against a code-level current version.
+
+When a note's marker is stale, the next index pass SHALL re-extract its links and tags, and SHALL then stamp the marker.
+
+Grammar-attributable embedding invalidation SHALL occur exactly when the note's **provider input differs** between the grammar version that stamped the note's recorded version and the current grammar. That is the case when either of these differs:
+- the embedded text, that is, the cleaned-for-embedding output;
+- **any derived value the embedding prefix carries (title, tags).**
+
+Each version's cleaning function is retained, frozen, while any row remains stamped with it, so the comparison is direction-aware and works for rollbacks as well as upgrades.
+
+The comparison is over cleaned output, not recognised-span tuples, because span equality is neither necessary nor sufficient for embedded-text equality. The v0 cleaner applied its two regexes sequentially, so adjacent mixed fences produce identical spans but different cleaned text, and vice versa.
+
+Independent invalidators are cumulative, and the cleaned-output comparison SHALL NOT suppress an invalidation any other requirement mandates. The independent invalidators are:
+- a content change;
+- a `file_path` change;
+- a changed title or tags;
+- a provider or configuration change;
+- exclusion reconciliation;
+- a chunking-version change.
+
+`content_hash` SHALL always hold the true hash of the note's bytes. It SHALL NOT be nulled or overwritten with a sentinel, so hash-based move/rename matching keeps working throughout the remediation window.
+
+#### Scenario: The fence-grammar deploy refreshes links and tags
+
+- **WHEN** this change's migration has run and the indexer completes its next pass
+- **THEN** every note's `note_links` rows and extracted tags SHALL reflect the new grammar
+
+#### Scenario: Embedding invalidation is scoped to affected notes
+
+- **WHEN** the re-derivation pass processes a note whose cleaned-for-embedding output is identical under the stamped version's frozen cleaner and the current one, whose title and tags are unchanged, and to which no independent invalidator applies (no content change, no `file_path` change, no provider or configuration change, no exclusion reconciliation)
+- **THEN** the grammar migration SHALL NOT cause that note to be re-embedded
+- **AND** the cleaned-output comparison SHALL govern only invalidation attributable to the grammar change, and SHALL NOT suppress an invalidation another requirement mandates
+- **WHEN** the pass processes a note whose cleaned output differs (for example, one containing an indented fence around text)
+- **THEN** that note's embeddings SHALL be rebuilt from the newly cleaned text on a subsequent embed pass
+
+#### Scenario: Identical cleaned text, different tags
+
+- **WHEN** the re-derivation pass processes a note whose cleaned output is identical under both versions but whose extracted tags differ
+- **THEN** that note's certification SHALL be cleared in the pass transaction
+- **AND** its embeddings SHALL be rebuilt with the new prefix on a subsequent embed pass
+
+#### Scenario: Move detection survives the remediation window
+
+- **WHEN** a note is externally renamed after the migration runs but before the re-derivation pass reaches it
+- **THEN** the indexer's content-hash move matching SHALL still identify it as the same note (its `content_hash` is real), preserving row identity rather than deleting and reinserting it
+- **AND** the path-change invalidation the existing requirements mandate for a move SHALL still apply
+- **AND** the ID-preserving move branch SHALL re-derive that note's links and tags under the current grammar and stamp its marker in the same transaction, so the note does not need a second pass to satisfy the next-pass refresh promise
+
+#### Scenario: Rewrite-enabled moves refuse while re-derivation is incomplete
+
+- **WHEN** any note in the caller's owner scope still carries a stale extraction marker and a client calls `move_note(from, to, rewrite_links=True)`
+- **THEN** the move SHALL be refused before the rename, naming the in-progress re-derivation
+- **AND** the reason is that rewrite-source discovery reads `note_links` rows that a stale-grammar extraction may have wrongly omitted: a link inside a span the old grammar masked but the new grammar reads as prose would otherwise be silently left broken
+- **AND** the same move with `rewrite_links=False` SHALL be unaffected, and the refusal SHALL clear on its own once the re-derivation pass completes

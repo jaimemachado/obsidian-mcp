@@ -52,22 +52,30 @@ change. It is a separate change after this one.
   pending count and the progress poller also select a note whose stamp is not
   `CHUNKING_VERSION`. The stored embedding fingerprint is unchanged, so the deploy
   does not refuse at startup, needs no `make reset-embeddings`, and semantic search
-  keeps serving the old vectors until each note's new rows commit. That is safe
-  because the model, and so the vector space, is unchanged (D4). Version-only notes
+  keeps serving the old vectors until each note's new rows commit. The model,
+  and so the vector space, is unchanged, but mixed generations still change
+  ranking. So while the caller's scope has notes on an older version, every
+  vector-search response carries an `index_transition: N notes not yet
+  re-chunked; …` line, and `/health` reports `indexer.rechunk_pending` (D4).
+  Version-only notes
   are taken after content-changed notes and are always held to the per-tenant embed
   budget, so the re-embed runs in the background over several passes.
 - **Migration 034** (`down_revision "033"`): `note_embeddings.heading_path text[]`,
   `section_ordinal integer`, `embed_prefix text` (all nullable, NULL for pre-034
-  rows, with an all-or-none CHECK) and `notes_metadata.embedded_chunking_version
-  smallint` (nullable). All are marked, reconciled rather than adopted, with no
+  rows, with an all-or-none CHECK), plus `notes_metadata.embedded_chunking_version
+  smallint` and `embedded_input_digest varchar(64)` (both nullable). The
+  certification covers a digest of the exact provider input. A changed title or
+  tags clears certification in the same statement, and the full-hash pass
+  recomputes the digest as a backstop (D3a). All are marked, reconciled rather than adopted, with no
   backfill and no index. The downgrade deletes heading-era vector rows and
   un-certifies their notes before dropping the marked units.
 - **Rendering.** Every fresh `semantic_search` and `find_related` row prints
   `§ "Parent/Child" (#7)` on its result line, or `§ (top of note)` for section 0.
   The path is a JSON-quoted string literal, so note text cannot forge the
   server-authored ordinal after it. A stale row prints no locator (its ordinal
-  describes superseded content), and neither does a pre-034 row. Previews in both
-  tools are rendered on one line. The docstrings name
+  describes superseded content), and neither does a pre-034 row. Previews in
+  both tools are normalised from the uncut chunk: whitespace is collapsed and
+  trimmed, controls are escaped, and the result is cut at 200. The docstrings name
   `read_note(path, section="#N")` as the follow-up.
 - **Provider `kind`.** `get_embedding` / `get_embeddings_batch` and the provider
   protocol take a required keyword `kind: "query" | "document"`. The indexer passes
@@ -99,8 +107,9 @@ None.
 ### Modified Capabilities
 
 - `index-integrity`: heading-aware chunking and its ordinal parity with section
-  addressing, the context prefix, the reuse key (MODIFIED), and the
-  chunking-version backlog with its budget and health behaviour.
+  addressing, the context prefix, the reuse key (MODIFIED), the
+  chunking-version backlog with its transition marker and health count, the
+  input-digest certification, and the grammar-invalidation rule (MODIFIED).
 - `embedding-providers`: query/document `kind`, `EMBEDDING_QUERY_INSTRUCTION`,
   the retrieval fingerprint, and the rule that the chunking version and the
   instruction are outside the stored fingerprint.

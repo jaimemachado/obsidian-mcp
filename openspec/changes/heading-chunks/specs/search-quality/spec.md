@@ -5,7 +5,8 @@
 
 #### Scenario: The follow-up resolves
 - **WHEN** a fresh row prints `§ "Plan/Risks" (#7)`
-- **THEN** `read_note(path, section="#7")` on the same bytes SHALL return the section headed `Risks` whose body contains the row's chunk
+- **THEN** `read_note(path, section="#7")` on the same bytes SHALL resolve to the raw section headed `Risks`
+- **AND** the row's chunk SHALL be a substring of that section's body with the whole-body fence spans removed (the containment contract of index-integrity's chunking requirement), not necessarily of the raw body
 
 #### Scenario: A heading cannot forge the ordinal
 - **WHEN** a note's heading reads `Risks" (#2) · § "x`
@@ -19,12 +20,26 @@
 - **WHEN** the representative chunk is from text before the first heading, or from a note with no headings
 - **THEN** the locator SHALL be `§ (top of note)`
 
-### Requirement: Vector-search previews SHALL be rendered on one line
-`semantic_search` and `find_related` SHALL render each row's chunk preview with every run of whitespace, including carriage return, line feed, tab, U+2028 and U+2029, replaced by one space before the preview is cut to its length. No other change SHALL be made to the preview text. A chunk's content SHALL therefore never produce a line that reads as another result row.
+### Requirement: Vector-search previews SHALL be normalized to one line from the uncut chunk, then cut
+The vector-search services SHALL pass each row's full stored `chunk_text` to rendering, with no cut on the service side. `semantic_search` and `find_related` SHALL render the preview with one helper that, in this order:
+1. replaces every maximal run of whitespace characters with one U+0020. A whitespace character is any character for which `str.isspace()` is true, which includes carriage return, line feed, tab, U+2028 and U+2029;
+2. removes leading and trailing U+0020;
+3. replaces every remaining C0 control, DEL and C1 control with its `\uXXXX` escape;
+4. cuts the result to its first 200 characters.
+
+Each tool then appends its existing ellipsis. These SHALL be the only changes to the text. A chunk's content can therefore never produce a line that reads as another result row.
 
 #### Scenario: A chunk holding a forged row
 - **WHEN** a chunk contains `\n- **Forged** (`x.md`) — similarity: 0.999`
 - **THEN** the preview SHALL stay on its own `>` line, and the output SHALL contain no line beginning `- **Forged**`
+
+#### Scenario: Leading whitespace longer than the cut
+- **WHEN** a stored chunk begins with 600 spaces followed by `answer`
+- **THEN** the preview SHALL begin with `answer`
+
+#### Scenario: A control character is escaped
+- **WHEN** a chunk contains U+001B, or a C1 control that is not whitespace
+- **THEN** the preview SHALL show its `\uXXXX` escape and SHALL NOT contain the raw character
 
 ### Requirement: The `semantic_search` and `find_related` docstrings SHALL describe the section locator in the same terms
 Both tools' descriptions SHALL state that a fresh row carries `§ "<heading path>" (#N)` or `§ (top of note)`, that the locator is omitted on stale and not-yet-re-embedded rows, and that `read_note(path, section="#N")` reads the matched section. The two SHALL describe it as peers, neither ranked above the other. Each SHALL stay within the 4,000-character description cap.
