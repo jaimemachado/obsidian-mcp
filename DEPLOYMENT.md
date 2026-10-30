@@ -894,7 +894,9 @@ and needs nothing; the real run is this path, from a checkout with
    the paths agents read, owner ids. Never commit it, upload it or paste it
    into an issue. On a multi-user deployment `USER_ID=` is required for a
    report you will attach to a PR; an unfiltered export covers every user
-   and is for your private use only.
+   and is for your private use only. `SEARCH_EVAL_DB_NAME` (default
+   `obsidian_mcp`, the name `make db-backup` dumps) names the database to
+   export from.
 2. **Back up with the derived tables.** `BACKUP_FULL=1 make db-backup`. The
    default dump stores `notes_metadata` and `note_embeddings` as schema
    only, and replay needs their rows.
@@ -917,7 +919,8 @@ and needs nothing; the real run is this path, from a checkout with
    `make search-eval-snapshot SEARCH_EVAL_DATA=.search-eval SEARCH_EVAL_DATABASE_URL=<scratch copy>`
    records which indexed notes each arm can reach. Taken after a candidate
    was applied, it would hide that candidate's lost notes as drift; the
-   harness cannot check the order.
+   harness cannot check the order. An existing snapshot is never replaced unless
+   you pass `FORCE=1`.
 5. **Apply the candidate to the copy**, if it changes indexed data (a
    migration, a re-chunk, a re-embed).
 6. **Score.**
