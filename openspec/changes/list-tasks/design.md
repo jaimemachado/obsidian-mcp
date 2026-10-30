@@ -300,3 +300,7 @@ The independent `openspec-verifier` pass on dc7cb34 found **0 blocking** gaps an
 1. **MAJOR**: an abbreviated row ignored `tags_cut`, so a task whose tags were capped (or stored NULL with `tags_cut`) rendered with neither `tags cut` nor `tags omitted` and looked complete. **Fixed:** either stored tags or `tags_cut` produces `— tags omitted`, and `tags_cut` always adds `— tags cut`; the structure stays within 120 (measured 86). Regression: `test_an_abbreviated_row_says_its_tags_were_cut`.
 2. **MINOR**: a hand-edited full cursor could carry a NUL (or an unpaired surrogate) in `p`, which reached the varchar bind and failed as a database error rather than the `invalid_argument` refusal. **Fixed:** decoding refuses both before any session opens; both mutations are in the tampered-cursor test.
 3. **MINOR**: path escaping was not injective (a literal `\` followed by `n` rendered like a line feed). **Fixed:** literal backslashes are doubled in the same pass as the whitespace escapes; `test_path_escaping_is_injective`. The closing incomplete-list notice was also shortened (now at most 85 characters) so the corrected D7 minimum holds with the extra `tags cut` label.
+
+## Codex implementation review, round 2 (2026-10-29): PASS
+
+All three round-1 fixes VERIFIED; no BLOCKER or MAJOR. One MINOR and one NIT, fixed: the "Five tool classes" table in `docs/architecture/rate-limits.md` now lists `list_tasks` in the `scan` row, and a trailing blank line at the end of `tests/test_note_tasks_extractor.py` is gone (`git diff --check` clean).

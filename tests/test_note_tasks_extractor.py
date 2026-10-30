@@ -281,4 +281,3 @@ def test_the_extractor_is_linear_on_adversarial_input(fragment):
     elapsed = time.monotonic() - started
     assert elapsed < TIME_BOUND_SECONDS, f"{elapsed:.1f}s on {fragment!r}"
     assert len(tasks) <= MAX_TASKS_PER_NOTE
-
