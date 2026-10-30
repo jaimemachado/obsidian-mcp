@@ -17,7 +17,7 @@
   - Set `HEAD_REVISION = "034"`.
   - Cases: the fresh shape; the chain from 033 with existing rows, which stay all NULL with vectors untouched; the stamp-back re-run; an impostor of each column (wrong type, unmarked, defaulted) and of each CHECK; both CHECK definitions read through `pg_constraint` and validated; the downgrade's uncertify-and-delete, with mixed pre-034 and prefixed rows; and the downgrade→upgrade round trip with `alembic check` clean after both.
 - [x] 1.4 Confirm `tests/integration/test_nonsuperuser_migrations_pg.py` passes unchanged, and that `tests/test_backup_derived_tables.py` needs no change (both tables are already derived).
-- [ ] 1.5 Run `make test-schema` (never concurrently with `make test-integration`), then `make db-check`: "No new upgrade operations detected".
+- [x] 1.5 Run `make test-schema` (never concurrently with `make test-integration`), then `make db-check`: "No new upgrade operations detected".
 
 ## 2. Chunker (offline, `src/services/embeddings.py`)
 
@@ -132,7 +132,7 @@
 - [x] 7.3 Reuse on PostgreSQL: append, inserted heading, tag change, and a reset racing the provider call (extend `test_perf_chunk_reuse_pg.py`).
 - [x] 7.4 End-to-end parity: index a fixture vault, then for every stored row with ordinal N ≥ 1 call `read_note_impl(path, section="#N")` and assert the containment of design D1.
 - [x] 7.5 Downgrade on real data: mixed rows → `downgrade 033` → prefixed rows gone, their notes uncertified, legacy rows intact → `upgrade head` → clean.
-- [ ] 7.6 Run `make test-integration`. A local `pytest tests` alone skips these.
+- [x] 7.6 Run `make test-integration`. A local `pytest tests` alone skips these.
 
 ## 8. Search-evaluation harness
 
@@ -156,7 +156,7 @@
 
 ## 10. Verification gates
 
-- [ ] 10.1 `openspec validate heading-chunks --strict`.
+- [x] 10.1 `openspec validate heading-chunks --strict`.
 - [ ] 10.2 `openspec-verifier` subagent (a non-author) audits the implementation against these deltas and runs `make audit`, `make test-schema`, `make test-integration`, `make search-eval` (fixture) and `make db-check`. Iterate to zero blocking gaps.
 - [ ] 10.3 Adversarial Codex (mandatory: search path, chunking and embedding). Commit first, pin `-m gpt-daybreak-blue-latest`, `--sandbox read-only`, stdin from a file, run in the background. Frame wrong as: a silently wrong or misleading search result (wrong ordinal, forged locator, reused vector for a different input, a note dropped from semantic search), a refused or crash-looping deploy, or `/health` degraded by a healthy transition. Attack:
   - ordinal parity on adversarial fences and terminators;
