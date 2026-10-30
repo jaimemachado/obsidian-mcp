@@ -146,10 +146,14 @@ def load_export(path: Path) -> LoadResult:
 
 
 def principal_of(row: dict) -> tuple[str, Any] | None:
-    """`("api_key", key_id)`, `("oauth", grant_id)`, or None (never `actor_ref`)."""
+    """`("api_key", key_id)`, `("oauth", grant_id)`, or None (never `actor_ref`).
+
+    An OAuth principal needs both `oauth_token_id` and the `grant_id` it
+    resolved to; either alone is not a credential the log can attribute.
+    """
     if row.get("key_id") is not None:
         return ("api_key", row["key_id"])
-    if row.get("grant_id") is not None:
+    if row.get("oauth_token_id") is not None and row.get("grant_id") is not None:
         return ("oauth", row["grant_id"])
     return None
 

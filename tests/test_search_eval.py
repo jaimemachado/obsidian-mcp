@@ -201,6 +201,12 @@ def test_an_unresolvable_principal_is_excluded_not_merged():
     assert principal_of(_who("UN")) is None
     assert principal_of(_who("G1")) == ("oauth", "g1")
     assert principal_of({**_who("G1"), "key_id": 5}) == ("api_key", 5)
+    # A grant without the token it was resolved from is not a principal.
+    assert principal_of({**_who("G1"), "oauth_token_id": None}) is None
+    assert principal_of({**_who("G1"), "grant_id": None}) is None
+    orphan = mine([{**srch(0, "q", ["X.md"], who="G1"), "oauth_token_id": None},
+                   rd(5, "X.md", who="G1")])
+    assert orphan.report["excluded"] == {"unresolved_principal": 1}
 
 
 def test_principals_interleave_without_cross_crediting():
