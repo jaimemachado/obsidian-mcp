@@ -47,14 +47,14 @@ Refs #354. Read `proposal.md`, `design.md` (D1–D11, the owner decisions, L1–
 - [x] 6.6 `docs/architecture/usage-attribution.md`: list `arms`, `semantic_unavailable`, `keyword_rows`, `semantic_rows`, `overlap` and `rrf_k` as reserved params keys with their types, and state that a keyword-only row carries no `error` marker.
 - [x] 6.7 `CLAUDE.md`: in "MCP tools", 27 → 28 tools and `hybrid_search` in **Search and read**; in the #343 bullet, the read-only count (seventeen → eighteen); a key-decisions bullet covering the third peer with symmetric routing, RRF k = `HYBRID_RRF_K` over both arms' top 50, one session and one REPEATABLE READ snapshot with the embedding before it, keyword-only marked never silent, the `embedding` class, and that the eval gate row applies. Note in the PR body that **the CLAUDE.md eval gate row applies to this PR** (task 7.3).
 - [x] 6.8 `DEPLOYMENT.md` and `docs/deployment-kubernetes.md`: an upgrade note (new tool, new optional setting, `CLASS_MAPPING_VERSION` 5 starts a new readiness epoch, no migration, rollback is a redeploy).
-- [ ] 6.9 File a follow-up issue for L9: `semantic_search`'s chunk preview is not one-lined, so it is a forgeable line. Do not fix it here.
+- [x] 6.9 (#385) File a follow-up issue for L9: `semantic_search`'s chunk preview is not one-lined, so it is a forgeable line. Do not fix it here.
 
 ## 7. Gates
 
 - [x] 7.1 `pytest tests` (offline) green; `make test-integration` green, with the report stating that it ran (not concurrently with `make test-schema`); `make audit` clean; `make search-eval` (fixture) passes with an unchanged golden.
 - [x] 7.2 `openspec validate hybrid-search --strict`.
 - [ ] 7.3 **Eval gate (CLAUDE.md row, required for this PR).** On a restored `BACKUP_FULL=1` copy, run `make search-eval-snapshot` before anything else, then `make search-eval SEARCH_EVAL_DATA=.search-eval SEARCH_EVAL_DATABASE_URL=<copy> ARMS="keyword semantic scripts.search_eval_arms.hybrid:make_arm scripts.search_eval_arms.hybrid:make_arm_alt" ARM_OPTS="hybrid_k=60 hybrid_alt_k=20"`, `BASELINE=semantic`, and `USER_ID=` on the multi-user deployment. Attach `report.json` to the PR **only if `attachable: true`**. `CORPUS_LOSS` invalidates the run. Record the per-class (`class:identifier`, `class:prose`) deltas in the PR body. If k = 20 beats 60 on the interval, raise it with Max rather than changing the default in this PR.
-- [ ] 7.4 `openspec-verifier` subagent against this change, iterated to zero blocking gaps.
+- [x] 7.4 `openspec-verifier` subagent against this change, iterated to zero blocking gaps. (verifier: 0 blocking, 7 minor, all folded)
 - [ ] 7.5 **Adversarial Codex (mandatory: a search-path change).** Frame "wrong" as silently wrong search results an agent acts on: a note in one arm and missing from the other within one call, a degraded answer presented as fused, a cross-tenant row, a forged result row, an unbounded response, an `enable_indexscan` leak, or any change to `keyword_search`/`semantic_search` output. Two rounds by default, with triage per the workflow, and declined findings recorded in the accepted-limitations list.
 
 ## 8. Archive, merge, live check
