@@ -23,6 +23,7 @@ from sqlalchemy import (
     delete,
     func,
     literal,
+    literal_column,
     null,
     or_,
     select,
@@ -3847,8 +3848,16 @@ async def _index_vault_attempt(
                                     NoteMetadata.title.is_distinct_from(
                                         stmt.excluded.title
                                     ),
-                                    NoteMetadata.tags.is_distinct_from(
-                                        stmt.excluded.tags
+                                    # NULL and `{}` build the same prefix (no
+                                    # tags line), so they compare equal.
+                                    func.coalesce(
+                                        NoteMetadata.tags,
+                                        literal_column("'{}'::varchar[]"),
+                                    ).is_distinct_from(
+                                        func.coalesce(
+                                            stmt.excluded.tags,
+                                            literal_column("'{}'::varchar[]"),
+                                        )
                                     ),
                                 ),
                                 null(),

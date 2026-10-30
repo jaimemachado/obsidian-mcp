@@ -114,24 +114,24 @@
 
 ## 7. PostgreSQL integration tests (`tests/integration/`)
 
-- [ ] 7.1 `test_heading_chunks_pg.py`, transition:
+- [x] 7.1 `test_heading_chunks_pg.py`, transition:
   - seed pre-034 rows (NULL locator, NULL version) for several notes;
   - startup proceeds and the fingerprint is unchanged;
   - `semantic_search` returns them unstale with previews and no locator;
   - one pass re-embeds within the budget; mixed results render correctly;
   - after convergence every row has a prefix and every note has version 1;
   - the backlog is empty and the pending count is zero.
-- [ ] 7.1a Transition membership (Codex r1 B1): with `limit=1`, legacy note A nearer than B before deploy, and a budget that re-embeds B on pass 1 and A on pass 2, assert:
+- [x] 7.1a Transition membership (Codex r1 B1): with `limit=1`, legacy note A nearer than B before deploy, and a budget that re-embeds B on pass 1 and A on pass 2, assert:
   - after pass 1 the response carries `index_transition:` whichever note it returns, and `/health` reports `indexer.rechunk: "in_progress"` with `status` `ok` and no transition number in the body;
   - after pass 2 the line is absent and `indexer.rechunk` is `"complete"`;
   - rollback (Codex r2 B2): with `CHUNKING_VERSION` patched to 2, re-embed B and C, then patch it back to 1 with no schema downgrade. The marker counts B and C and stays until every note in scope is stamped 1. The backlog re-selects B and C, and no version-2 row is reused;
   - another tenant's legacy notes never add the line to this caller.
 
   Implement `indexer_health`'s per-scope count in process memory, set by each embed stage under the one predicate. `/health` exposes only `indexer.rechunk: "in_progress" | "complete"`, never the count, never in `status`. Document this privacy contract in `indexing-and-embeddings.md`, beside the existing "counts only, no path/error/user id" rule: the field is non-volumetric because `/health` is unauthenticated.
-- [ ] 7.2 Ordering and budget: with version-only notes pending and one edited note, the edited note is embedded first; single-user mode stops at the time budget at a note boundary with no run error.
-- [ ] 7.3 Reuse on PostgreSQL: append, inserted heading, tag change, and a reset racing the provider call (extend `test_perf_chunk_reuse_pg.py`).
-- [ ] 7.4 End-to-end parity: index a fixture vault, then for every stored row with ordinal N ≥ 1 call `read_note_impl(path, section="#N")` and assert the containment of design D1.
-- [ ] 7.5 Downgrade on real data: mixed rows → `downgrade 033` → prefixed rows gone, their notes uncertified, legacy rows intact → `upgrade head` → clean.
+- [x] 7.2 Ordering and budget: with version-only notes pending and one edited note, the edited note is embedded first; single-user mode stops at the time budget at a note boundary with no run error.
+- [x] 7.3 Reuse on PostgreSQL: append, inserted heading, tag change, and a reset racing the provider call (extend `test_perf_chunk_reuse_pg.py`).
+- [x] 7.4 End-to-end parity: index a fixture vault, then for every stored row with ordinal N ≥ 1 call `read_note_impl(path, section="#N")` and assert the containment of design D1.
+- [x] 7.5 Downgrade on real data: mixed rows → `downgrade 033` → prefixed rows gone, their notes uncertified, legacy rows intact → `upgrade head` → clean.
 - [ ] 7.6 Run `make test-integration`. A local `pytest tests` alone skips these.
 
 ## 8. Search-evaluation harness
@@ -143,16 +143,16 @@
 
 ## 9. Documentation (last commits of the feature branch)
 
-- [ ] 9.1 README: `EMBEDDING_QUERY_INSTRUCTION` in the settings table, with the Qwen3 example in double quotes and the statement that the default model is unchanged; the `§` locator in the `semantic_search` / `find_related` descriptions; a note that changing the instruction needs no reset, and changing the model still does.
-- [ ] 9.2 `.env.example`: `EMBEDDING_QUERY_INSTRUCTION=` (empty) with a comment covering queries only, verbatim, no reset needed, the Qwen3 template, and `\n` inside double quotes. Grep that every new setting appears in both README and `.env.example` (feedback: public docs for settings).
-- [ ] 9.3 DEPLOYMENT.md:
+- [x] 9.1 README: `EMBEDDING_QUERY_INSTRUCTION` in the settings table, with the Qwen3 example in double quotes and the statement that the default model is unchanged; the `§` locator in the `semantic_search` / `find_related` descriptions; a note that changing the instruction needs no reset, and changing the model still does.
+- [x] 9.2 `.env.example`: `EMBEDDING_QUERY_INSTRUCTION=` (empty) with a comment covering queries only, verbatim, no reset needed, the Qwen3 template, and `\n` inside double quotes. Grep that every new setting appears in both README and `.env.example` (feedback: public docs for settings).
+- [x] 9.3 DEPLOYMENT.md:
   - an "Upgrading to 034 (heading-aware chunks)" note: what the migration does, that startup does not refuse, the background re-embed and its measured duration, what the dashboard and logs show, `/health` unaffected, Ollama sharing, and rollback via `alembic downgrade 033` with its cost;
   - "Measuring search quality": the `runfile:` before/after recipe for a re-chunk or re-embed (design D8), including the read-only vault mount and the budget override on the one-off container.
-- [ ] 9.4 `docs/architecture/indexing-and-embeddings.md`: a section "Heading-aware chunks (#355)" with sectioning, the zero-chunk invariant, the prefix, the reuse key (amend D16), the chunking-version backlog and why it is outside the fingerprint, the budget in every mode, the rolling-deploy window, and L1–L10. Amend "Indexing decisions" (no longer "512 token chunks" only) and the fingerprint section with the instruction and retrieval-fingerprint rule.
-- [ ] 9.5 `docs/architecture/search.md`: the locator and its forgery rule, stale-row withholding, one-line previews, the harness's new arm fields, and the `max_scan_tuples` note updated with the new chunk count.
-- [ ] 9.6 `docs/architecture/vault-tools.md` "Section addressing": the chunker is a consumer of `_scan_headings`. State the containment guarantee and that a change to the heading scan now also needs a `CHUNKING_VERSION` bump.
-- [ ] 9.7 `docs/architecture/schema-and-migrations.md`: a "034" section (columns, CHECKs, no backfill, reconcile-or-refuse, the downgrade's delete-and-uncertify).
-- [ ] 9.8 CLAUDE.md: one key-decisions bullet (heading-aware chunks; prefix; reuse key; per-note `CHUNKING_VERSION` outside the fingerprint; the instruction is query-only and unfingerprinted; the locator). Update "Indexing decisions" wording if it states 512-token windows only.
+- [x] 9.4 `docs/architecture/indexing-and-embeddings.md`: a section "Heading-aware chunks (#355)" with sectioning, the zero-chunk invariant, the prefix, the reuse key (amend D16), the chunking-version backlog and why it is outside the fingerprint, the budget in every mode, the rolling-deploy window, and L1–L10. Amend "Indexing decisions" (no longer "512 token chunks" only) and the fingerprint section with the instruction and retrieval-fingerprint rule.
+- [x] 9.5 `docs/architecture/search.md`: the locator and its forgery rule, stale-row withholding, one-line previews, the harness's new arm fields, and the `max_scan_tuples` note updated with the new chunk count.
+- [x] 9.6 `docs/architecture/vault-tools.md` "Section addressing": the chunker is a consumer of `_scan_headings`. State the containment guarantee and that a change to the heading scan now also needs a `CHUNKING_VERSION` bump.
+- [x] 9.7 `docs/architecture/schema-and-migrations.md`: a "034" section (columns, CHECKs, no backfill, reconcile-or-refuse, the downgrade's delete-and-uncertify).
+- [x] 9.8 CLAUDE.md: one key-decisions bullet (heading-aware chunks; prefix; reuse key; per-note `CHUNKING_VERSION` outside the fingerprint; the instruction is query-only and unfingerprinted; the locator). Update "Indexing decisions" wording if it states 512-token windows only.
 
 ## 10. Verification gates
 

@@ -136,7 +136,7 @@ async def env(engine, monkeypatch, tmp_path):
         monkeypatch.setattr(module, 'async_session', maker)
     monkeypatch.setattr(embeddings_service, 'async_session', maker, raising=False)
 
-    async def fake_embedding(_text):
+    async def fake_embedding(_text, **_kw):
         return list(UNIT)
     monkeypatch.setattr(embeddings_service, 'get_embedding', fake_embedding)
 

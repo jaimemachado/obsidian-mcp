@@ -315,7 +315,7 @@ def embed_as(monkeypatch):
     """Make `get_embedding` return a chosen vector, for old and new alike."""
     state = {"vec": None}
 
-    async def _fake(_text):
+    async def _fake(_text, **_kw):
         return state["vec"]
 
     monkeypatch.setattr("src.services.embeddings.get_embedding", _fake)
@@ -791,6 +791,14 @@ async def _semantic_pair(sessionmaker, embed_as, vec, **kw):
             await session.execute(text("SET LOCAL enable_indexscan = off"))
             new = await semantic_search(session, "q", **kw)
         new_fb = timing.current()["exact_fallback"]
+        # #355 adds `section` and hands the renderer the uncut chunk; the old
+        # arm predates both. Project the new result back onto the old shape so
+        # this stays a test of #280's projection identity.
+        new = [
+            {**{k: v for k, v in r.items() if k != "section"},
+             "chunk": None if r["chunk"] is None else r["chunk"][:500]}
+            for r in new
+        ]
     finally:
         timing.clear(token)
     return old, new, old_fb, new_fb
