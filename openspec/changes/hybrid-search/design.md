@@ -244,3 +244,7 @@ Verdict FAIL on c96b747: 2 MAJOR, both accepted and fixed.
 2. **MAJOR: `snippet_ms` was missing from the usage row when `KEYWORD_SNIPPET_ROWS=0`.** → Recorded on every call; the cap-zero telemetry test asserts it.
 
 The `openspec-verifier` pass on the same head reported 0 blocking gaps and 7 minor items, all folded in: the structure-bound wording (cut-form labels, 332), `semantic_search`'s `db_ms` boundary restored, the rank-51 test now offers A.md and pins the arms' LIMIT 50, the below-floor renderer note, an A/B-of-k harness test, #385 cited, the per-arm filter assertions, and these implementation notes.
+
+## Codex implementation review, round 2 (2026-10-30): PASS
+
+Verdict on c45a0e9: PASS. Both round-1 fixes VERIFIED (the zero-result provenance tokens; `snippet_ms` with the snippet cap off), no new findings.
