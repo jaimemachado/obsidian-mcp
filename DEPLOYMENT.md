@@ -756,6 +756,17 @@ deployment; on a compose-file deployment the equivalents are plain
   `docker compose -f docker-compose.simple.yml exec obsidian-mcp alembic check`
   should print "No new upgrade operations detected."
 
+  **Upgrading to `hybrid_search` (#354).** No migration and nothing
+  re-derived or re-embedded. The release adds a 28th tool, `hybrid_search`,
+  and one optional setting, `HYBRID_RRF_K` (default 60, 1–1000; an
+  out-of-range value refuses to start). `hybrid_search` joins the
+  `embedding` concurrency class beside `semantic_search`, so
+  `CLASS_MAPPING_VERSION` moves to 5 and starts a new readiness epoch for
+  `make concurrency-report`. The panel's search-analytics page gains a
+  `hybrid_search` query table. Rollback is a redeploy of the previous image:
+  the tool disappears from the listing, its usage rows stay (harmless), and
+  the mapping version moving back starts another epoch.
+
   **Upgrading across migration 033 (change feed, #351).** 033 adds
   `notes_metadata.content_changed_at`, backfilled in one UPDATE from each
   note's `modified_at` (or `indexed_at` where that is NULL), and three

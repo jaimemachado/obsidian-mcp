@@ -205,3 +205,26 @@ Verdict on 7e4ec37: seven of the eight round-1 fixes VERIFIED (1 eval membership
 ## Codex spec review, round 3 (2026-10-30): PASS
 
 Verdict on 2d5b981: PASS. The round-2 rendered-length fix is VERIFIED. One MINOR, folded in: the omitted-form scenario asked for a budget 60 characters below the cut form. Emptying two 42-rendered-character fields saves 84, minus at least 25 characters of `title omitted` / `path omitted` labels, so at most 59. That made a fixed 60 unsatisfiable for some inputs. The scenario now measures the omitted-form length `L_omit` and the cut-form length `L_cut`, asserts `L_cut > L_omit`, and renders at budget `L_omit`.
+
+## Implementation notes
+
+Choices the spec left open, one line each:
+
+- `fuse()` in `src/services/hybrid.py` is a pure function over the two path lists, so the tie-break and the k table are unit-tested without a session.
+- The header's `semantic:`/`keyword:`/`in both:` and `arm_depth:` counts are the **arms'** (the 50-deep lists); `stale`, `truncated`, `without excerpt` and `shown` count the **rendered** rows.
+- In keyword-only mode the header still reads `arm_depth: … semantic 0/50 chunks` (the token is always present) beside the `arms: keyword-only` token.
+- The zero-result line echoes the query as a JSON literal (`No hybrid results for "<q>" — arms: …`), consistent with the header; the spec scenario's `'<query>'` is read as schematic. The keyword-only zero-result response also carries the fixed footer on a second line.
+- `query_cut` is rendered as its own ` — query_cut — ` token right after the query literal.
+- `explain` lists the semantic term first, then the keyword term (the field order of the row): `1/(k+s) + 1/(k+r)`.
+- `matched_in` renders `title`, `body`, `title,body` (keyword_search's join) or `title+body` (the split match); all are server vocabulary.
+- A stale row's semantic preview is the stale notice (`preview_kind: "stale_notice"`); it counts as the semantic arm's preview for the preview-choice fallback.
+- An abbreviation step that would change nothing (no tags, no preview, a value ≤ 45 rendered) is skipped and adds no label; the omitted form adds `title_cut`/`path_cut` if the cut step had not already.
+- The renderer reserves the header (computed over the whole page, which bounds any prefix's), the keyword-only footer when degraded, and the cap footer's 75 always; abbreviation labels follow the server fields, joined by ` — `.
+- The ≤ 340 structure bound is measured on the **cut** form (labels `tags omitted`, `preview omitted`, `title_cut`, `path_cut`, `abbreviated`; 332 measured), the form the 985 floor sum adds 45 + 45 to; the omitted form trades ≥ 80 rendered characters of value for 31 of labels, so it is always shorter.
+- The cap footer is `Response cap reached: N more result(s) omitted; narrow the query.` (≤ 69).
+- `_between_arms_hook` (module attribute, `None` in production) is the integration suite's seam between step 4 and step 5.
+- `required_options` on a harness factory is checked by `run_generation` before the generation is reserved, which is how `make_arm_alt` without `hybrid_alt_k` exits 64 (the factory also raises `UsageError` on its own); a non-integer or out-of-range `hybrid_k`/`hybrid_alt_k` is a `UsageError` from the factory.
+- A keyword-only replay answer raises `KeywordOnlyAnswer` (a `RuntimeError`), so the manifest records `failed` with that type.
+- `semantic_search`'s description said "best-matching chunk"; it now says "closest-matching" so none of the three descriptions contains "best" (the routing scenario).
+- `tests/test_issue_343_tool_metadata.py::test_the_instructions_qualify_both_statements` pinned the old lead phrase ending `(\`precondition_required\`)`; D8 moves that code to paragraph two, so the assertion now checks the qualified statement and the new `precondition_required` sentence separately.
+- vault-tools.md's `_READ_ONLY` row was missing `get_changes` (#351); it is listed now beside `hybrid_search`.
