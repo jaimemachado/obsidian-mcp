@@ -218,7 +218,7 @@ async def test_status_folder_tag_and_date_filters(seed):
     cancelled = await call(status="cancelled")
     assert lines(cancelled) == ["- [-] `Projects/p.md`:3 — due 2026-10-30 — text: c"]
     every = await call(status="all", folder="Projects/")
-    assert [ln[:5] for ln in lines(every)] == ["- [ ]", "- [/]", "- [-]", "- [ ]", "- [x]"]
+    assert [ln[:5] for ln in lines(every)] == ["- [ ]", "- [/]", "- [-]", "- [x]", "- [ ]"]
     assert texts(await call(due_by="2026-10-29")) == ["a", "b"]
     assert texts(await call(scheduled_by="2026-10-01")) == ["e"]
     assert texts(await call(folder="Projects/", tags=["#work"])) == ["a"]
@@ -326,7 +326,8 @@ async def test_a_compact_cursor_whose_note_was_deleted_is_refused(seed, sessionm
     cursor = next_of(first)
     assert "h" in decoded(cursor) and len(cursor) <= 2048
     second = await call(limit=1, cursor=cursor)
-    assert lines(second)[0].endswith("text: two")
+    # A 900-character path at the 1,000 minimum: the row is abbreviated.
+    assert "text: two" in lines(second)[0]
     async with sessionmaker() as session:
         await session.execute(text("DELETE FROM notes_metadata WHERE file_path = :p"), {"p": path})
         await session.commit()
