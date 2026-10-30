@@ -680,6 +680,11 @@ provenance)` as its first line. The fixture test asserts both values (D7).
   a lone surrogate is not caught by `is_truncated`, because #310's escaping
   can grow the stored string past 201 characters. Implausible input; not
   handled.
+- **L15. A symlinked `SEARCH_EVAL_DIR` is not refused.** The harness
+  writes through unpredictable `O_EXCL` temp files, but it does not check
+  whether the data directory itself is a symlink. Declined: the directory is
+  the operator's own `0700` directory, and a planted symlink there means the
+  operator account is already compromised.
 
 ## Decisions taken during implementation
 
@@ -827,3 +832,27 @@ loss of only the semantic constituent as corpus loss. It was fixed in
 constituents, and verified by grep and `openspec validate --strict` without
 a fourth round.
 
+## Codex implementation review, round 1 (FAIL, six findings)
+
+1. **Manual judgments of another owner rode a user filter** (real, fixed in
+   1a27a6d). Under `USER_ID=` or `--user-id`, a manual line for another
+   owner entered the query set while the report stayed attachable. Such
+   lines are now excluded and counted (`manual_excluded_other_owner`), and
+   provenance is derived from every judgment that enters the report.
+2. **`score --arm X` validated only the requested arm's file** (real, fixed
+   in 78eee3c). Every file the complete manifest references is now checked
+   for presence, hash and metadata before scoring the subset.
+3. **Predictable `.tmp` paths opened with `O_TRUNC` would follow a planted
+   symlink** (hygiene, fixed in 974b479). `atomic_write` uses
+   `tempfile.NamedTemporaryFile` in the destination directory and
+   `os.replace`; the export recipe uses `mktemp` with an `EXIT` trap.
+4. **The extra guard refusing a symlinked `SEARCH_EVAL_DIR`** was declined
+   and recorded as L15: the directory is the operator's own `0700`
+   directory, and a planted symlink there means the account is already
+   compromised.
+5. **An OAuth principal was built from `grant_id` alone** (fixed in
+   1a4f629). It now requires `oauth_token_id` and `grant_id` together;
+   otherwise the row is `unresolved_principal`.
+6. **`load_export` repaired undecodable bytes with U+FFFD** (fixed in
+   e320738). Lines are decoded strictly, and an undecodable line counts as
+   malformed.
