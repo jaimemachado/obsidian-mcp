@@ -253,4 +253,6 @@
 
   Done: round 1 FAIL, round 2 FAIL, round 3 PASS; declined findings are in design.md.
 - [ ] 8.4 Owner step: the first real run. Follow the DEPLOYMENT.md path with `USER_ID=<owner>`, against a restored `BACKUP_FULL=1` copy, with `ARMS="keyword semantic" BASELINE=keyword`. Post the attachable `report.json` on #356 (it carries no query text and no paths) as the incumbent baseline for #354, #355 and #367. Re-check the defaults against the observed yield, per L7a and E3: `--min-queries` 50, the 90-day export and the 120 s pairing window. A change to any default is its own small PR.
-- [ ] 8.5 After the gates pass, archive with `openspec archive search-eval-harness -y` as the last commit of the feature branch. The PR body says `Closes #356`.
+- [x] 8.5 After the gates pass, archive with `openspec archive search-eval-harness -y` as the last commit of the feature branch. The PR body says `Closes #356`.
+
+  Done: archived as `2026-10-30-search-eval-harness`; `openspec validate --all --strict` passes.
