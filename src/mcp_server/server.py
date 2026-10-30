@@ -409,7 +409,7 @@ async def semantic_search(
     Conceptual or paraphrased questions: `semantic_search`. Unsure which:
     `hybrid_search`.
 
-    Each result is one note (deduped) with its best-matching chunk as a ~200-character preview.
+    Each result is one note (deduped) with its closest-matching chunk as a ~200-character preview.
     Call `read_note` on a result's path to get the full note content.
 
     The header line carries a stale count and a truncated count, always —
