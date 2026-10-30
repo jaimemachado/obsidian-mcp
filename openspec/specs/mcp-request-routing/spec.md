@@ -1,7 +1,8 @@
 # mcp-request-routing Specification
 
 ## Purpose
-TBD - created by archiving change harden-cross-layer-integrity. Update Purpose after archive.
+How an MCP request reaches a tool and what is recorded about it: middleware and the root fallback, the vault-assignment admission gate, refusal and usage logging with denormalised attribution, typed tool outcomes, concurrency and body-memory admission, unknown-argument refusal, and the published tool surface — titles, annotations, instructions, description caps and the listing fixtures that pin every tool's schema, `get_changes` (#351) included.
+
 ## Requirements
 ### Requirement: Root MCP fallback preserves application middleware
 An MCP request accepted through the bearer-authenticated root-path fallback SHALL traverse the same trust, proxy, CORS, session, security-header, and compression middleware boundary as the canonical MCP path. Routing MUST NOT recursively invoke the root fallback.
@@ -1215,12 +1216,12 @@ Every tool the server lists SHALL carry a non-empty `title` and a `ToolAnnotatio
 
 #### Scenario: Every listed tool carries complete metadata
 - **WHEN** a client lists tools
-- **THEN** each of the 26 tools SHALL carry a non-empty `title`, distinct from every other tool's
+- **THEN** each of the 27 tools SHALL carry a non-empty `title`, distinct from every other tool's
 - **AND** each SHALL carry `annotations` with `readOnlyHint`, `destructiveHint`, `idempotentHint` and `openWorldHint` each `true` or `false`, none absent
 
 #### Scenario: The read tools are marked read-only
 - **WHEN** a client lists tools
-- **THEN** `keyword_search`, `semantic_search`, `read_note`, `list_notes`, `get_tags`, `get_recent`, `get_vault_guide`, `read_file`, `list_files`, `get_backlinks`, `get_links`, `get_neighborhood`, `find_related`, `find_orphans`, `check_upload` and `list_tasks` SHALL each carry `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`, `openWorldHint=false`
+- **THEN** `keyword_search`, `semantic_search`, `read_note`, `list_notes`, `get_tags`, `get_recent`, `get_vault_guide`, `read_file`, `list_files`, `get_backlinks`, `get_links`, `get_neighborhood`, `find_related`, `find_orphans`, `check_upload`, `list_tasks` and `get_changes` SHALL each carry `readOnlyHint=true`, `destructiveHint=false`, `idempotentHint=true`, `openWorldHint=false`
 - **AND** no other tool SHALL carry `readOnlyHint=true`
 
 #### Scenario: The destructive set is the write bucket minus create_note plus request_upload
@@ -1297,19 +1298,19 @@ Every tool's published description — the string the registry holds, which is t
 - **AND** the extractor SHALL accept `read_note.frontmatter_yaml` and SHALL flag `read_notes.frontmatter_yaml`
 
 ### Requirement: Tool metadata SHALL leave the published tool surface otherwise unchanged
-Adding titles, annotations and instructions, and shortening descriptions, SHALL NOT change the set of tool names, their listing order, any tool's `inputSchema`, or any tool's `outputSchema`. The first 25 entries of the listing SHALL be compared against the frozen fixture generated from the registry on `main` at 5a391ca, and every entry after them SHALL be compared, in order, against `tests/fixtures/tools_list_schema_additions.json`, which a tool-adding change regenerates deliberately; `list_tasks` (#350) is its first entry, so the listing holds 26 tools. A schema change to an existing tool SHALL be a deliberate regeneration of a fixture and never a side effect.
+Adding titles, annotations and instructions, and shortening descriptions, SHALL NOT change the set of tool names, their listing order, any tool's `inputSchema`, or any tool's `outputSchema`. The first 25 entries of the listing SHALL be compared against the frozen fixture generated from the registry on `main` at 5a391ca, and every entry after them SHALL be compared, in order, against `tests/fixtures/tools_list_schema_additions.json`, which a tool-adding change regenerates deliberately; `list_tasks` (#350) is its first entry and `get_changes` (#351) its second, so the listing holds 27 tools. A deliberate schema change to one of the first 25 tools SHALL be recorded as a full replacement entry in `tests/fixtures/tools_list_schema_amendments.json`, and that entry SHALL be compared instead of the frozen one; the frozen fixture itself SHALL NOT be edited. The change-feed change (#351) records exactly two amendments, `list_notes` and `get_recent`, each differing from its frozen entry only by the optional `since`, `until`, `order_by` and `cursor` input properties. A schema change to an existing tool SHALL be a deliberate fixture regeneration and never a side effect.
 
 #### Scenario: The same 25 tools in the same order, then the additions
 - **WHEN** a client lists tools
 - **THEN** the first 25 names SHALL equal the sequence recorded in `tests/fixtures/tools_list_schema_5a391ca.json`
-- **AND** the remaining names SHALL equal the sequence recorded in `tests/fixtures/tools_list_schema_additions.json`, which after this change is exactly `list_tasks`, for 26 tools in all
+- **AND** the remaining names SHALL equal the sequence recorded in `tests/fixtures/tools_list_schema_additions.json`, which after this change is exactly `list_tasks`, `get_changes`, for 27 tools in all
 
 #### Scenario: Every schema is identical to the fixture
-- **WHEN** each tool's `inputSchema` and `outputSchema` are compared with the entry of the same name in whichever of the two fixtures holds it
+- **WHEN** each tool's `inputSchema` and `outputSchema` are compared with the entry of the same name in the amendments fixture if it holds one, and otherwise in whichever of the two other fixtures holds it
 - **THEN** each SHALL be equal as a JSON value
-- **AND** the set of tools carrying an `outputSchema` SHALL be unchanged apart from the additions (`list_tasks` returns `str` and carries one) — on 5a391ca every tool but `read_file` carries one (the SDK wraps a `str` return as `{"result": string}`; `read_note` publishes its model's schema; `read_file` returns content blocks and has none)
+- **AND** a test SHALL assert that each amendment differs from its frozen entry only by the four optional properties, none of them listed in `required`, and that the amendments fixture names exactly `get_recent` and `list_notes`
+- **AND** the set of tools carrying an `outputSchema` SHALL be unchanged apart from the additions (`list_tasks` and `get_changes` return `str` and carry the SDK's `{"result": string}` wrapper) — on 5a391ca every tool but `read_file` carries one (the SDK wraps a `str` return as `{"result": string}`; `read_note` publishes its model's schema; `read_file` returns content blocks and has none)
 
 #### Scenario: Unknown-argument refusal is unaffected
-- **WHEN** `tests/test_issue_295_unknown_arguments.py` runs with only its tool count moved from 25 to 26
-- **THEN** it SHALL pass, and every `inputSchema`, `list_tasks`'s included, SHALL carry `additionalProperties: false`
-
+- **WHEN** `tests/test_issue_295_unknown_arguments.py` runs with only its tool count moved from 26 to 27
+- **THEN** it SHALL pass, and every `inputSchema`, `get_changes`'s included, SHALL carry `additionalProperties: false`
