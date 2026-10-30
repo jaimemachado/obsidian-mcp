@@ -86,7 +86,7 @@ This is what `llama-server --reranking` serves, and vLLM, Infinity and Jina's AP
 
 - Reranked order: `rerank_score DESC`, then the candidate's unreranked position ASC (a deterministic, order-preserving tie-break). The page is the first `limit` rows of that order.
 - Every other field on a row (similarity, stale, truncated, and for hybrid the fused score, ranks and `explain`) keeps its unreranked value. The reranker changes the order and adds `rerank_score`, nothing else.
-- **All or nothing.** Either every candidate has a validated score and the page is in reranked order, or no score is used and the page has the `rerank=false` page's rows, order, fields and preview selection, rendered in the `rerank=true` encoding (D9), with a `reranked: false (<code>)` header. There is no partial reranking: no "scored the first 30" and no mixing of scored and unscored rows.
+- **All or nothing.** Either every candidate has a validated score and the page is in reranked order, or no score is used and the page equals the capped unreranked `rerank=true` baseline (the unreranked order rendered in the `rerank=true` encoding under the same cap, D9) in rows, order, fields and preview selection, with a `reranked: false (<code>)` header. There is no partial reranking: no "scored the first 30" and no mixing of scored and unscored rows.
 
 ### D6. `hybrid_search` (when it exists)
 
@@ -179,7 +179,7 @@ Found 10 semantic matches for "deploy runbook" — 0 stale, 0 truncated — rera
 
 ### D13. Docstrings and the tool schema
 
-- Both tools gain `rerank: bool = False`. The docstring sentence (≤ 4,000 characters on the wire stays true) reads: "`rerank=true` asks the deployment's reranker to reorder the candidates this call already fetched. It can add up to the configured timeout. Its rows are one-line quoted objects followed by server fields. The header says `reranked: true` or `reranked: false (<reason>)`, and an unreranked page holds the same rows in the same order as `rerank=false`." No "better", "best" or "recommended". The peers rule (feedback: no tool or mode ranked above another) applies to the argument too.
+- Both tools gain `rerank: bool = False`. The docstring sentence (≤ 4,000 characters on the wire stays true) reads: "`rerank=true` asks the deployment's reranker to reorder the candidates this call already fetched. It can add up to the configured timeout. Its rows are one-line quoted objects followed by server fields. The header says `reranked: true` or `reranked: false (<reason>)`, and an unreranked page keeps the unreranked order." No "better", "best" or "recommended". The peers rule (feedback: no tool or mode ranked above another) applies to the argument too.
 - The annotations are unchanged: read-only, idempotent, closed-world. The reranker is deployment infrastructure, like the embedding provider (vault-tools.md L5).
 - `semantic_search` is one of the frozen 25. Its schema change is recorded as an **amendment entry** in `tests/fixtures/tools_list_schema_amendments.json`, which then names `get_recent`, `list_notes` and `semantic_search`. The amendment differs from the frozen entry only by the optional `rerank` boolean property (not in `required`). The frozen fixture is not edited. `hybrid_search`'s additions entry carries `rerank` from the start if both changes land in sequence, or gains it in the follow-up.
 - `SERVER_INSTRUCTIONS` is unchanged. The argument is discoverable from the schema, and the lead's 512-character budget is spoken for.
@@ -204,7 +204,7 @@ No migration and no re-derive. Deploy is merge → CI → image → Flux. To ena
 
 ## Owner decisions taken by default
 
-1. **`rerank` is always in the schema.** With no `RERANK_URL`, `rerank=true` returns the unreranked page marked `reranked: false (not_configured)`. It is not refused. A refusal would make one agent prompt fail on every deployment without a reranker, so a portable client would have to probe per server before sending an optional quality hint. The 1.0 tool-contract promise is a stable schema. The marker keeps it honest, and the page returned is exactly the correct `rerank=false` answer.
+1. **`rerank` is always in the schema.** With no `RERANK_URL`, `rerank=true` returns the unreranked page marked `reranked: false (not_configured)`. It is not refused. A refusal would make one agent prompt fail on every deployment without a reranker, so a portable client would have to probe per server before sending an optional quality hint. The 1.0 tool-contract promise is a stable schema. The marker keeps it honest, and the page returned is the correct unreranked answer in the `rerank=true` encoding (the capped baseline, D9).
 2. **One wire format: Jina-compatible `/v1/rerank`** (`llama-server`, vLLM, Infinity). TEI native and Cohere v2 are limitations (L1).
 3. **The scored unit is the note**: title plus best-distance chunk, cut to 2,048 characters. The candidates are the existing deduped overfetch, capped at 50 notes. There is no second retrieval.
 4. **A failed probe disables reranking, and the lifespan still starts.** A background re-probe (60 s doubling to 10 min, `RERANK_TIMEOUT_MS` per attempt) re-enables it. `enabled` is never revoked. (Revised in Codex round 1.)
@@ -233,7 +233,7 @@ Verdict on de4a738: FAIL, 10 MAJOR and 2 MINOR. All twelve were accepted and fol
 5. **MAJOR: the replay arm could not see candidates deeper than its depth.** → One shared `semantic_candidates` service for the tool and the arm, with a depth-20, rank-23 promotion test (D4, D12).
 6. **MAJOR: hybrid rerank arm membership.** → `keyword_or_semantic`, with per-constituent corpus loss (D12, search-evaluation delta).
 7. **MAJOR: hybrid `rerank_score` before the preview broke the fixed object.** → Appended after the separator. Hybrid's bounds are recomputed (D9).
-8. **MAJOR: a fallback was not byte-identical to `rerank=false`.** → Contract chosen: `rerank=false` is byte-identical, and `rerank=true` always uses the new encoding. A fallback equals the unreranked page by identities, order, fields and preview selection, plus the marker (D9, spec).
+8. **MAJOR: a fallback was not byte-identical to `rerank=false`.** → Contract chosen: `rerank=false` is byte-identical, and `rerank=true` always uses the new encoding. A fallback equals the unreranked page by identities, order, fields and preview selection, plus the marker (D9, spec). Superseded in round 2: the comparison baseline is the capped unreranked `rerank=true` page.
 9. **MAJOR: no slow-drip test of the deadline and pool.** → A `drip` fake mode asserting the fallback, the stream closed, occupancy ≤ 2 and a following fast success (D14, spec scenario).
 10. **MAJOR: the 27-tool routing delta contradicted the stated sequence.** → An explicit pre-implementation rebase task (0.1). The requirement text states both the 28-tool merged form and the 27-tool fallback.
 11. **MINOR: probe wrong-order and tie had no code.** → `probe_wrong_order` and `probe_tie` diagnostic codes (D7).
@@ -242,6 +242,10 @@ Verdict on de4a738: FAIL, 10 MAJOR and 2 MINOR. All twelve were accepted and fol
 ## Codex spec review, round 2 (2026-10-30)
 
 Verdict on 898f306: 11 of the 12 round-1 fixes were VERIFIED. One REGRESSED (MAJOR). The rendered-length cap (one abbreviated row, later rows dropped whole) contradicted "a fallback equals the `rerank=false` page": at `B = 1000`, `limit=10` and large escaped rows, `rerank=true` shows one row where `rerank=false` shows ten. → The contract is redefined against the **capped `rerank=true` baseline** (D9). The cap applies identically to success and every fallback, and its footer discloses the omitted count with `more: true`. The `rerank=false` page stays the byte-identical legacy rendering. L14 records the bounded omission. Multi-row success and fallback tests at the 1,000-character cap are added (task 7.4).
+
+## Codex spec review, round 3 (2026-10-30)
+
+Verdict on 2d8ea06: the spec and task 7.4 close the capped-page case. **NOT_FIXED on stale text only**: three places still stated the old "fallback equals the `rerank=false` page" contract (D5, tasks 11.2 and 13.1). The docstring draft (D13) and owner decision 1 carried the same phrasing. All of them now name the capped unreranked `rerank=true` baseline, and 11.2 keeps the separate `rerank=false` byte-identity check explicitly. This commit closes it. Verified by the supervisor by `git grep -n "rerank=false"` over the change, with no round 4.
 
 ## Accepted limitations
 
