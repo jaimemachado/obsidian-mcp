@@ -491,3 +491,39 @@ def _reset_indexer_scan_state():
     if indexer is not None:
         indexer._last_full_hash.clear()
         indexer.clear_sweep_state()
+
+
+#: Offline modules that exercise the change feed's own behaviour and must see
+#: the real helpers (they open no database session).
+_CHANGE_FEED_REAL = {"test_change_feed_offline.py", "test_note_hash.py"}
+
+
+@pytest.fixture(autouse=True)
+def _offline_change_feed(request, monkeypatch):
+    """Stub the change feed's database writers in the offline suite (#351).
+
+    The offline suite's fake sessions model the database only as far as each
+    module's own contract needs; the feed's statements (the advisory lock, the
+    event INSERT, the purges) would fail against them and turn every
+    `move_note` into a "DB update failed" partial outcome. Those statements are
+    pinned against real PostgreSQL in `tests/integration/test_change_feed_pg.py`,
+    which this fixture leaves untouched.
+    """
+    path = Path(str(request.node.fspath))
+    if "integration" in path.parts or path.name in _CHANGE_FEED_REAL:
+        yield
+        return
+    from src.services import change_feed
+
+    async def _append(*_a, **_k):
+        return 0
+
+    async def _none(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(change_feed, "append_events", _append)
+    monkeypatch.setattr(change_feed, "discard_scope", _none)
+    monkeypatch.setattr(change_feed, "purge_scope", _none)
+    monkeypatch.setattr(change_feed, "record_tool_events", _none)
+    monkeypatch.setattr(change_feed, "prune", _none)
+    yield
