@@ -24,6 +24,7 @@ from src.mcp_server.tools import (
     import_from_url_impl,
     list_files_impl,
     list_notes_impl,
+    list_tasks_impl,
     move_note_impl,
     read_file_impl,
     read_note_impl,
@@ -103,7 +104,7 @@ def _origin_patterns(origins) -> list[str]:
 #
 # The classification, pinned by `tests/test_issue_343_tool_metadata.py`
 # against the code rather than a list:
-#   read-only   = the fifteen tools that neither change vault bytes nor mint a
+#   read-only   = the sixteen tools that neither change vault bytes nor mint a
 #                 capability (idempotent, closed-world)
 #   destructive = the write-bucket set (`_tracked(write_class=True)`) minus
 #                 `create_note` (no-clobber, additive) plus `request_upload`
@@ -155,7 +156,9 @@ SERVER_INSTRUCTIONS = (
     "link graph is `get_backlinks`, `get_links`, `get_neighborhood`, "
     "`find_related` and `find_orphans`. Deletes are soft (`.trash/`) unless "
     "`permanent=true`. Calls are rate-limited per credential; a rate refusal "
-    "says when to retry and spends no daily quota."
+    "says when to retry and spends no daily quota. `list_tasks` lists checkbox "
+    "tasks across the vault from the index; Tasks-plugin query blocks are text "
+    "it does not evaluate."
 )
 
 
@@ -203,8 +206,10 @@ async def keyword_search(
     `aliases` are indexed above its body, so a query that is a note's title
     ranks that note first.
 
-    Each result carries `rank` (a relative score, not comparable across
-    queries), `match`, `matched_in` (`title` — title or aliases — and/or
+    Each result carries `rank` (a relative score: a body-only match scores in
+    the thousandths, a title match near 1, and an `any` row is scored against
+    the fallback query, so ranks compare only within one block of one page),
+    `match`, `matched_in` (`title` — title or aliases — and/or
     `body`, or `title+body` when the terms are split between them), `terms`
     (`k/n`: how many of the query's terms the note contains), and a second
     line: `snippet:` — the matching body text with the matches in `«»` — or
@@ -1183,6 +1188,73 @@ async def delete_file(
         expected_hash: Optional whole-file raw-byte digest of the incumbent.
     """
     return await delete_file_impl(path, permanent=permanent, expected_hash=expected_hash)
+
+
+# Registered after every other tool (#350, design D12), so the first 25 entries
+# of `tools/list` keep the order `tests/fixtures/tools_list_schema_5a391ca.json`
+# pins; tools added later append after it, in
+# `tests/fixtures/tools_list_schema_additions.json`.
+@mcp.tool(title="List tasks", annotations=_READ_ONLY)
+async def list_tasks(
+    folder: str | None = None,
+    status: str = "open",
+    due_by: str | None = None,
+    scheduled_by: str | None = None,
+    tags: list[str] | None = None,
+    limit: int = 100,
+    cursor: str | None = None,
+) -> str:
+    """List checkbox tasks (`- [ ] …`) across the vault in one call, from the index — no note is read.
+
+    Reads the index, refreshed each pass (default every 300 s): a just-edited
+    note may show its previous tasks until the next pass. Tasks-plugin and
+    Dataview query blocks are fenced text and are not evaluated; only the
+    checkbox lines themselves are tasks. A checkbox inside a fenced code block
+    or inline code is not a task.
+
+    Status: `[ ]`, `[/]` (in progress) and any other marker are `open`; `[x]`
+    and `[X]` are `done`; `[-]` is `cancelled` — excluded from `open`,
+    included in `all`. Each line shows the raw marker.
+
+    Ordering: due date ascending, undated tasks last, then path, then line.
+    When more rows match than fit, the header says `more: yes` and the
+    response ends with `next: <cursor>`; pass it back as `cursor` with the same
+    filters to continue. A cursor from other filters or another owner is
+    refused (`invalid_argument`); so is a compact cursor whose note has since
+    gone — start again without one.
+
+    Each task is one line: the marker, the path in backticks with `:line`, then any of due,
+    scheduled, start and done dates, priority, the task's own `#tags`, the
+    heading path (`under:`), and `text:` last, as written (Tasks-plugin
+    emoji included). Text past 1,000 characters is cut and labelled; a task
+    whose tags were capped (64 kept) says `tags cut`. A first row too long for
+    the response is shown abbreviated rather than skipped.
+
+    The header always states `not yet scanned for tasks` (notes the index has
+    not re-derived yet, e.g. right after an upgrade), `tasks could not be
+    indexed` and `over the task cap` (5,000 per note), each even when zero, and
+    with `tags` the count of tasks whose tags were cut. When either of the
+    first two is non-zero the list is incomplete and the response says so —
+    "no tasks" then does not mean none exist.
+
+    Args:
+        folder: Only notes under this path prefix (e.g. "Projects/").
+        status: `open` (default), `done`, `cancelled` or `all`.
+        due_by: `YYYY-MM-DD`; only tasks due on or before this date. Tasks
+            with no due date are excluded when it is given.
+        scheduled_by: `YYYY-MM-DD`; only tasks scheduled on or before this
+            date. Tasks with no scheduled date are excluded when it is given.
+        tags: Only tasks carrying every one of these inline tags on the task
+            line itself (a leading `#` is optional; note-level tags are not
+            consulted). At most 32, each 1–128 characters.
+        limit: Maximum tasks per page (1–500, default 100). The response size
+            cap can end a page sooner; `next` then continues it.
+        cursor: The `next` value from the previous page of the same query.
+    """
+    return await list_tasks_impl(
+        folder=folder, status=status, due_by=due_by, scheduled_by=scheduled_by,
+        tags=tags, limit=limit, cursor=cursor,
+    )
 
 
 def _forbid_unknown_arguments(server: FastMCP) -> None:

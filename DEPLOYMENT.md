@@ -552,7 +552,7 @@ docker compose -f docker-compose.simple.yml exec postgres \
 ```
 
 You should see the tables: `api_keys`, `notes_metadata`,
-`note_embeddings`, `note_links`, `oauth_clients`,
+`note_embeddings`, `note_links`, `note_tasks`, `oauth_clients`,
 `oauth_codes`, `oauth_tokens`, `transfer_tokens`, `usage_logs`,
 `users`, plus `alembic_version`, all owned by `obsidian_mcp`, and
 `obsidian_mcp` listed with no attributes beyond login (in particular,
@@ -756,6 +756,24 @@ deployment; on a compose-file deployment the equivalents are plain
   `docker compose -f docker-compose.simple.yml exec obsidian-mcp alembic check`
   should print "No new upgrade operations detected."
 
+  **Upgrading across migration 032 (task listing, #350).** 032 adds the
+  `note_tasks` table and two `notes_metadata` bits; it writes no row. The
+  extraction version moves to 4, so the first pass after the upgrade
+  re-derives every note once (the startup full-hash pass) and stores its
+  checkbox tasks for `list_tasks`. Nothing is re-embedded: version 4
+  shares version 3's embedding cleaner. Until that pass finishes,
+  `list_tasks` counts the notes not yet scanned in its header and
+  `move_note(rewrite_links=True)` returns `index_not_ready`. `list_tasks`
+  joins the `scan` concurrency class, so `CLASS_MAPPING_VERSION` moves to
+  3 and starts a new readiness epoch: `make concurrency-report` evidence
+  from before the upgrade does not carry over. **Rollback is
+  roll-forward:** a bare redeploy of the previous image re-extracts every
+  note and, having no version-4 cleaner, clears every note's embedding
+  certification; its embed pass then re-chunks every note and reuses every
+  stored vector (#281), so no provider calls are made, while
+  `semantic_search` marks those notes stale until it catches up. Rolling
+  forward again is one more re-derive. No new setting.
+
   **Upgrading across migration 031 (keyword ranking, #344).** 031
   rewrites every keyword vector so a note's title and frontmatter
   `aliases` rank above its body; ranking is right the moment the new
@@ -795,9 +813,9 @@ deployment; on a compose-file deployment the equivalents are plain
   container — `make deploy` and `make status` fail if a mount at
   `/app/backups` exists — and `.env` should be `0600` (`make init` sets it).
 
-  **What a dump contains.** Of the seventeen tables, five are a cache of the
+  **What a dump contains.** Of the eighteen tables, six are a cache of the
   vault plus settings — `notes_metadata`, `note_embeddings`, `note_links`,
-  `indexer_runs`, `indexer_state` — and their rows are the bulk of every
+  `note_tasks`, `indexer_runs`, `indexer_state` — and their rows are the bulk of every
   dump (one 1024-dimension vector per chunk). `make db-backup` dumps their
   *schema only* (`pg_dump --exclude-table-data=<table>` for each), so a
   restore followed by `alembic check` is clean and the first indexer pass
@@ -871,6 +889,76 @@ deployment; on a compose-file deployment the equivalents are plain
 - **Dependency audit.** `make audit` (pip-audit) and `make trivy` (image
   CVE scan) work from a checkout regardless of which compose file runs
   the container.
+
+### Measuring search quality
+
+Any change to the search path (ranking, chunking, the embedding model or
+provider, query parsing, fusion, a reranker) is measured with `make
+search-eval` on judgments mined from your own usage log: a search followed,
+within two minutes, by a successful `read_note` of one of the paths it
+returned, by the same API key or OAuth grant. The design and every rule are
+in [search](docs/architecture/search.md#search-evaluation-harness-356).
+`make search-eval` with no arguments runs on a committed synthetic fixture
+and needs nothing; the real run is this path, from a checkout with
+`requirements-dev.txt` installed:
+
+1. **Export.** `make search-eval-export [DAYS=90] USER_ID=<your user id>`.
+   It runs one read-only transaction holding one `SELECT` through the same
+   channel as `make db-backup` (`DB_BACKEND=docker` or `cnpg`, set in
+   `Makefile.local`), and writes the `keyword_search`, `semantic_search` and
+   `read_note` rows of the last `DAYS` days (1 to 365) to
+   `.search-eval/usage-export.jsonl` (`SEARCH_EVAL_DIR` to move it): a `0700`
+   directory, a `0600` file, git-ignored. **It is tenant data**: query text,
+   the paths agents read, owner ids. Never commit it, upload it or paste it
+   into an issue. On a multi-user deployment `USER_ID=` is required for a
+   report you will attach to a PR; an unfiltered export covers every user
+   and is for your private use only. `SEARCH_EVAL_DB_NAME` (default
+   `obsidian_mcp`, the name `make db-backup` dumps) names the database to
+   export from.
+2. **Back up with the derived tables.** `BACKUP_FULL=1 make db-backup`. The
+   default dump stores `notes_metadata` and `note_embeddings` as schema
+   only, and replay needs their rows.
+3. **Restore it into a scratch database**, never over the live one. For
+   example, on a throwaway pgvector container bound to loopback:
+
+   ```sh
+   docker run --rm -d --name omcp-eval -e POSTGRES_PASSWORD=<scratch password> \
+       -p 127.0.0.1:55499:5432 pgvector/pgvector:pg16
+   docker exec omcp-eval createuser -U postgres obsidian_mcp
+   docker exec omcp-eval createdb -U postgres eval_copy
+   gunzip -c <the backup>.sql.gz | docker exec -i omcp-eval psql -q -U postgres -d eval_copy
+   ```
+
+   `SEARCH_EVAL_DATABASE_URL` is then
+   `postgresql+asyncpg://postgres:<scratch password>@127.0.0.1:55499/eval_copy`.
+   It is the only replay target the harness documents; it never reads
+   `DATABASE_URL`.
+4. **Snapshot, before any candidate.**
+   `make search-eval-snapshot SEARCH_EVAL_DATA=.search-eval SEARCH_EVAL_DATABASE_URL=<scratch copy>`
+   records which indexed notes each arm can reach. Taken after a candidate
+   was applied, it would hide that candidate's lost notes as drift; the
+   harness cannot check the order. An existing snapshot is never replaced unless
+   you pass `FORCE=1`.
+5. **Apply the candidate to the copy**, if it changes indexed data (a
+   migration, a re-chunk, a re-embed).
+6. **Score.**
+   `make search-eval SEARCH_EVAL_DATA=.search-eval SEARCH_EVAL_DATABASE_URL=<scratch copy> ARMS="keyword semantic <candidate>" BASELINE=keyword`.
+   It mines the export (plus `.search-eval/manual.jsonl`, operator-written
+   judgments, when present), replays every arm against the copy and prints
+   a table; `report.json` lands next to the export. The built-in arms call
+   the server's own search services, so run it in an environment that
+   carries the server's search settings (`FTS_CONFIGS`, the embedding
+   provider settings, and a `SECRET_KEY`, which the settings module needs
+   to import). `MIN_QUERIES` (50) and `SEED` (0) are overridable.
+7. **Attach `report.json` to the PR only if it says `attachable: true`.** It
+   carries metrics, counts and hashes, no query text and no note paths. A
+   `CORPUS_LOSS` verdict means the candidate lost searchable notes for that
+   arm, and the run is not evidence. `INSUFFICIENT_DATA` means too few judged
+   queries for a verdict. A failed or running manifest means the run did not
+   finish: re-run it; `score` never falls back to an earlier run. There is no
+   pass/fail threshold: the reviewer reads the deltas against the baseline.
+
+Drop the scratch container afterwards (`docker rm -f omcp-eval`).
 
 ## Upgrading: split database roles
 

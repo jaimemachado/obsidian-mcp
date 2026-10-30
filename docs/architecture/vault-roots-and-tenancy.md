@@ -710,8 +710,15 @@ an ownerless credential handed over every tenant's paths, titles, tags,
 frontmatter and chunk excerpts (#127). `None` is now a scoping value — `IS
 NULL` — and every index-backed tool is swept to it: `keyword_search`,
 `semantic_search`, `list_notes`, `get_recent`, **`get_tags`**, `get_backlinks`,
-`get_links`, `get_neighborhood`, `find_related`, `find_orphans`. A single-user
-deployment sees no change; every row there is NULL-owned.
+`get_links`, `get_neighborhood`, `find_related`, `find_orphans`, and since
+#350 `list_tasks`. A single-user deployment sees no change; every row there is
+NULL-owned.
+
+- **`note_tasks` carries no `user_id` either** (#350, migration 032): a task
+  row's owner is its note's, and `list_tasks` puts `_note_owner_predicate` in
+  the ON clause of its join to `notes_metadata`, so a task under another
+  owner's note never resolves — rows and header counts alike. Its cursor is
+  bound to the owner scope by a discriminator and refused under any other.
 
 - **`note_links` carries no `user_id`, so ownership rides the endpoint rows —
   and *where* it rides decides two different things.** In a JOIN's ON clause a

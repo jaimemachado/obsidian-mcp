@@ -30,13 +30,19 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import ARRAY, insert
 
-from src.config import MAX_CHUNKS_PER_NOTE, MAX_LINKS_PER_NOTE, settings
+from src.config import (
+    MAX_CHUNKS_PER_NOTE,
+    MAX_LINKS_PER_NOTE,
+    MAX_TASKS_PER_NOTE,
+    settings,
+)
 from src.database import async_session
 from src.models.db import (
     IndexerRun,
     NoteEmbedding,
     NoteLink,
     NoteMetadata,
+    NoteTask,
     OAuthClient,
     OAuthCode,
     OAuthToken,
@@ -81,6 +87,7 @@ from src.services.links import (
     resolve_target,
 )
 from src.oauth.grants import lock_account_guard
+from src.services.tasks import extract_tasks_bounded, frontmatter_line_offset
 from src.services import vault_overlap
 from src.services.transfer import canonical_vault_root
 from src.services.vault import (
@@ -761,7 +768,17 @@ def _content_hash(content: str) -> str:
 # CLEARS, so it can never suppress an invalidation another rule mandates — a
 # content change, a `file_path` change, a provider change, exclusion
 # reconciliation.
-CURRENT_EXTRACTION_VERSION = 3
+#
+# Version 4 adds task extraction (#350). The bump is the backfill: every row
+# stamped 3 is changed for one pass, so it is parsed and gains its
+# `note_tasks` rows beside its re-derived tags, links and keyword vector. The
+# fence grammar did not change, so version 4's cleaner is version 3's (and so
+# version 1's) under a new key — no note is re-embedded on account of it.
+# `src.services.tasks.TASKS_SINCE_EXTRACTION_VERSION` names this version, and
+# `list_tasks` counts the caller's rows still below it as "not yet scanned
+# for tasks". A change to the task grammar or to any task-extraction cap is a
+# bump, like a change to the fence or link grammar.
+CURRENT_EXTRACTION_VERSION = 4
 
 
 def _grammar_changed_the_embedding_text(stamped_version: int, body: str) -> bool:
@@ -3268,6 +3285,10 @@ async def _index_vault_attempt(
         # pass treats every note as changed and therefore holds the whole
         # vault's parsed bodies for the duration of the pass.
         path_to_content: dict[str, str] = {}
+        # Beside it, filled on the same branch (#350, D3): the number of line
+        # terminators in each buffered body's frontmatter block, so a task's
+        # line number counts from the file's first line.
+        path_to_line_offset: dict[str, int] = {}
         for rel_path, found in scan.files.items():
             h = found.content_hash
             # A stale extraction marker makes a note changed even when its
@@ -3359,6 +3380,7 @@ async def _index_vault_attempt(
                     withholding.append(entry)
                 continue
             path_to_content[rel_path] = content
+            path_to_line_offset[rel_path] = frontmatter_line_offset(raw, content)
             title = _note_title(frontmatter, found.name)
 
             # Grammar-attributable embedding invalidation, scoped to notes
@@ -3890,10 +3912,13 @@ async def _index_vault_attempt(
             link_skips: list[str] = []
             # D3, site 4: each note's link inserts in their own savepoint.
             poisoned_links: list[tuple[str, str]] = []
-            await _update_links_for_changed(
+            changed_for_derivation = (
+                [n["file_path"] for n in to_upsert] + list(moved_new_paths)
+            )
+            link_paths_to_id = await _update_links_for_changed(
                 session,
                 vault,
-                [n["file_path"] for n in to_upsert] + list(moved_new_paths),
+                changed_for_derivation,
                 user_id=user_id,
                 path_to_content=path_to_content,
                 skips=link_skips,
@@ -3907,6 +3932,27 @@ async def _index_vault_attempt(
                 ])
             skips.extend(link_skips)
             withholding.extend(link_skips)
+
+            # ── Task rows for changed notes (#350, D4) ───────────────────
+            # The second per-note derivation, after the link rebuild, for the
+            # same changed list, in this transaction. Its missing-body and
+            # missing-id skips withhold exactly as the link rebuild's do; a
+            # task-derivation failure is isolated to that note's task rows
+            # (`tasks_failed`) and is never poison, never a skip. A third
+            # derivation (#351) is one more call after this one.
+            task_skips: list[str] = []
+            await _update_tasks_for_changed(
+                session,
+                changed_for_derivation,
+                user_id=user_id,
+                paths_to_id=link_paths_to_id,
+                bodies=path_to_content,
+                line_offsets=path_to_line_offset,
+                skips=task_skips,
+                skipped_paths=underived,
+            )
+            skips.extend(task_skips)
+            withholding.extend(task_skips)
 
         # ── Re-derive progress (#311, D3) ─────────────────────────────────
         # Mark every row this re-deriving pass fully derived — upserted or
@@ -4322,6 +4368,10 @@ async def _update_links_for_changed(
     (`index-integrity`, "A capped note does not withhold the record").
 
     `vault` is retained in the signature and is deliberately unused for reads.
+
+    Returns the pass's `paths_to_id` map (this scope's `file_path -> id`,
+    read in this transaction after the upsert), which the task derivation
+    reuses (#350, D4) — or None when it returned early on poison.
     """
     bodies = path_to_content if path_to_content is not None else {}
     # Build vault_index once for the entire pass — scoped to this user when set.
@@ -4449,7 +4499,7 @@ async def _update_links_for_changed(
 
             if poisoned:
                 # The caller rolls this attempt back and restarts.
-                return
+                return None
 
             # The marker is derived state, exactly like the rows: set where
             # this pass capped, cleared where it did not, in the same
@@ -4533,6 +4583,215 @@ async def _update_links_for_changed(
             f"{where_extra}"
         )
         await session.execute(text(reresolve_sql), params)
+    return paths_to_id
+
+
+class _TaskExtractionFailed(Exception):
+    """The task extractor raised. Wrapped so the savepoint helper can tell an
+    extractor bug (a derivation failure, design D4) from a database error."""
+
+    def __init__(self, cause: BaseException):
+        super().__init__(type(cause).__name__)
+        self.cause = cause
+
+
+async def _task_savepoint(session, run) -> BaseException | None:
+    """Run `await run()` in a savepoint (#350, D4).
+
+    Returns the exception when it is a **derivation failure** — the extractor
+    raised (`_TaskExtractionFailed`) or a statement failed with a poison
+    SQLSTATE — and the savepoint rolled back cleanly; None on success.
+    Anything else re-raises, and so does a savepoint whose rollback itself
+    failed (the exception leaving the block is then not the body's), for the
+    reason `_savepoint_poison` gives (C4).
+    """
+    body_exc: BaseException | None = None
+    try:
+        async with session.begin_nested():
+            try:
+                await run()
+            except Exception as e:
+                body_exc = e
+                raise
+    except Exception as exc:
+        if exc is not body_exc:
+            raise
+        if isinstance(exc, _TaskExtractionFailed) or poison_sqlstate(exc) is not None:
+            return exc
+        raise
+    return None
+
+
+async def _update_tasks_for_changed(
+    session,
+    changed_paths: list[str],
+    *,
+    user_id: int | None = None,
+    paths_to_id: dict[str, int] | None,
+    bodies: dict[str, str],
+    line_offsets: dict[str, int],
+    skips: list[str],
+    skipped_paths: set[str] | None,
+) -> None:
+    """Re-derive `note_tasks` for every changed note (#350, design D4).
+
+    The second per-note derivation of the pass, called right after
+    `_update_links_for_changed` with the same changed list, in the pass's
+    transaction. It follows the composition rule in `src.services.tasks`:
+
+    - **No file read.** Bodies come from the scan's buffer (`bodies`), line
+      offsets from the parallel `line_offsets`. A changed path with no
+      buffered body or no row in `paths_to_id` is appended to `skips` and
+      `skipped_paths`, so a re-derive's record is withheld (#311), exactly
+      as the link rebuild records the same two cases.
+    - **Per note, in its own savepoint**: delete the note's task rows, insert
+      the extracted ones in batches of 1,000, clear `tasks_failed` and set or
+      clear `tasks_truncated` (one UPDATE, predicated on a value changing).
+    - **Failure isolation.** A derivation failure — the extractor raised, or
+      one of the note's statements failed with a poison SQLSTATE — rolls the
+      savepoint back and is retried once in a fresh one. If the retry fails
+      too, a third savepoint deletes the note's task rows and sets
+      `tasks_failed`, with one ERROR line (path, exception class, SQLSTATE —
+      never content). It is **not** poison: nothing is appended to a
+      `poisoned` list, no `PoisonNote` is raised, nothing is quarantined, and
+      it is not a skip. Any other database error propagates and fails the
+      pass with nothing committed.
+    - A note over `MAX_TASKS_PER_NOTE` keeps its first N tasks, has
+      `tasks_truncated` set and is logged at ERROR. Not a skip.
+    """
+    if not changed_paths:
+        return
+    if paths_to_id is None:
+        # The link rebuild returned no map (it only does so on poison, after
+        # which the caller restarts without reaching here). Read the same map
+        # it would have, in this transaction, rather than trust that.
+        stmt = select(NoteMetadata.file_path, NoteMetadata.id)
+        if user_id is None:
+            stmt = stmt.where(NoteMetadata.user_id.is_(None))
+        else:
+            stmt = stmt.where(NoteMetadata.user_id == user_id)
+        paths_to_id = {r.file_path: r.id for r in (await session.execute(stmt)).all()}
+
+    total_rows = 0
+    truncated_count = 0
+    failed_count = 0
+    for path in changed_paths:
+        note_id = paths_to_id.get(path)
+        if note_id is None:
+            skips.append(f"{path} (no index row for the task rebuild)")
+            if skipped_paths is not None:
+                skipped_paths.add(path)
+            continue
+        body = bodies.get(path)
+        offset = line_offsets.get(path)
+        if body is None or offset is None:
+            skips.append(f"{path} (no buffered body for the task rebuild)")
+            if skipped_paths is not None:
+                skipped_paths.add(path)
+            continue
+
+        outcome: dict = {}
+
+        async def _derive(note_id=note_id, body=body, offset=offset, outcome=outcome):
+            outcome.clear()
+            try:
+                # Off the loop, like `extract_links_bounded` (#180, D3).
+                extracted, truncated = await asyncio.to_thread(
+                    extract_tasks_bounded,
+                    body,
+                    line_offset=offset,
+                    max_tasks=MAX_TASKS_PER_NOTE,
+                )
+            except Exception as e:
+                raise _TaskExtractionFailed(e) from e
+            await session.execute(delete(NoteTask).where(NoteTask.note_id == note_id))
+            rows = [
+                {
+                    "note_id": note_id,
+                    "line": t.line,
+                    "status_char": t.status_char,
+                    "state": t.state,
+                    "text": t.text,
+                    "text_cut": t.text_cut,
+                    "due": t.due,
+                    "scheduled": t.scheduled,
+                    "start": t.start,
+                    "done_on": t.done_on,
+                    "priority": t.priority,
+                    "tags": t.tags,
+                    "tags_cut": t.tags_cut,
+                    "heading_path": t.heading_path,
+                }
+                for t in extracted
+            ]
+            extracted = []
+            for start in range(0, len(rows), 1000):
+                await session.execute(insert(NoteTask).values(rows[start:start + 1000]))
+            await session.execute(
+                update(NoteMetadata)
+                .where(
+                    NoteMetadata.id == note_id,
+                    or_(
+                        NoteMetadata.tasks_failed.is_(True),
+                        NoteMetadata.tasks_truncated.is_(not truncated),
+                    ),
+                )
+                .values(tasks_failed=False, tasks_truncated=truncated)
+            )
+            outcome["rows"] = len(rows)
+            outcome["truncated"] = truncated
+
+        first = await _task_savepoint(session, _derive)
+        if first is not None:
+            again = await _task_savepoint(session, _derive)
+            if again is not None:
+                async def _mark_failed(note_id=note_id):
+                    await session.execute(
+                        delete(NoteTask).where(NoteTask.note_id == note_id)
+                    )
+                    await session.execute(
+                        update(NoteMetadata)
+                        .where(NoteMetadata.id == note_id)
+                        .values(tasks_failed=True)
+                    )
+
+                async with session.begin_nested():
+                    await _mark_failed()
+                failed_count += 1
+                cause = again.cause if isinstance(again, _TaskExtractionFailed) else again
+                # Path, exception class and SQLSTATE only — never content and
+                # never the driver's message, which can quote the value.
+                logger.error(
+                    "Task derivation failed for %s%s (%s, SQLSTATE %s) on the "
+                    "attempt and on its retry: the note's task rows are absent "
+                    "and notes_metadata.tasks_failed is set, so `list_tasks` "
+                    "counts it as a note whose tasks could not be indexed. The "
+                    "note itself stays indexed; this is not a quarantine.",
+                    _loggable_path(path),
+                    f" (user_id={user_id})" if user_id is not None else "",
+                    type(cause).__name__,
+                    poison_sqlstate(cause) or "none",
+                )
+                continue
+        total_rows += outcome.get("rows", 0)
+        if outcome.get("truncated"):
+            truncated_count += 1
+            logger.error(
+                "Task extraction truncated for %s: the note holds more than "
+                "MAX_TASKS_PER_NOTE=%d checkbox lines; the first %d in "
+                "document order were stored and notes_metadata.tasks_truncated "
+                "was set, so `list_tasks` counts this note as capped. A "
+                "declared degradation, not a skip.",
+                _loggable_path(path),
+                MAX_TASKS_PER_NOTE,
+                outcome.get("rows", 0),
+            )
+
+    logger.info(
+        f"Re-extracted tasks for {len(changed_paths)} notes ({total_rows} task rows)"
+        + (f", {truncated_count} truncated at {MAX_TASKS_PER_NOTE}" if truncated_count else "")
+        + (f", {failed_count} failed" if failed_count else "")
+    )
 
 
 async def _ancillary_pass_is_permitted(

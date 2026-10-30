@@ -837,6 +837,11 @@ next unforeseen value costs one note rather than its owner's whole index.
   most five, then `…`), and `/health` counts them as `quarantined_notes`
   (`degraded`, no paths). **A quarantining pass is a successful pass**:
   nothing derives success from the `error` column.
+- **Task rows are not a quarantine site** (#350). A failure of one note's
+  `note_tasks` write (a poison SQLSTATE, or the task extractor raising) is
+  isolated to that note's task rows — a savepoint, one retry, then
+  `notes_metadata.tasks_failed` — and never raises `PoisonNote`. The four
+  sites above are the whole set; see "Task extraction (#350)" below.
 
 ## A pass does not prune what it could not see (#309)
 
@@ -1033,6 +1038,103 @@ amplification by a rarer route. #308's accounting made it visible
   transaction commits only after the A stamp, is not detected (one committing
   before the final re-read NULLs a marker and withholds the stamp) — the stamp matches A, so no re-derive follows (triaged
   implausible; no cross-writer lock protocol).
+
+## Task extraction (#350)
+
+`note_tasks` holds one row per checkbox list item of a note body, so
+`list_tasks` can answer "what is open" from the index in one bounded call.
+The 2026-10-23 morning-briefing incident (≈ 400 `read_note` calls in ≈ 100 s
+against a task index made of Tasks-plugin query blocks) is what it replaces.
+
+### The table is keyed by note id, with no path and no owner (D1)
+
+`note_tasks.note_id` → `notes_metadata.id` `ON DELETE CASCADE`; the path and
+the owner come from the join. Duplicating either would need a writer on every
+move path (the pass's id-preserving branch and `move_note`'s UPDATE), and one
+that forgot would list a task under a path that no longer exists or under
+another tenant. Keyed by id, a task cannot outlive its note (prune, quarantine
+removal, provenance discard and user delete all cascade), cannot precede it
+(the FK), and follows an id-preserving move without a write. No content hash
+is stored: every task write is in the transaction that wrote the row's hash,
+from the same buffered body.
+
+### The grammar (D2, D3)
+
+`src/services/tasks.py`, one pure function, `extract_tasks_bounded`, run off
+the loop. It masks the body with the shared fence grammar (`BODY` context),
+splits lines under the universal-newline rule, and recognises a checkbox on
+the **masked** line with a possessive, line-anchored pattern (blockquote
+prefixes, any indentation, `-`/`*`/`+` or 1–9 digits with `.`/`)`, a
+one-code-point marker that is U+0020 or non-whitespace other than `[`/`]`).
+The #218 rule applies: the original and masked text must be equal through the
+closing `]`, so `` `- [ ]` `` in inline code is not a task. `x`/`X` are done,
+`-` is cancelled, every other marker (`/`, `>`, `!`, …) is open, and the raw
+marker is stored. Fields come from the masked slice — last occurrence of each
+family wins, an invalid date is NULL and never an error — and tags from the
+shared inline-tag rule (`vault.INLINE_TAG_RE`), longer than 128 dropped, the
+first 64 distinct kept in document order, `tags_cut` on either drop. The
+heading path is the stack of column-zero ATX headings above the task. Caps:
+`MAX_TASKS_PER_NOTE` (5,000; `tasks_truncated`, not a skip),
+`TASK_TEXT_MAX_CHARS` (1,000; `text_cut`), 200 per heading and 512 for the
+path. **Any change to the grammar or to these caps is an extraction-version
+bump.** Accepted divergences from the Tasks plugin: checkboxes inside HTML or
+`%% %%` comments and fences nested in callouts are listed (the flat fence
+grammar, L1); signifiers count anywhere on the line, not only trailing (L2);
+custom statuses, recurrence, created/cancelled dates and dependencies are not
+modelled (L6); nesting is visible only through line order (L7).
+
+### The seam: a second per-note derivation beside the link rebuild (D4)
+
+`_update_tasks_for_changed` runs immediately after `_update_links_for_changed`
+(after its poison check), for the same changed list (upserted plus moved
+paths), in the pass's transaction and before the re-derive marks. The link
+rebuild returns its `paths_to_id`, which the task stage reuses. Per note, in
+its own savepoint: delete the note's rows, insert the extracted ones in batches
+of 1,000, clear `tasks_failed` and set or clear `tasks_truncated` (one UPDATE,
+predicated on a value changing). A changed path with no buffered body (or line
+offset) or no id is appended to the shared `skips` / `skipped_paths`, which
+withholds a re-derive's record (#311), as the link rebuild does. It reads no
+file. The scan buffers each body's frontmatter line count beside the body, so
+a task's line counts from the file's first line.
+
+**Failure isolation, and why it is not the quarantine.** A derivation
+failure — the extractor raised, or one of the note's statements failed with a
+poison SQLSTATE (class 22 or 54000) — rolls the savepoint back and is retried
+once in a fresh one. If the retry also fails, a third savepoint deletes the
+note's task rows and sets `tasks_failed`, with one ERROR line (path, exception
+class, SQLSTATE; never content or the driver's message). The note's row,
+keyword vector, links, embeddings and the pass are untouched; nothing goes to
+`poisoned`, no `PoisonNote` is raised, and it is not a skip, so a permanently
+failing note cannot hold its owner in re-derive mode (#311). The quarantine
+exists for writes that *are* the note; task rows are a view of it, and
+quarantining on their account would drop an otherwise searchable note from
+every tool — and from `list_tasks`'s own counts, silently. Any other database
+error propagates and fails the pass with nothing committed. The bit is cleared
+only by a later successful derivation, which every content change, version
+bump or re-derive runs. All three entry points (startup, periodic, panel
+Reindex) reach the same code through `_index_vault_attempt`.
+`tests/test_note_tasks_isolation.py` pins that the stage never names
+`PoisonCandidate` / `PoisonNote`.
+
+**The composition rule, for the next derivation (#351).** A per-note
+derivation (1) is keyed by `notes_metadata.id` with `ON DELETE CASCADE`, (2) is
+a pure function of the buffered body and the extraction version, (3) runs after
+the link rebuild in the same transaction for the same changed list, (4) records
+a missing body or id in the shared skip lists, (5) never reads a file, and (6)
+isolates its own failure (savepoint, one retry, an owner-visible bit — never the
+quarantine, never a pass failure). A third derivation is one more call after
+`_update_tasks_for_changed`. A change feed must key on a content-hash change,
+not on membership in the changed set: the version-4 bump makes every row
+"changed" for one pass.
+
+### What `list_tasks` can and cannot see
+
+It reads only the index, so it is one pass behind an edit (L5,
+`INDEX_INTERVAL_SECONDS`). Rows stamped below version 4 have not been scanned
+for tasks; the tool counts them in every header (`not yet scanned for tasks`)
+rather than reporting "no tasks", alongside `tasks could not be indexed`
+(`tasks_failed`) and `over the task cap` (`tasks_truncated`). The rendering and
+cursor rules are in [vault tools](vault-tools.md#list_tasks-rendering-and-the-cursor-350).
 
 ## Non-finite frontmatter numbers, and the one title rule (#154)
 
@@ -2306,6 +2408,24 @@ existing owner-scoped `move_note(rewrite_links=True)` refusal lasts until that
 scope's markers are current. The version-2 row repair and unchanged vectors
 are pinned against PostgreSQL in
 `tests/integration/test_issue_150_extraction_version_pg.py`.
+
+### Version 4 adds task extraction (#350)
+
+Task rows are new derived state, so every existing note has to be parsed once
+to gain them; `content_hash` cannot see that, so the marker moves. The fence
+and link grammars did not change, and version 4's cleaner is version 3's
+(`_EXTRACTION_CLEANERS[4] = clean_for_embedding`), so
+`_grammar_changed_the_embedding_text` is False for every v3 row and **nothing
+is re-embedded**: the cost is one re-derive pass (tags, links, keyword vector,
+tasks), the same as the v2 and v3 bumps. `TASKS_SINCE_EXTRACTION_VERSION = 4`
+in `src/services/tasks.py` is what `list_tasks` compares against for its
+not-yet-scanned count. During the window `move_note(rewrite_links=True)`
+refuses with `index_not_ready`, as after every bump. A bare redeploy of the
+v3 image (L8) re-extracts every note, and — having no version-4 cleaner —
+clears every note's embedding certification; its embed pass then re-chunks
+every note with full vector reuse (#281) and no provider calls. It never
+reads or writes `note_tasks`, and the cascade still holds. Rolling forward
+again is one more re-derive.
 
 ### The frozen v0 cleaner is a line scanner with the regexes as its oracle
 
