@@ -569,6 +569,11 @@ Recorded numbers on that corpus: rare-term keyword query 228 buffers with the
 hint vs 29,071 sequential; common-term 57,799 either way (seq scan is the right
 plan there, so it is recorded, not asserted).
 
+These benchmarks prove the index does not lose candidates against an exact
+scan; they cannot say whether the notes returned are the ones an agent
+needed. Their relevance counterpart is the
+[search evaluation harness](#search-evaluation-harness-356) below.
+
 ## Per-phase search timing
 
 `usage_logs.params` carries `embed_ms` + `db_ms` + `exact_fallback` for
@@ -642,3 +647,175 @@ Reading side: `src/services/search_analytics.py` and
 keys on `(usage_logs.user_id, path)` with `IS NOT DISTINCT FROM` — is written
 down there and in [usage attribution](usage-attribution.md).
 
+## Search evaluation harness (#356)
+
+Retrieval quality is measured offline, on judgments mined from the
+operator's own `usage_logs`, by `scripts/search_eval/` (`python -m
+scripts.search_eval mine | snapshot | run | score`, wrapped by `make
+search-eval-export`, `make search-eval-snapshot` and `make search-eval`).
+It reads only what the "Search result telemetry (#161)" contract above
+already writes, and changes no search tool, no telemetry key, no panel and
+no schema. The step-by-step operator path is DEPLOYMENT.md, "Measuring
+search quality"; this section is the why.
+
+**What a judgment is.** A usable `read_note` row for path *p* by principal
+*P* credits `(query, p)` only when a usable `keyword_search` /
+`semantic_search` row by the same *P* is strictly earlier, inside the
+window (`R.created_at - W < S.created_at < R.created_at`, W = 120 s by
+default), and its logged `result_paths` contains *p* by exact string
+equality. When several searches qualify, only the **latest** is credited
+(ties broken by row id), so one read credits at most one search; a read
+that credits nothing is counted as `unattributed_reads`.
+
+- **The principal is the credential principal the rate limiter uses**:
+  `(user_id, "api_key", key_id)` when `key_id` is set, otherwise
+  `(user_id, "oauth", grant_id)` when `oauth_token_id` resolves to a token
+  row carrying a `grant_id` (the export joins `oauth_tokens` for it). Any
+  other row is excluded as `unresolved_principal` and **never** merged under
+  `actor_ref`: one `client_id` covers many independently revocable grants,
+  and merging them would credit one agent's read to another agent's search.
+- **Usable** means `params.error` absent or null and `params.over_quota` not
+  true (the Python mirror of `search_analytics.analysable_sql`; an
+  integration test pins the equivalence). A usable search also carries a
+  `result_paths` array of strings and a non-empty query the 200-character
+  param cap did not truncate (length 201 ending in `…`, which cannot be
+  replayed faithfully); a usable read carries a non-truncated `path`. Every
+  exclusion is counted by reason in `mine-report.json`.
+- **A query** is `(user_id, whitespace-normalized text, canonical JSON of
+  {folder, tags, frontmatter})`, its id the first 16 hex digits of that
+  tuple's sha256. Searches sharing it fold into one query; its relevant set
+  is the union of credited paths (grade 1), its **pool** the union of every
+  logged `result_paths`. `sources` is a set: an operator-written judgment
+  with the same identity merges in, and a query in both `mined` and `manual`
+  is scored in both slices and counted once in `n_both_sources`. A class,
+  `identifier` or `prose`, comes from a table-tested heuristic in
+  `classify.py`; a manual judgment's explicit class overrides it.
+
+**Read-only, and its limit.** The export (`scripts/search_eval_export.sql`)
+is one `BEGIN TRANSACTION READ ONLY` / one `SELECT` / `COMMIT`, run by psql
+through `docker/db-exec.sh`, the channel `make db-backup` uses; a test parses
+the file and fails on any added statement, and the integration gate runs the
+real Make target through a `DB_EXEC` shim. Replay connects only to
+`SEARCH_EVAL_DATABASE_URL` (or `--database-url`), never `DATABASE_URL`, and
+the documented target is a disposable copy restored from a `BACKUP_FULL=1`
+dump. **The built-in `keyword` and `semantic` arms write nothing** (they call
+the services directly, never through `_tracked`, and an integration test
+reads `pg_stat_user_tables` before and after). **An imported arm runs with
+whatever the replay URL permits**: it can open its own engine or `SET
+TRANSACTION READ WRITE`, so the restored copy is what protects data. Every
+replay connection sets `default_transaction_read_only=on` and `run` asserts
+`SHOW transaction_read_only = on` first; that is a backstop against an
+accidental write through the supplied sessions (25006, and the run fails),
+not a guarantee about every arm.
+
+**The snapshot, drift and corpus loss.** `make search-eval-snapshot` records,
+on the restored copy **before any candidate is applied**, every
+`notes_metadata` row per owner (NULL-safe) with its searchable membership:
+
+| membership | definition |
+|---|---|
+| `metadata` | the `notes_metadata` row exists |
+| `keyword` | `notes_metadata.content_tsvector IS NOT NULL` |
+| `semantic` | at least one `note_embeddings` row with `note_id = notes_metadata.id` |
+| `keyword_and_semantic` | both (a hybrid draws from both, so losing either changes it) |
+
+`embedded_content_hash` is not part of `semantic`: under #200 a stale vector
+is annotated and still returned (the snapshot records `stale_vector` for
+information). Two absences are kept apart:
+
+- **Vault drift**: a judged path absent from the snapshot was renamed or
+  deleted before any candidate. It leaves the qrels (`dropped_paths`), and a
+  query left empty is dropped (`dropped_queries`).
+- **Candidate corpus loss**: a judged path the snapshot marks searchable under
+  an arm's membership, but the replay database does not. It **stays relevant
+  and counts as a miss**, is reported as that arm's `corpus_loss`, and any
+  loss makes the verdict `CORPUS_LOSS` (exit 2): the run is not evidence. A
+  path not searchable under the membership even in the snapshot is
+  `unsearchable_before`, a miss for baseline and candidate alike, never loss.
+  The replay corpus never shrinks the qrels.
+
+Worked examples: Q has relevant {A.md, B.md} and the incumbent returns both.
+A candidate whose derivation deletes B.md's `notes_metadata` row returns only
+A.md: recall@10 0.5, `corpus_loss: 1`, exit 2. A re-embedding pass that deletes
+B.md's `note_embeddings` and then fails leaves the row and its tsvector: the
+`semantic` arm (and any `semantic` or `keyword_and_semantic` candidate) gets
+`corpus_loss: 1`, the `keyword` arm none.
+
+**Arms and generations.** An arm is an async `(EvalQuery, depth) -> list[str]`
+built by a factory from an `ArmContext` (read-only session factory, replay
+corpus, `--arm-opt` options). Built-ins are `keyword`, `semantic` and the
+fixture-only `fixture-lexical` / `fixture-title`. A follow-up adds a
+candidate as `<module>:<factory>` (declaring `factory.membership`, or the run
+exits 64), e.g. #354's RRF fusion as
+`ARMS="keyword semantic scripts.search_eval_arms.hybrid:make_arm"` with
+membership `keyword_and_semantic`; #355's heading-aware chunking as the
+built-in arms replayed on a copy re-chunked after the snapshot; or #367's
+embedding-model trial as `runfile:<path>`, a staged arm file the harness's
+own `run` wrote on a re-embedded copy with the same qrels, snapshot and
+selection hashes, published by a complete manifest. Every `run` is a
+**generation**: `runs/manifest.json` is written `running` before any factory
+executes, rewritten `failed` (failing arm, exception type and message with
+the query text redacted, exit 1) on any exception or any answer that is not a
+list of strings, and `complete` with every staged file's sha256 only after
+every arm answered every selected query. `score` reads only that manifest,
+never an earlier generation, and exits 64 unless it is complete and its
+selected-qid hash, qrels hash, snapshot hash and file hashes all match. A
+`runfile:` arm's missing queries are the one tolerated omission, scored empty
+and counted as `missing_queries`. Answers are deduplicated to first rank and
+truncated to `--depth` (20), and ranked exactly as returned.
+
+**Metrics** (`metrics.py`, standard library only, E1): binary gains over
+`dedup(run)`; recall@k = |relevant ∩ top k| / |relevant|; reciprocal rank =
+1 / rank of the first relevant item (MRR its mean); nDCG@10 = DCG / IDCG,
+DCG = Σ rel_i / log2(i + 1), IDCG over min(|relevant|, 10) items; `novel@10`
+= the mean share of an arm's top ten outside the query's pool, i.e. results
+nobody could have judged. With `--baseline`, per metric and per slice
+(overall, `class:*`, `source:*`), the per-query deltas (candidate minus
+baseline, reported sorted, without query ids), their mean, and a percentile
+bootstrap 95 % interval on the mean: 1,000 resamples with replacement from
+`random.Random(seed)` over the deltas in qid order, linear-interpolated
+2.5th / 97.5th percentiles. The interval is reported and never gates.
+
+**The report and the gate.** `report.json` holds the metrics, counts (per
+class, per source, `n_both_sources`, drift, `ownerless_queries`), each arm's
+label, options, membership, `corpus_loss`, `unsearchable_before` and
+`missing_queries`, the window, the seed, the qrels / snapshot / selection
+hashes, the generation, `provenance`, `attachable` and `commit_sha`, and
+**no query text and no note path**; `score` checks the serialized report for
+both before writing it. `stable_projection` drops `UNSTABLE_KEYS`
+(`commit_sha`, `generated_at`, `generation`), which is what the committed
+golden file `tests/fixtures/search_eval/expected-report.json` is compared
+with; `commit_sha` is asserted separately against `git rev-parse HEAD`.
+Exit codes: 0 `OK`, 2 `INSUFFICIENT_DATA` (fewer than `--min-queries`,
+default 50) or `CORPUS_LOSS`, 64 usage error or an incomplete or mismatched
+run, 1 anything else. **There is no metric threshold** (E2): the gate is a
+report the reviewer judges, with the incumbent as `--baseline`.
+
+**Provenance: only a single-tenant report is attachable** (D10). Removing
+text, paths and ids does not make a multi-user report safe to publish:
+counts and per-slice metrics are themselves tenant data, and whoever knows
+tenant A's share can subtract it and learn about tenant B. `provenance.users`
+is `1` when the export ran with `USER_ID=` (every row carries the same
+`user_filter` and that `user_id`, or `mine --user-id` filtered it), or when
+the deployment has at most one user and the export at most one distinct
+`user_id`; anything else, including an empty export, is `"multi"`.
+`attachable` is `provenance.users == 1`. A non-attachable report is still
+written for the operator's private use, and its table starts with `NOT
+ATTACHABLE (multi-user provenance)`. Only an attachable report may be
+attached to a PR.
+
+Accepted limitations:
+
+- **L1** Incumbent bias: only notes the live tools showed can be judged; read recall drops alongside `novel@10`.
+- **L2** A read is not relevance: grade 1 means "the agent chose to read it".
+- **L3** Queries and read paths over 200 characters are truncated in the log and excluded.
+- **L4** Exact path match only: a read spelled differently from the result row does not pair (undercounts, never mis-credits).
+- **L5** Vault drift drops a renamed note's judgments; they are not followed to the new path.
+- **L6** The principal is the key or grant: two sessions sharing one can cross-credit; deleted credentials' rows are excluded (`unresolved_principal`).
+- **L6a** The snapshot-before-candidate ordering is operator discipline; the snapshot hash in every report is the control.
+- **L7** The 120 s window is a heuristic: a slow read is lost, a coincidental one credited.
+- **L7a** The defaults (`--min-queries` 50, 90-day export, 120 s window) are unvalidated until the first real export (task 8.4).
+- **L8** Replay is not bit-reproducible (approximate HNSW, provider drift): compare arms within one report.
+- **L10** Rows before #161 have no `result_paths`; rows before typed body outcomes may show a failed read without `error`.
+- **L11** A deleted user's rows are ownerless (`user_id` NULL) and replay against the ownerless slice; counted as `ownerless_queries`.
+- **L12** Small samples: the bootstrap interval shows the uncertainty, and `INSUFFICIENT_DATA` stops a 12-query verdict looking like a result.

@@ -204,11 +204,11 @@
     - In a second database, snapshot, then delete only one judged note's `note_embeddings` rows and run `keyword` and `semantic`. Only `semantic` reports loss, and `score` exits 2.
   - **Snapshot membership SQL.** On seeded rows with a NULL `content_tsvector`, and with notes lacking embeddings, the snapshot flags `keyword` and `semantic` exactly as D6 defines them. A stale `embedded_content_hash` does not clear `semantic`.
   - **Provenance from a real export.** Seed two users. An unfiltered `make search-eval-export` yields `"multi"`, and `USER_ID=<one>` yields `1`.
-- [ ] 6.4 Run `pytest -q tests/test_search_eval.py`, then `make search-eval` (it must exit 0 and print both fixture arms), then `make test-integration`. Never run `make test-integration` concurrently with `make test-schema`.
+- [x] 6.4 Run `pytest -q tests/test_search_eval.py`, then `make search-eval` (it must exit 0 and print both fixture arms), then `make test-integration`. Never run `make test-integration` concurrently with `make test-schema`.
 
 ## 7. Docs, in the same PR
 
-- [ ] 7.1 In `docs/architecture/search.md`, add a section "Search evaluation harness (#356)". It covers:
+- [x] 7.1 In `docs/architecture/search.md`, add a section "Search evaluation harness (#356)". It covers:
   - what a judgment is: the D2 join and the credential principal, with the rules verbatim;
   - the read-only guarantees and their limit, as in D3: built-in arms write nothing, an imported arm is protected only by the disposable copy, and the session default is a backstop;
   - the snapshot, the per-arm membership table (D6, naming the columns), and the difference between drift and corpus loss, including both worked examples;
@@ -219,7 +219,7 @@
   - accepted limitations L1–L12 and L6a/L7a, one line each.
 
   Also point "Search benchmarks (opt-in integration)" at the new section as the relevance counterpart of the recall benchmark.
-- [ ] 7.2 In `DEPLOYMENT.md`, add a "Day-2 operations" subsection "Measuring search quality". Describe exactly this path:
+- [x] 7.2 In `DEPLOYMENT.md`, add a "Day-2 operations" subsection "Measuring search quality". Describe exactly this path:
   1. `make search-eval-export [DAYS=] USER_ID=<your id>`. Say which backends it supports, what lands on disk, and that it is tenant data. On a multi-user deployment, `USER_ID=` is required for a report that will be attached. An unfiltered export is for private use only.
   2. `BACKUP_FULL=1 make db-backup`.
   3. Restore into a scratch database.
@@ -227,12 +227,12 @@
   5. Apply the candidate to the copy, if it changes indexed data.
   6. `make search-eval SEARCH_EVAL_DATA=.search-eval SEARCH_EVAL_DATABASE_URL=<scratch copy> ARMS=… BASELINE=…`.
   7. Attach `report.json` to the PR **only if** it says `attachable: true`. A `CORPUS_LOSS` verdict means the candidate lost searchable notes for that arm, and the run is not evidence. A failed or running manifest means re-run; `score` will not fall back to an earlier run.
-- [ ] 7.3 In `README.md`, add one line under "Search and discovery": retrieval changes are measured with `make search-eval` against judgments mined from the operator's own usage log. Link it to the search note.
-- [ ] 7.4 In `CLAUDE.md`:
+- [x] 7.3 In `README.md`, add one line under "Search and discovery": retrieval changes are measured with `make search-eval` against judgments mined from the operator's own usage log. Link it to the search note.
+- [x] 7.4 In `CLAUDE.md`:
   - Add a local-gates row: `| Search eval (any search-path change) | make search-eval-snapshot then make search-eval SEARCH_EVAL_DATA=.search-eval SEARCH_EVAL_DATABASE_URL=<restored BACKUP_FULL=1 copy> — attach report.json only if attachable: true (USER_ID= export on multi-user), incumbent as BASELINE; CORPUS_LOSS invalidates |`.
   - Add `make search-eval`, `make search-eval-export` and `make search-eval-snapshot` to the Commands list.
   - Add `scripts/search_eval/` to the search.md row of the architecture-notes table.
-- [ ] 7.5 Run `grep -n "search-eval\|SEARCH_EVAL_" README.md DEPLOYMENT.md CLAUDE.md docs/architecture/search.md Makefile .gitignore` and confirm every place above is covered. Do not touch `.env.example`: no server setting is added, and `SEARCH_EVAL_*` are tooling variables documented in DEPLOYMENT.md.
+- [x] 7.5 Run `grep -n "search-eval\|SEARCH_EVAL_" README.md DEPLOYMENT.md CLAUDE.md docs/architecture/search.md Makefile .gitignore` and confirm every place above is covered. Do not touch `.env.example`: no server setting is added, and `SEARCH_EVAL_*` are tooling variables documented in DEPLOYMENT.md.
 
 ## 8. Gates and follow-up
 
