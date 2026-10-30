@@ -49,6 +49,26 @@ from src.services.embeddings import EmbedNoteResult, NoteEmbedOutcome
 # wrong rows.
 
 
+# #351: these fakes model the database only as far as this module's contract
+# needs, and the change feed's own statements (the feed lock, the event
+# INSERT, the purges) are pinned against real PostgreSQL in
+# `tests/integration/test_change_feed_pg.py`. Stub them out here.
+@pytest.fixture(autouse=True)
+def _no_change_feed(monkeypatch):
+    from src.services import change_feed
+
+    async def _append(*_a, **_k):
+        return 0
+
+    async def _none(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(change_feed, "append_events", _append)
+    monkeypatch.setattr(change_feed, "discard_scope", _none)
+    monkeypatch.setattr(change_feed, "purge_scope", _none)
+    monkeypatch.setattr(change_feed, "record_tool_events", _none)
+
+
 class _LockNotAvailable(Exception):
     """What `SELECT … FOR UPDATE NOWAIT` raises on a contended row.
 
