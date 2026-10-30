@@ -74,7 +74,8 @@ from src.services.fts import aliases_text, rehead_tsvector_sql
 from src.services.search import full_text_search
 from src.services.usage_params import render_usage_params
 from src.services.usage_stats import OVER_QUOTA_PARAM
-from src.services import transfer, vault_fs
+from src.services import change_feed, transfer, vault_fs
+from src.services.note_hash import canonical_note_hash
 from src.services.vault import (
     MAX_PATH_CHARS,
     VAULT_ROOT_NOT_READY_ERROR,
@@ -913,6 +914,40 @@ async def _confirmed_publication(uid: int | None, publish):
         # started". Sharing it made the most expensive refusal in the server
         # invisible to the latency view.
         return _body_refusal(str(exc), _ANCHOR_LOST_AT_PUBLISH_MARKER), None
+
+
+# ── Change-feed events for confirmed publications (#351, design D3) ─────────
+
+
+def _content_event(kind: str, rel: str, data: bytes | None) -> "change_feed.Event":
+    """A `created` / `modified` event for bytes this call published, with the
+    canonical note hash (the one the index pass will store). Bytes that are
+    not UTF-8 carry no hash and `reason=not_indexable`."""
+    h = canonical_note_hash(data) if data is not None else None
+    return change_feed.Event(
+        kind, path=rel, content_hash=h,
+        reason=None if h is not None or data is None else change_feed.REASON_NOT_INDEXABLE,
+    )
+
+
+async def _record_note_events(uid: int | None, events) -> None:
+    """Record a file-only tool's events after its confirmed publication.
+
+    Only ever called after the publication returned, never between
+    `_confirmed_publication`'s confirming read and the write, and never on a
+    refusal, a dry run or an uncertain publication. Swallows everything: the
+    tool's text, `BodyOutcome` and usage classification are identical whether
+    this succeeds, times out on the feed lock or fails (the next pass records
+    the change as `human/sync`). The root binding is the root `_tracked`
+    resolved for this call (the request's own snapshot).
+    """
+    try:
+        root = _vault_root(uid)
+    except Exception:  # noqa: BLE001 - nothing to bind to; the pass rediscovers
+        return
+    await change_feed.record_tool_events(
+        list(events), root=root, session_factory=async_session, user_id=uid
+    )
 
 
 #: Exception type -> `(caller-facing message, usage_logs marker, event reason)`
@@ -2392,12 +2427,163 @@ async def read_note_impl(
 
 
 
-@_tracked("list_notes", ["folder", "limit", "tags", "frontmatter"])
+# ── `since` / `until` / `order_by` / `cursor` on the two listings (#351, D8) ──
+
+_NOTE_ORDERS = {"mtime": "modified", "content_changed": "changed"}
+NOTE_CURSOR_VERSION = 1
+NOTE_CURSOR_MAX_CHARS = 8192
+_NOTE_WINDOW_CHAR_CAPS = {
+    "since": change_feed.MAX_BOUND_CHARS,
+    "until": change_feed.MAX_BOUND_CHARS,
+    "order_by": 32,
+    "cursor": NOTE_CURSOR_MAX_CHARS,
+}
+
+
+class _NoteWindowRefused(Exception):
+    def __init__(self, prose: str):
+        super().__init__(prose)
+        self.prose = prose
+
+
+def _note_window_requested(since, until, order_by, cursor) -> bool:
+    """Whether the call used any of the four #351 parameters. A call that used
+    none issues the pre-#351 statement and returns its exact bytes."""
+    return any(v is not None for v in (since, until, order_by, cursor))
+
+
+def _note_filters_digest(folder, tags, frontmatter, since, until) -> str:
+    """`f`: the call's normalised filters (`limit` and `order_by` excluded —
+    the order is its own field)."""
+    normalised = json.dumps(
+        {
+            "folder": folder or "",
+            "tags": sorted(set(tags or [])),
+            "frontmatter": frontmatter or {},
+            "since": since.isoformat() if since else "",
+            "until": until.isoformat() if until else "",
+        },
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
+    )
+    return hashlib.sha256(normalised.encode("utf-8")).hexdigest()[:16]
+
+
+def encode_note_cursor(*, order: str, time_us: int, path: str, filters: str,
+                       owner: str) -> str:
+    """The `more: cursor=` token: list-tasks' envelope (`_b64url` over compact
+    JSON) and its owner discriminator, carrying the keyset of the last row."""
+    payload = {"v": NOTE_CURSOR_VERSION, "o": order, "t": time_us, "p": path,
+               "f": filters, "w": owner}
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return _b64url(raw.encode("utf-8"))
+
+
+def decode_note_cursor(token: str, *, order: str, filters: str, owner: str) -> tuple[int, str]:
+    """`(time_us, path)` of a valid cursor for exactly this call; raises
+    `_NoteWindowRefused` on any mismatch (version, order, filters, owner) or
+    on a token that does not decode."""
+    foreign = _NoteWindowRefused(
+        "cursor does not belong to this query (other filters, another order, "
+        "another owner, or not a cursor this server issued); start without one."
+    )
+    try:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", token or ""):
+            raise ValueError("alphabet")
+        raw = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4))
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, binascii.Error, UnicodeDecodeError):
+        raise foreign from None
+    if not isinstance(payload, dict) or set(payload) != {"v", "o", "t", "p", "f", "w"}:
+        raise foreign
+    v, o, t, p, f, w = (payload[k] for k in ("v", "o", "t", "p", "f", "w"))
+    if type(v) is not int or v != NOTE_CURSOR_VERSION:
+        raise foreign
+    if o != order or f != filters or w != owner:
+        raise foreign
+    if type(t) is not int or not -(2**62) < t < 2**62:
+        raise foreign
+    if (not isinstance(p, str) or not p or len(p) > MAX_PATH_CHARS
+            or "\x00" in p or not is_encodable(p)):
+        raise foreign
+    return t, p
+
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _to_us(value: datetime) -> int:
+    delta = value - _EPOCH
+    return (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+
+def _from_us(value: int) -> datetime:
+    from datetime import timedelta
+
+    return _EPOCH + timedelta(microseconds=value)
+
+
+async def _note_window(tool, columns, *, folder, tags, frontmatter, since, until,
+                       order_by, cursor, limit, uid):
+    """The bounded listing: `order_by`'s column DESC, `file_path` ASC, bounds
+    on that column (NULL excluded), keyset continuation
+    `col < t OR (col = t AND file_path > p)`, and a `limit + 1` fetch."""
+    from sqlalchemy import and_, or_, select
+    from src.models.db import NoteMetadata
+
+    order = "mtime" if order_by is None else order_by
+    if order not in _NOTE_ORDERS:
+        raise _NoteWindowRefused(
+            f"{tool}: `order_by` must be \"mtime\" or \"content_changed\", "
+            f"not {str(order_by)[:32]!r}."
+        )
+    try:
+        lo, hi = change_feed.parse_window(since, until, tool=tool)
+    except change_feed.BoundError as e:
+        raise _NoteWindowRefused(str(e)) from None
+    filters = _note_filters_digest(folder, tags, frontmatter, lo, hi)
+    owner = _task_owner_discriminator(uid)
+    col = (NoteMetadata.modified_at if order == "mtime"
+           else NoteMetadata.content_changed_at)
+    stmt = select(*columns, col.label("window_time")).where(col.is_not(None))
+    stmt = apply_note_filters(stmt, folder=folder, tags=tags,
+                              frontmatter=frontmatter, user_id=uid)
+    if lo is not None:
+        stmt = stmt.where(col >= lo)
+    if hi is not None:
+        stmt = stmt.where(col < hi)
+    if cursor is not None:
+        t_us, p = decode_note_cursor(cursor, order=order, filters=filters, owner=owner)
+        t = _from_us(t_us)
+        stmt = stmt.where(or_(col < t, and_(col == t, NoteMetadata.file_path > p)))
+    stmt = stmt.order_by(col.desc(), NoteMetadata.file_path.asc()).limit(limit + 1)
+    async with async_session() as session:
+        rows = (await session.execute(stmt)).all()
+    next_cursor = None
+    if len(rows) > limit:
+        rows = rows[:limit]
+        last = rows[-1]
+        next_cursor = encode_note_cursor(
+            order=order, time_us=_to_us(last.window_time), path=last.file_path,
+            filters=filters, owner=owner,
+        )
+    return SimpleNamespace(rows=rows, next_cursor=next_cursor,
+                           label=_NOTE_ORDERS[order])
+
+
+@_tracked(
+    "list_notes",
+    ["folder", "limit", "tags", "frontmatter", "since", "until", "order_by", "cursor"],
+    arg_char_caps=_NOTE_WINDOW_CHAR_CAPS,
+)
 async def list_notes_impl(
     folder: str = "",
     limit: int = 50,
     tags: list[str] | None = None,
     frontmatter: dict | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    order_by: str | None = None,
+    cursor: str | None = None,
 ) -> str:
     """List notes in a vault folder, sourced from the index."""
     from sqlalchemy import select
@@ -2405,6 +2591,29 @@ async def list_notes_impl(
 
     limit = _clamp_limit(limit)
     uid = current_user_id.get()
+    if _note_window_requested(since, until, order_by, cursor):
+        # #351, D8: any new parameter switches to the bounded, keyset-paged
+        # path. A call with none of them keeps today's statement and bytes.
+        try:
+            window = await _note_window(
+                "list_notes",
+                (NoteMetadata.file_path, NoteMetadata.file_size),
+                folder=folder or None, tags=tags, frontmatter=frontmatter,
+                since=since, until=until, order_by=order_by, cursor=cursor,
+                limit=limit, uid=uid,
+            )
+        except _NoteWindowRefused as refused:
+            return _body_refusal(refused.prose, "invalid_argument")
+        if not window.rows:
+            return f"No markdown files in '{folder or '/'}' in that window"
+        lines = [f"Found {len(window.rows)} notes in '{folder or '/'}' "
+                 f"(by {window.label} time):\n"]
+        for n in window.rows:
+            mod = n.window_time.astimezone(timezone.utc).strftime("%Y-%m-%d")
+            lines.append(f"- `{n.file_path}` ({n.file_size or 0:,}B, {window.label} {mod})")
+        if window.next_cursor:
+            lines.append(f"\nmore: cursor={window.next_cursor}")
+        return "\n".join(lines)
     async with async_session() as session:
         # Only the columns the listing renders (#280, D6); `file_path` breaks
         # exact `modified_at` ties so membership and order at the LIMIT no
@@ -2466,12 +2675,20 @@ async def get_tags_impl(limit: int = 50) -> str:
     return "\n".join(lines)
 
 
-@_tracked("get_recent", ["limit", "folder", "tags", "frontmatter"])
+@_tracked(
+    "get_recent",
+    ["limit", "folder", "tags", "frontmatter", "since", "until", "order_by", "cursor"],
+    arg_char_caps=_NOTE_WINDOW_CHAR_CAPS,
+)
 async def get_recent_impl(
     limit: int = 20,
     folder: str | None = None,
     tags: list[str] | None = None,
     frontmatter: dict | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    order_by: str | None = None,
+    cursor: str | None = None,
 ) -> str:
     """Recently modified notes."""
     from sqlalchemy import select
@@ -2479,6 +2696,28 @@ async def get_recent_impl(
 
     limit = _clamp_limit(limit)
     uid = current_user_id.get()
+    if _note_window_requested(since, until, order_by, cursor):
+        try:
+            window = await _note_window(
+                "get_recent",
+                (NoteMetadata.file_path, NoteMetadata.title, NoteMetadata.tags),
+                folder=folder, tags=tags, frontmatter=frontmatter,
+                since=since, until=until, order_by=order_by, cursor=cursor,
+                limit=limit, uid=uid,
+            )
+        except _NoteWindowRefused as refused:
+            return _body_refusal(refused.prose, "invalid_argument")
+        if not window.rows:
+            return "No recent notes found in that window"
+        heading = "modified" if window.label == "modified" else "content-changed"
+        lines = [f"Last {len(window.rows)} {heading} notes:\n"]
+        for n in window.rows:
+            when = n.window_time.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            tags_str = f" [{', '.join(n.tags)}]" if n.tags else ""
+            lines.append(f"- `{n.file_path}` — {n.title}{tags_str} ({window.label} {when})")
+        if window.next_cursor:
+            lines.append(f"\nmore: cursor={window.next_cursor}")
+        return "\n".join(lines)
     async with async_session() as session:
         # Only the columns the listing renders (#280, D6), with the same
         # `file_path` tie-break as `list_notes`.
@@ -3435,6 +3674,9 @@ async def create_note_impl(
             )
             if err:
                 return err
+            await _record_note_events(
+                uid, [_content_event("created", target.rel, content.encode("utf-8"))]
+            )
             # D9: the bytes this call published, which `_atomic_write_at`
             # encoded exactly this way.
             return f"Created note: {path}" + _published_hash_clause(
@@ -4471,6 +4713,11 @@ async def edit_note_impl(
             return _body_refusal(str(e), "validation_failed")
         except OSError as e:
             return _body_refusal(f"Failed to write {path}: {e}", "io_failure")
+        if new_content.encode("utf-8") != existing_bytes:
+            # A rewrite to identical bytes changes nothing the feed reports.
+            await _record_note_events(
+                uid, [_content_event("modified", target.rel, new_content.encode("utf-8"))]
+            )
         return success_message + _published_hash_clause(
             new_content.encode("utf-8")
         )
@@ -5639,6 +5886,28 @@ async def _move_note_locked(
                     .values(target_path=to_rel)
                 )
                 await session.execute(link_update)
+                # The change-feed `moved` event, **in this transaction** (#351,
+                # D3): this update is what tells the next pass there was no
+                # move, so an event committed separately and lost would be lost
+                # for good. Unbounded, so a failure rolls the path update back
+                # with it and takes the "DB update failed; reindex will
+                # reconcile" branch below — the pass then pairs the move by
+                # hash and records it `human/sync`: misattributed, never lost.
+                # The feed lock is the last lock this transaction takes.
+                if change_feed.is_note_path(from_rel) and change_feed.is_note_path(to_rel):
+                    await change_feed.append_events(
+                        session, uid,
+                        [change_feed.Event(
+                            "moved", path=to_rel, from_path=from_rel,
+                            content_hash=(canonical_note_hash(renamed_bytes)
+                                          if renamed_bytes is not None else None),
+                        )],
+                        source=change_feed.SOURCE_MCP,
+                        attribution=change_feed.current_attribution(),
+                        binding=(change_feed.root_binding(admitted_root)
+                                 if uid is not None else None),
+                        bounded=False,
+                    )
                 await session.commit()
         except Exception as e:
             security_events.emit(
@@ -5659,6 +5928,9 @@ async def _move_note_locked(
         # can change which hash this call may honestly report.
         moved_rewrite_bytes: bytes | None = None
         moved_rewrite_conflicted = False
+        # The rewrites this call actually published, for the change feed: on a
+        # partial completion only what was written is recorded (#351, D3).
+        rewrite_events: list = []
         for position, planned in enumerate(planned_rewrites):
             write_path, write_target, original_bytes, new_content, n = planned
             # The moved note is the one source written through the destination
@@ -5747,6 +6019,9 @@ async def _move_note_locked(
             else:
                 rewrites_done += n
                 files_modified += 1
+                rewrite_events.append(_content_event(
+                    "modified", write_target.rel, new_content.encode("utf-8")
+                ))
                 if is_moved_note:
                     # Published, so these are the bytes at the destination —
                     # exactly what `write_file_at` encoded.
@@ -5757,6 +6032,8 @@ async def _move_note_locked(
             # sources the move started with.
             drop(write_target)
 
+        if rewrite_events:
+            await _record_note_events(uid, rewrite_events)
         parts = [f"Moved {from_rel} → {to_rel}"]
         if db_failed:
             parts.append("(warning: DB update failed; reindex will reconcile)")
@@ -5904,6 +6181,9 @@ async def delete_note_impl(
                     return err
             except OSError as e:
                 return _body_refusal(f"Permanent delete failed: {e}", "io_failure")
+            await _record_note_events(uid, [change_feed.Event(
+                "deleted", path=target.rel, reason=change_feed.REASON_REMOVED
+            )])
             return f"Permanently deleted: {path}"
 
         # One `renameat2(RENAME_NOREPLACE)` from the note's own parent
@@ -5947,6 +6227,9 @@ async def delete_note_impl(
             return _body_refusal(str(e), "io_failure")
         except OSError as e:
             return _body_refusal(f"Soft-delete failed: {e}", "io_failure")
+        await _record_note_events(uid, [change_feed.Event(
+            "deleted", path=target.rel, reason=change_feed.REASON_REMOVED
+        )])
         return f"Soft-deleted: {path} → {dest}"
 
 
@@ -6221,6 +6504,9 @@ async def set_frontmatter_impl(
         except OSError as e:
             return _body_refusal(f"Failed to write {path}: {e}", "io_failure")
 
+        await _record_note_events(
+            uid, [_content_event("modified", target.rel, new_raw.encode("utf-8"))]
+        )
         summary: list[str] = []
         if set_keys:
             summary.append(f"set: {', '.join(set_keys)}")
@@ -6471,6 +6757,9 @@ async def write_file_impl(
                 f"max {cap:,} — {cap_name}). No file was written.", "size_limit")
             )
 
+        # Whether an incumbent stood here, for the event's kind only (#351): a
+        # wrong guess mislabels `created`/`modified`, both content events.
+        had_incumbent = overwrite and target.lstat() is not None
         try:
             err, _ = await _confirmed_publication(  # #88
                 uid,
@@ -6490,6 +6779,10 @@ async def write_file_impl(
             return _body_refusal(str(e), "validation_failed")
         except OSError as e:
             return _body_refusal(f"Failed to write {path}: {e}", "io_failure")
+        if change_feed.is_note_path(target.rel):
+            await _record_note_events(uid, [_content_event(
+                "modified" if had_incumbent else "created", target.rel, data
+            )])
         result = f"Wrote {len(data):,} bytes to {path}"
         if over_cap or len(data) > read_cap:
             return result + (
@@ -7136,6 +7429,13 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
     except OSError as e:
         return _body_refusal(f"Could not write {rel}: {e}", "io_failure")
 
+    if change_feed.is_note_path(rel):
+        h = written.get("note_hash")
+        await _record_note_events(_uid, [change_feed.Event(
+            "modified" if fingerprint is not None else "created", path=rel,
+            content_hash=h,
+            reason=None if h is not None else change_feed.REASON_NOT_INDEXABLE,
+        )])
     return (
         f"Imported {written['size']:,} bytes to {rel}\n"
         f"sha256: {written['sha256']}\n"
@@ -7271,6 +7571,8 @@ async def delete_file_impl(
         return _body_refusal(str(e), "validation_failed")
     except OSError as e:
         return _body_refusal(f"Failed to delete {rel}: {e}", "io_failure")
+    # No change-feed event (#351): this tool refuses every `.md` path above,
+    # so it never removes a note; `delete_note` records note deletions.
     if precondition_refusal is not None:
         return precondition_refusal
     if permanent:
@@ -7817,3 +8119,143 @@ async def list_tasks_impl(
         cursor_args=dict(owner=owner, filters=filters),
         more_rows=more_rows,
     )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# get_changes (#351, design D6–D7)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Reads `note_events` under the total owner mapping, in one
+# `REPEATABLE READ, READ ONLY` snapshot that also yields the scope's
+# `last_seq` and retention watermark: computed from two snapshots, a commit
+# between them could move `next_since` past an event the page never held.
+# Every note- or user-controlled string is a JSON string literal
+# (`change_feed.quote`), so a filename cannot forge a line.
+
+GET_CHANGES_DEFAULT_LIMIT = 50
+
+
+@_tracked(
+    "get_changes",
+    ["since", "folder", "kinds", "by", "limit"],
+    arg_char_caps={"since": change_feed.MAX_BOUND_CHARS, "folder": MAX_PATH_CHARS},
+)
+async def get_changes_impl(
+    since: str,
+    folder: str | None = None,
+    kinds: list[str] | None = None,
+    by: str = "any",
+    limit: int = GET_CHANGES_DEFAULT_LIMIT,
+) -> str:
+    """The caller's change feed after a cursor or a UTC date/datetime."""
+    from sqlalchemy import and_, or_, select
+    from src.models.db import NoteEvent, NoteEventScope
+    from src.services.filters import _escape_like
+
+    try:
+        start = change_feed.parse_since(since)
+    except change_feed.BoundError as e:
+        return _body_refusal(str(e), "invalid_argument")
+    if kinds is not None:
+        unknown = [k for k in kinds if k not in change_feed.NOTE_KINDS]
+        if unknown:
+            return _body_refusal(
+                "get_changes: `kinds` must be a subset of "
+                f"{', '.join(change_feed.NOTE_KINDS)}; got {str(unknown[0])[:32]!r}.",
+                "invalid_argument",
+            )
+    if by not in change_feed.BY_VALUES:
+        return _body_refusal(
+            f"get_changes: `by` must be one of {', '.join(change_feed.BY_VALUES)}; "
+            f"got {str(by)[:32]!r}.",
+            "invalid_argument",
+        )
+    principal = current_principal.get()
+    if by == "me" and principal is None:
+        return _body_refusal(
+            "get_changes: `by=\"me\"` needs a calling credential, and this call "
+            "has none.",
+            "invalid_argument",
+        )
+    limit = _clamp_limit(limit)
+    uid = current_user_id.get()
+    owner = NoteEvent.user_id.is_(None) if uid is None else NoteEvent.user_id == uid
+    scope_owner = (NoteEventScope.user_id.is_(None) if uid is None
+                   else NoteEventScope.user_id == uid)
+
+    note_filter = []
+    if kinds is not None:
+        note_filter.append(NoteEvent.kind.in_(list(kinds)))
+    if folder:
+        pattern = f"{_escape_like(folder)}%"
+        note_filter.append(or_(
+            NoteEvent.path.like(pattern, escape="\\"),
+            NoteEvent.from_path.like(pattern, escape="\\"),
+        ))
+    if by == "agents":
+        note_filter.append(NoteEvent.source == change_feed.SOURCE_MCP)
+    elif by == "human":
+        note_filter.append(NoteEvent.source == change_feed.SOURCE_INDEX)
+    elif by == "me":
+        note_filter.append(and_(
+            NoteEvent.source == change_feed.SOURCE_MCP,
+            NoteEvent.principal_kind == str(principal[0]),
+            NoteEvent.principal_ref == str(principal[1])[:64],
+        ))
+
+    async with async_session() as session:
+        await session.execute(
+            text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        )
+        scope = (await session.execute(
+            select(NoteEventScope.last_seq, NoteEventScope.pruned_through_seq,
+                   NoteEventScope.pruned_at).where(scope_owner)
+        )).first()
+        last_seq = scope.last_seq if scope else 0
+        pruned_through = scope.pruned_through_seq if scope else 0
+        pruned_at = scope.pruned_at if scope else None
+        if isinstance(start, int) and start > last_seq:
+            await session.rollback()
+            return _body_refusal(
+                f"get_changes: cursor ev:{start} is not from this vault's feed "
+                "(it is ahead of every event here — another vault's cursor, "
+                "another deployment's, or a restore rolled the feed back). "
+                "Start again from a date with `since=\"YYYY-MM-DD\"`.",
+                "invalid_argument",
+            )
+        stmt = select(
+            NoteEvent.seq, NoteEvent.occurred_at, NoteEvent.kind, NoteEvent.path,
+            NoteEvent.from_path, NoteEvent.source, NoteEvent.tool,
+            NoteEvent.actor_kind, NoteEvent.actor_label, NoteEvent.principal_kind,
+            NoteEvent.principal_ref, NoteEvent.gap_reason, NoteEvent.gap_count,
+            NoteEvent.reason,
+        ).where(owner)
+        if isinstance(start, int):
+            stmt = stmt.where(NoteEvent.seq > start)
+        else:
+            stmt = stmt.where(NoteEvent.occurred_at >= start)
+        if note_filter:
+            # `gap` and `reset` say how complete the view is; no filter hides them.
+            stmt = stmt.where(or_(
+                NoteEvent.kind.in_(change_feed.META_KINDS), and_(*note_filter)
+            ))
+        stmt = stmt.order_by(NoteEvent.seq).limit(limit + 1)
+        rows = (await session.execute(stmt)).all()
+        await session.rollback()
+
+    if isinstance(start, int):
+        label = f"ev:{start}"
+        truncated = start < pruned_through
+        floor = start
+    else:
+        label = change_feed.format_time(start)
+        truncated = pruned_through > 0 and (pruned_at is None or start <= pruned_at)
+        floor = 0
+    page = change_feed.ChangesPage(since_label=label, truncated_history=truncated,
+                                   next_since=max(last_seq, floor))
+    last = change_feed.fit_lines(
+        page, rows, principal, settings.max_read_response_chars, limit
+    )
+    if page.more:
+        page.next_since = last if last is not None else floor
+    return change_feed.render_changes(page)

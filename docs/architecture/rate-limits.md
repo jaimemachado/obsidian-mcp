@@ -1032,7 +1032,7 @@ ending in a 500, shared with the panel and `/token`.
 | `embedding` | `semantic_search` | 1 | 1 |
 | `vector` | `find_related` | 1 | 1 |
 | `write` | the eight write-class tools (L3) | 1 | 2 |
-| `scan` | `keyword_search`, `list_notes`, `get_tags`, `get_neighborhood`, `find_orphans`, `list_files`, `list_tasks` (#350, `CLASS_MAPPING_VERSION` 3) | 2 | 1 |
+| `scan` | `keyword_search`, `list_notes`, `get_tags`, `get_neighborhood`, `find_orphans`, `list_files`, `list_tasks` (#350, `CLASS_MAPPING_VERSION` 3), `get_changes` (#351, `CLASS_MAPPING_VERSION` 4) | 2 | 1 |
 | `light` | `read_note`, `read_file`, `get_recent`, `get_vault_guide`, `get_backlinks`, `get_links`, `request_upload`, `check_upload`, `request_download` | 4 | 1 |
 
 #261's `other` held 15 of the 25 tools and was pinned to 1. Raising it alone

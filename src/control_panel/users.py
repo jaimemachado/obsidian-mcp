@@ -63,7 +63,7 @@ from src.csrf import verify_csrf
 from src.database import get_session
 from src.models.db import APIKey, NoteMetadata, UsageLog, User
 from src.oauth.grants import ACCOUNT_GUARD_LOCK_KEY, lock_account_guard
-from src.services import panel_csp, security_events, vault_overlap
+from src.services import change_feed, panel_csp, security_events, vault_overlap
 from src.services.vault import clear_user_vault_cache, validate_vault_root_path
 
 logger = logging.getLogger(__name__)
@@ -848,6 +848,16 @@ async def delete_user(
             .values(key_id=None)
         )
         await session.delete(target)
+        # `purge_scope` first flushes the `users` DELETE (and its cascade into
+        # `notes_metadata` and the rest), so the change-feed purge runs after
+        # it (#351, design D4). The feed tables carry **no foreign key** — one to `users`
+        # would make every index pass wait on this row after it already holds
+        # `notes_metadata` row locks, the documented deadlock — so the scope's
+        # events, counter and gap rows are deleted explicitly, under the feed
+        # lock taken **last**: users row, cascade, feed lock, three DELETEs,
+        # commit. A pass's append that takes the lock after this commits finds
+        # the user gone and writes nothing.
+        await change_feed.purge_scope(session, target.id)
         await session.commit()
         clear_user_vault_cache(target.id)
         return _back_to_list(

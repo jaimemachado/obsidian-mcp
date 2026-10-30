@@ -35,19 +35,20 @@ COVERAGE = {
     'import_from_url': [('partial', 'test_transfer_tools.py::test_import_reports_a_post_publish_failure_as_written')],
     'delete_file': [('refused', 'test_transfer_tools.py::test_delete_file_reports_a_missing_file')],
     'list_tasks': [('refused', 'test_list_tasks_render.py::test_the_tags_argument_bounds'), ('success', 'test_list_tasks_render.py::test_an_empty_result_is_a_header_and_not_a_refusal')],
+    'get_changes': [('refused', 'test_change_feed_offline.py::test_get_changes_refuses_bad_arguments_before_any_query'), ('success', 'test_change_feed_offline.py::test_render_changes_page_shape')],
 }
 
 # Tools registered after the typed-tool-outcomes inventory was archived. Their
 # outcome contract lives in their own change's spec rather than in that
 # inventory, which is a historical record and is not edited.
-ADDED_AFTER_INVENTORY = {'list_tasks'}  # #350
+ADDED_AFTER_INVENTORY = {'list_tasks', 'get_changes'}  # #350, #351
 
 
 def test_every_registered_tool_has_inventory_and_live_behavioral_references():
     from src.mcp_server.server import mcp
     registered = {tool.name for tool in mcp._tool_manager.list_tools()}
     assert set(COVERAGE) == registered
-    assert len(registered) == 26  # 25 → 26: `list_tasks` (#350)
+    assert len(registered) == 27  # 25 → 27: `list_tasks` (#350), `get_changes` (#351)
     root = Path(__file__).resolve().parents[1]
     inventory = (root / 'openspec/changes/archive/2026-09-06-typed-tool-outcomes/inventory.md').read_text()
     for tool, references in COVERAGE.items():
