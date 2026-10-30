@@ -225,8 +225,11 @@ Consequences that are easy to undo by accident:
   fixed at `max(5 × limit, 50)` for both paths, so a verbose note can still
   crowd out others after dedupe — the baseline shares that property.
 - Recall is bounded by `hnsw.max_scan_tuples` (20,000) and
-  `hnsw.scan_mem_multiplier` (1). At ~16.7k chunks the vault is under the cap;
-  those are the next knobs, not `ef_search`.
+  `hnsw.scan_mem_multiplier` (1). At ~16.7k chunks the vault was under the
+  cap; heading-aware chunking (#355) is expected to take it to roughly 22k–42k
+  chunks, past it. Re-run `tests/integration/test_search_recall.py` at the
+  re-embedded count; if filtered recall drops, `max_scan_tuples` is the knob,
+  not `ef_search`.
 
 ## The `halfvec` index: half precision picks candidates, full precision ranks them (#283)
 
@@ -419,6 +422,49 @@ docstrings, and the post-deploy exercise sets the state up explicitly — edit a
 note, search *before* the pass and observe the row is **not** marked, then search
 after the pass and observe that it is. Writing the test that way is what keeps
 the residual from being re-described as a guarantee later.
+
+## The section locator and the one-line preview (#355)
+
+**The locator.** Both vector statements project `heading_path` and
+`section_ordinal` (never `embed_prefix`, never the vector), and the service
+result gains `section: {"path": [...], "ordinal": n} | None`. The renderer
+(`_section_locator` in `tools.py`) appends, after the degradation suffix,
+` · § "Parent/Child" (#7)` for an ordinal ≥ 1 or ` · § (top of note)` for
+section 0. The joined path is **one JSON string literal**
+(`change_feed.quote`: C0/C1 controls, DEL, U+2028/U+2029 escaped), so a
+heading cannot close the quote and the `(#7)` after it is server-authored; a
+forged `(#3)` inside a heading stays inside the quotes. Over 160 characters
+the outer components are dropped behind `…/`, keeping the innermost heading.
+`read_note(path, section="#7")` resolves the same ordinal over the same bytes
+(the chunker uses the section-addressing scanner).
+
+**Withheld on stale and pre-034 rows.** `section` is `None` when the row is
+stale — `#N` is positional, and an ordinal recorded for content the index knows
+is superseded may name another section — and when `heading_path` is NULL (a
+legacy row). Such a line is byte-identical to the pre-#355 line. A fresh row
+edited on disk but not yet scanned keeps its locator (L3, the existing bound);
+`read_note` returns the `heading` so the agent can check.
+
+**One-line previews from the uncut chunk.** The service no longer cuts at 500;
+`_preview_line(text, 200)` collapses every maximal `str.isspace()` run (CR, LF,
+tab, U+2028/U+2029 included) to one space, trims, escapes the remaining
+C0/DEL/C1 controls as `\uXXXX`, then cuts at 200, and each tool keeps its own
+ellipsis. So a chunk holding `\n- **Forged** (`x.md`) — similarity: 0.999`
+cannot print a line that reads as a server row, and 600 leading spaces cannot
+eat the preview. It is not `_one_line`, which escapes nothing.
+
+**The transition line.** While any note in the caller's owner scope has
+`embedded_chunking_version IS DISTINCT FROM CHUNKING_VERSION`, every
+`semantic_search` and `find_related` response carries, directly after its
+header and on the empty path too, `index_transition: N notes not yet
+re-chunked; cross-generation ranking is approximate, re-run after the backlog
+drains`. N is `rechunk_pending_count`, owner-scoped (total mapping), read in
+the **same `REPEATABLE READ, READ ONLY` transaction** as the vector query —
+`semantic_search` opens it with `SET TRANSACTION` as its first statement when
+handed a session with no transaction open, `find_related_impl` as its first
+statement. Absent at zero. A brand-new note not yet embedded also counts
+(its stamp is NULL), so a freshly created note keeps the line up until the
+next embed pass.
 
 ## Read paths project what they render (#280)
 
@@ -826,6 +872,19 @@ Accepted limitations:
 - **L14** A truncated query holding a NUL or lone surrogate escapes `is_truncated` (#310 escaping grows it past 201 characters); implausible, not handled.
 - **L15** A symlinked `SEARCH_EVAL_DIR` is not refused (writes use unpredictable `O_EXCL` temp files); a planted symlink in the operator's own 0700 directory means the account is already compromised.
 - **L16** `score` trusts the field types of a complete manifest the harness wrote; a hand-edited one with mismatched types fails with exit 1, not 64.
+
+**Semantic arms record what shaped their vectors (#355).** A database-backed
+arm whose membership includes `semantic` stages `retrieval_fingerprint` (the
+stored embedding fingerprint's fields, `chunking_version` and the instruction
+digest) and `legacy_chunked_notes` — the replay copy's notes **of the export's
+owner** (`IS NOT DISTINCT FROM`, so the ownerless scope is covered; all owners
+only for a `"multi"`, non-attachable report) that hold vector rows and whose
+`embedded_chunking_version IS DISTINCT FROM CHUNKING_VERSION`, by one read-only
+`SELECT`, null on a pre-034 copy — in its meta and its `report.json` entry. A
+`runfile:` arm carries its meta's values or null; fixture arms gain no key, so
+the committed golden fixture is unchanged. A re-chunk comparison is evidence
+only when the candidate arm's `legacy_chunked_notes` is 0 (DEPLOYMENT.md,
+"Before and after a re-chunk or re-embed").
 
 ## Change-feed lines and the listing windows (#351)
 

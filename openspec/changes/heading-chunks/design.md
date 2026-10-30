@@ -589,6 +589,31 @@ process-wide, non-volumetric `indexer.rechunk`, never a number) and B2 (one
 higher-stamp rollback scenario) close their failing inputs and do not regress the
 round-1 fixes. Strict OpenSpec validation also passes.
 
+## Implementation notes
+
+Choices the spec left open, one line each.
+
+- `_scan_headings` and `_LINE_BREAK_RE` are imported from `vault.py` as they are (locally, inside `_note_sections`), not renamed.
+- An empty section after the cap is reached does not mark the note truncated; only a non-empty one does (one chunk past the cap, as `chunk_text_bounded`).
+- A heading-path component is cut to 199 characters plus `…` (200 total); prefix components to 79 plus `…`.
+- `input_digest` is SHA-256 over `json.dumps(inputs, ensure_ascii=True, separators=(",", ":"))`.
+- `certify_embedded` takes the inputs as a required keyword, `provider_inputs`; the excluded and certified-empty branches pass `[]`.
+- The upsert's title/tags invalidation is a `CASE` in `on_conflict_do_update`, so it applies to every re-upsert (content-changed rows are stale anyway).
+- The full-hash backstop keeps every body on that pass (`keep_bodies=backstop`, a re-derive's memory shape once per interval) and re-checks rows certified under the current version, both unchanged rows and same-hash re-upserts, after the upsert; it compares with `= :cv`, which is not one of the five transition surfaces.
+- The predicate helpers (`vectors_not_current_sql/_expr`, `not_rechunked_sql/_expr`) live in `embeddings.py` beside `CHUNKING_VERSION` and inline the version as a literal read at call time.
+- `EmbedBudget.enter_version_only()` starts a fresh allowance (clock and chunk counter) at the first version-only note of a single-scope pass; `leave_version_only()` restores the unbudgeted state before the exclusion sweep.
+- `/health`'s rechunk state is observed by one owner-scoped `count(*)` at the end of each embed stage (after the sweep); a failed count keeps the previous observation.
+- `semantic_search` issues `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY` only when its session has no open transaction; `find_related_impl` issues it first; the tools then call `rechunk_pending_count` on the same session.
+- The transition line goes on the line after the header (the header's trailing blank line moves below it); on the empty paths it is the second line.
+- `_preview_line` maps each `str.isspace()` character to a space and collapses runs, then escapes `[\x00-\x1f\x7f-\x9f]`; U+0085 is whitespace in Python and so collapses rather than escapes.
+- The locator's 160-character cut drops whole outer components behind `…/`; a single innermost component still over 160 is itself cut with `…`.
+- `EMBEDDING_QUERY_INSTRUCTION` refuses C0 controls other than LF/TAB (as specified); DEL and C1 are accepted.
+- The harness owner for `legacy_chunked_notes` is derived from the queries of a single-user report (the miner guarantees one owner); a single-user report with no queries records `null`.
+- The startup line is `Embedding retrieval: <canonical JSON>`, logged right after the embedding transport line.
+- The upsert's tags comparison treats NULL and `{}` as equal (`COALESCE(tags, '{}')`), since both build the same prefix; otherwise a pre-existing NULL-tag row would be re-embedded by its first re-upsert.
+- Because an excluded note's digest is of `[]`, the full-hash backstop also clears the certification of a note whose exclusion pattern changed (in either direction); the backlog then repairs it, ahead of the exclusion sweep.
+- Task 7.5 (downgrade on real data) is covered by the schema-gate case `test_downgrade_034_deletes_prefixed_rows_and_uncertifies_their_notes` (mixed legacy and prefixed rows, downgrade, upgrade, `alembic check`); task 7.3's reuse cases are in `test_heading_chunks_pg.py`, and `test_perf_chunk_reuse_pg.py` was updated to the prefixed input rather than extended.
+
 ## Accepted limitations
 
 - **L1** — During the transition, legacy and heading-era vectors of the same
