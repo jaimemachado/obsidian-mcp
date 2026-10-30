@@ -92,3 +92,36 @@ async def fetch_membership(session) -> dict:
             "stale_vector": bool(row.stale_vector),
         }
     return {k: dict(sorted(v.items())) for k, v in sorted(out.items())}
+
+
+async def legacy_chunked_notes(session, owner: "tuple[bool, int | None]") -> int | None:
+    """Notes of the provenance owner that hold vector rows and whose
+    `embedded_chunking_version IS DISTINCT FROM CHUNKING_VERSION` (#355, D8).
+
+    `owner` is `(scoped, user_id)`: scoped compares `user_id IS NOT DISTINCT
+    FROM` the export's owner (so the ownerless scope is covered); unscoped —
+    only for a `"multi"`, non-attachable report — covers every owner. One
+    read-only `SELECT`; `None` when the column does not exist (a pre-034
+    copy).
+    """
+    from sqlalchemy import text
+
+    from src.services.embeddings import CHUNKING_VERSION
+
+    present = (await session.execute(text(
+        "SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('public.notes_metadata') "
+        "AND attname = 'embedded_chunking_version' AND NOT attisdropped"
+    ))).scalar()
+    if not present:
+        return None
+    scoped, user_id = owner
+    where = "m.user_id IS NOT DISTINCT FROM CAST(:owner AS integer)" if scoped else "TRUE"
+    params = {"cv": int(CHUNKING_VERSION)}
+    if scoped:
+        params["owner"] = user_id
+    return int((await session.execute(text(
+        "SELECT count(*) FROM notes_metadata m "
+        f"WHERE {where} "
+        "AND EXISTS (SELECT 1 FROM note_embeddings e WHERE e.note_id = m.id) "
+        "AND m.embedded_chunking_version IS DISTINCT FROM CAST(:cv AS smallint)"
+    ), params)).scalar() or 0)
