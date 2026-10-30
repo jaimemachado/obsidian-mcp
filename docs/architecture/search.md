@@ -822,3 +822,4 @@ Accepted limitations:
 - **L13** `SEARCH_EVAL_DATA` may point outside `SEARCH_EVAL_DIR`; nothing checks it is git-ignored (same directory by convention; 0700/0600 still apply).
 - **L14** A truncated query holding a NUL or lone surrogate escapes `is_truncated` (#310 escaping grows it past 201 characters); implausible, not handled.
 - **L15** A symlinked `SEARCH_EVAL_DIR` is not refused (writes use unpredictable `O_EXCL` temp files); a planted symlink in the operator's own 0700 directory means the account is already compromised.
+- **L16** `score` trusts the field types of a complete manifest the harness wrote; a hand-edited one with mismatched types fails with exit 1, not 64.
