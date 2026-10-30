@@ -198,13 +198,14 @@ def test_the_fixed_bounds():
         not_scanned=10**10 - 1, failed=10**10 - 1, capped=10**10 - 1, cut_tags=10**10 - 1,
     )
     assert len(worst) <= LIST_TASKS_HEADER_MAX, len(worst)
+    assert len(render_incomplete_notice(1, 1)) <= 85
     compact = "next: " + encode_task_cursor(
         owner=OWNER, filters=FILTERS, due_key="infinity", path="é" * 1024,
         line=2_147_483_647, compact=True,
     )
     assert len(compact) <= LIST_TASKS_FOOTER_MAX, len(compact)
-    r = row(path="", text="", line=10**10 - 1, tags=["a"], heading_path="h",
-            status_char="X")
+    r = row(path="", text="", line=10**10 - 1, tags=["a"], tags_cut=True,
+            heading_path="h", status_char="X")
     structure = render_abbreviated_task_row(r, 10_000)
     assert len(structure) <= LIST_TASKS_ABBREVIATED_STRUCTURE_MAX, structure
     # The design's arithmetic: at least 200 characters of the minimum cap
@@ -270,6 +271,8 @@ def test_cursor_round_trip_and_shape():
     lambda p: {k: v for k, v in p.items() if k != "p"},  # neither
     lambda p: {**p, "p": "x" * 1025},
     lambda p: {**p, "id": 5},
+    lambda p: {**p, "p": "a\x00b.md"},          # NUL: never a stored path
+    lambda p: {**p, "p": "a\ud800b.md"},        # unpaired surrogate
 ])
 def test_a_tampered_cursor_is_refused(mutate):
     token = encode_task_cursor(owner=OWNER, filters=FILTERS, due_key="infinity",
@@ -478,3 +481,54 @@ def test_an_abbreviated_row_keeps_a_short_path_whole():
     assert len(line) <= 300
     assert "`short.md`:1" in line and "path cut" not in line
     assert line.endswith("— abbreviated")
+
+
+# ── Codex implementation review, round 1 ────────────────────────────────────
+
+
+def test_an_abbreviated_row_says_its_tags_were_cut():
+    r = row(path="p" * 1024, text="x" * 1000, tags=None, tags_cut=True)
+    line = render_abbreviated_task_row(r, 300)
+    assert "— tags omitted" in line and "— tags cut" in line
+    r = row(path="p" * 1024, text="x" * 1000, tags=["a"] * 64, tags_cut=True)
+    assert "— tags cut" in render_abbreviated_task_row(r, 300)
+    r = row(path="p" * 1024, text="x" * 1000, tags=None, tags_cut=False)
+    assert "tags" not in render_abbreviated_task_row(r, 300)
+
+
+def test_path_escaping_is_injective():
+    backslash_n = render_task_row(row(path="a\\nb.md"))
+    newline = render_task_row(row(path="a\nb.md"))
+    assert backslash_n != newline
+    assert "`a\\\\nb.md`" in backslash_n and "`a\\nb.md`" in newline
+    assert render_task_row(row(path="a\\u2028.md")) != render_task_row(row(path="a\u2028.md"))
+
+
+def test_the_worst_case_at_the_minimum_cap_keeps_40_of_path_and_text():
+    """Design D7 as corrected: header, closing notice, compact footer and an
+    abbreviated row keeping four dates and a priority still leave at least 40
+    characters each of path and text at `MAX_READ_RESPONSE_CHARS=1000`."""
+    big = 10**10 - 1
+    first = D(2026, 1, 1)
+    rows = [row(path="é" * 1024, line=big, text="x" * 1000, due=first, scheduled=first,
+                start=first, done_on=first, priority="highest",
+                tags=["t" * 128] * 64, tags_cut=True, heading_path="H" * 512),
+            row(path="é" * 1024, line=big + 1, text="y")]
+    out = render_task_results(
+        rows, budget=1000,
+        header_args=header_args(status="cancelled", folder="F" * 1024,
+                                due_by="2026-01-01", scheduled_by="2026-01-01",
+                                tags=["t" * 128] * 32, not_scanned=big, failed=big,
+                                capped=big, cut_tags=big),
+        cursor_args=dict(owner=OWNER, filters=FILTERS), more_rows=True,
+    )
+    assert len(out) <= 1000, len(out)
+    (line,) = task_lines(out)
+    assert line.endswith("— abbreviated") and "— tags cut" in line
+    for field in ("due 2026-01-01", "scheduled 2026-01-01", "start 2026-01-01",
+                  "done 2026-01-01", "priority highest"):
+        assert field in line
+    path_shown = line.split("`")[1]
+    text_shown = line.split("text (cut): ", 1)[1].rsplit(" — abbreviated", 1)[0]
+    assert len(path_shown) >= 40 and len(text_shown) >= 40, (len(path_shown), len(text_shown))
+    assert out.splitlines()[-1].startswith("next: ")

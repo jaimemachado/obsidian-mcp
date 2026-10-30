@@ -287,6 +287,16 @@ def test_the_instructions_state_the_round_trip_with_its_conditions():
     assert "back to `edit_note` unchanged" not in text
 
 
+def test_the_instructions_name_list_tasks_outside_the_lead():
+    """`vault-guide` delta (#350): one sentence names `list_tasks`, after the
+    512-character lead, within the 2,000 cap."""
+    text = server.SERVER_INSTRUCTIONS
+    assert "`list_tasks`" in text
+    assert "list_tasks" not in text[:INSTRUCTIONS_LEAD]
+    assert text.index("`list_tasks`") >= INSTRUCTIONS_LEAD
+    assert len(text) <= INSTRUCTIONS_CAP
+
+
 def test_the_instructions_frame_the_guide_neutrally():
     lowered = server.SERVER_INSTRUCTIONS.lower()
     assert "`get_vault_guide`" in lowered

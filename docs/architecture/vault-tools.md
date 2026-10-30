@@ -785,7 +785,8 @@ here is an extraction-version bump, like the fence and link grammars.
   `text:` last. Text, heading and tags pass through `_one_line` (every
   whitespace run, U+2028/9 and `\r` included, becomes one space), and the path
   is rendered with every whitespace character other than U+0020 escaped
-  (`\n`, `\r`, `\t`, `\uXXXX`), so it stays exact and on one line — stricter
+  (`\n`, `\r`, `\t`, `\uXXXX`) and every literal backslash doubled, so it
+  stays exact, injective and on one line — stricter
   than `keyword_search`, which renders paths raw (L9). A cut text reads
   `text (cut at 1000 chars):`, a capped tag list `— tags cut`.
 - **The header is always there** and always states `shown`, `more` and three
@@ -796,13 +797,16 @@ here is an extraction-version bump, like the fence and link grammars.
   filter whose tags were cut, any of which might have carried the tag). When
   either of the first two is non-zero a closing `Incomplete list:` line says so.
   Echoed filters are display only, cut at 64 characters.
-- **Bounded, with guaranteed progress.** The header (≤ 480) and the notice are
-  reserved first, then the footer (≤ 200), then rows are appended while each
-  fits `MAX_READ_RESPONSE_CHARS`. A first row that does not fit is rendered
-  **abbreviated** — dates and priority kept, tags and heading dropped with a
-  note, text cut to the room, the path cut around `…` only when it alone cannot
-  fit, the line ending `— abbreviated` — so every page with a match shows a row
-  and its cursor advances, down to the 1,000-character minimum cap.
+- **Bounded, with guaranteed progress.** The header (≤ 480) and the notice
+  (≤ 85) are reserved first, then the footer (≤ 200), then rows are appended
+  while each fits `MAX_READ_RESPONSE_CHARS`. A first row that does not fit is
+  rendered **abbreviated** — dates and priority kept, tags and heading dropped
+  with a note (`— tags cut` too when the stored tags were capped), text cut to
+  the room, the path cut around `…` only when it alone cannot fit beside a
+  40-character text reserve, the line ending `— abbreviated` — so every page
+  with a match shows a row and its cursor advances, down to the 1,000-character
+  minimum cap, where the worst case still shows at least 40 characters each of
+  path and text.
 - **The cursor** is base64url JSON over the caller's own values:
   `{"v":1,"o":…,"f":…,"d":…,"p" | "h":…,"l":…}`. `o` is 16 hex of
   SHA-256(`owner:<uid>` / `owner:null`) — bound to the owner scope, not the

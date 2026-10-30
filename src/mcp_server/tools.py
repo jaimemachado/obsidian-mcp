@@ -7305,7 +7305,7 @@ _ABBREVIATED_TEXT_RESERVE = 40
 _ISO_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _HEX32_RE = re.compile(r"[0-9a-f]{32}")
 _HEX16_RE = re.compile(r"[0-9a-f]{16}")
-_PATH_ESCAPE_RE = re.compile(r"[^\S ]")
+_PATH_ESCAPE_RE = re.compile(r"[^\S ]|\\")
 
 _CURSOR_FOREIGN = (
     "list_tasks: cursor does not belong to this query; start without one."
@@ -7405,7 +7405,10 @@ def decode_task_cursor(token: str, *, owner: str, filters: str) -> dict:
     out: dict = {"d": d, "l": line}
     if "p" in payload:
         p = payload["p"]
-        if not isinstance(p, str) or not p or len(p) > MAX_PATH_CHARS:
+        # A NUL or an unpaired surrogate can never be a stored path, and would
+        # fail at the bind as a database error rather than a refusal.
+        if (not isinstance(p, str) or not p or len(p) > MAX_PATH_CHARS
+                or "\x00" in p or not is_encodable(p)):
             raise _TaskCursorRefused(_CURSOR_FOREIGN)
         out["p"] = p
     else:
@@ -7432,10 +7435,14 @@ def _parse_iso_date(value: str):
 
 def _escape_task_path(path: str) -> str:
     """The path, exact and on one line: every whitespace character other than
-    U+0020 — each one `_one_line` would collapse — is shown as an escape."""
+    U+0020 — each one `_one_line` would collapse — is shown as an escape, and
+    a literal backslash is doubled, so the rendering is injective: `a\\nb.md`
+    (backslash, n) and `a<LF>b.md` never look alike (Codex round 1)."""
     def _esc(m: re.Match) -> str:
         ch = m.group(0)
-        return {"\n": "\\n", "\r": "\\r", "\t": "\\t"}.get(ch, f"\\u{ord(ch):04x}")
+        return {"\\": "\\\\", "\n": "\\n", "\r": "\\r", "\t": "\\t"}.get(
+            ch, f"\\u{ord(ch):04x}"
+        )
 
     return _PATH_ESCAPE_RE.sub(_esc, path)
 
@@ -7501,12 +7508,14 @@ def render_incomplete_notice(not_scanned: int, failed: int) -> str | None:
     """The closing notice when the list is known to be incomplete."""
     reasons = []
     if not_scanned:
-        reasons.append("some notes are not yet scanned for tasks")
+        reasons.append("notes not yet scanned for tasks")
     if failed:
-        reasons.append("some notes' tasks could not be indexed")
+        reasons.append("tasks that could not be indexed")
     if not reasons:
         return None
-    return "Incomplete list: " + " and ".join(reasons) + " (counted above)."
+    # Short on purpose: it is reserved before any row at the 1,000 minimum
+    # cap (design D7); the counts are in the header.
+    return "Incomplete list: " + " and ".join(reasons) + "."
 
 
 def _task_fields(row) -> list[str]:
@@ -7541,8 +7550,12 @@ def render_abbreviated_task_row(row, room: int) -> str:
     kept, tags and heading dropped with a note, text cut to the room, the path
     cut around `…` only when it alone cannot fit. Ends `— abbreviated`."""
     notes = []
-    if row["tags"]:
+    if row["tags"] or row["tags_cut"]:
         notes.append("tags omitted")
+    if row["tags_cut"]:
+        # Never let an abbreviated row hide that the stored tags are
+        # incomplete (Codex round 1).
+        notes.append("tags cut")
     if row["heading_path"]:
         notes.append("heading omitted")
     escaped = _escape_task_path(row["file_path"])
