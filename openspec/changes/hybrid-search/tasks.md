@@ -8,10 +8,10 @@ Refs #354. Read `proposal.md`, `design.md` (D1–D11, the owner decisions, L1–
 
 ## 2. Hybrid service (`src/services/hybrid.py`)
 
-- [ ] 2.1 Add `hybrid_rrf_k: int = Field(60, ge=1, le=1000)` (env `HYBRID_RRF_K`) to `src/config.py`, and `HYBRID_ARM_DEPTH = 50` as a module constant in `hybrid.py`.
-- [ ] 2.2 Implement `hybrid_search(session, query, *, limit, folder, tags, frontmatter, user_id, rrf_k=None) -> HybridResult` in the D2 statement order. The embedding comes before any statement. Then `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`, the three `SET LOCAL`s, the keyword arm (limit 50), the semantic arm (overfetch 50), `SET LOCAL enable_indexscan = on` after an exact re-run, the D3 fusion and tie-break, then keyword snippets for the keyword rows on the fused page (at most `KEYWORD_SNIPPET_ROWS`). Clamp `limit` to 1–50.
-- [ ] 2.3 Implement D4: catch any `Exception` from `get_embedding` only. Map `ProviderInputTooLarge` to `provider_input_rejected` and anything else to `provider_error`. Log one WARNING with the exception's class name only, never its message, skip the `hnsw` settings and the semantic arm, and return keyword-only. Any database exception propagates.
-- [ ] 2.4 Record the D7 timing keys (`embed_ms`, `db_ms`, `exact_fallback`, `fallback`, `any_rows`, `snippet_ms`, `arms`, `semantic_unavailable`, `keyword_rows`, `semantic_rows`, `overlap`, `rrf_k`). **Do not** call `record_results` in the service.
+- [x] 2.1 Add `hybrid_rrf_k: int = Field(60, ge=1, le=1000)` (env `HYBRID_RRF_K`) to `src/config.py`, and `HYBRID_ARM_DEPTH = 50` as a module constant in `hybrid.py`.
+- [x] 2.2 Implement `hybrid_search(session, query, *, limit, folder, tags, frontmatter, user_id, rrf_k=None) -> HybridResult` in the D2 statement order. The embedding comes before any statement. Then `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`, the three `SET LOCAL`s, the keyword arm (limit 50), the semantic arm (overfetch 50), `SET LOCAL enable_indexscan = on` after an exact re-run, the D3 fusion and tie-break, then keyword snippets for the keyword rows on the fused page (at most `KEYWORD_SNIPPET_ROWS`). Clamp `limit` to 1–50.
+- [x] 2.3 Implement D4: catch any `Exception` from `get_embedding` only. Map `ProviderInputTooLarge` to `provider_input_rejected` and anything else to `provider_error`. Log one WARNING with the exception's class name only, never its message, skip the `hnsw` settings and the semantic arm, and return keyword-only. Any database exception propagates.
+- [x] 2.4 Record the D7 timing keys (`embed_ms`, `db_ms`, `exact_fallback`, `fallback`, `any_rows`, `snippet_ms`, `arms`, `semantic_unavailable`, `keyword_rows`, `semantic_rows`, `overlap`, `rrf_k`). **Do not** call `record_results` in the service.
 
 ## 3. Tool, render, registration
 
