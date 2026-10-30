@@ -921,8 +921,8 @@ and needs nothing; the real run is this path, from a checkout with
 1. **Export.** `make search-eval-export [DAYS=90] USER_ID=<your user id>`.
    It runs one read-only transaction holding one `SELECT` through the same
    channel as `make db-backup` (`DB_BACKEND=docker` or `cnpg`, set in
-   `Makefile.local`), and writes the `keyword_search`, `semantic_search` and
-   `read_note` rows of the last `DAYS` days (1 to 365) to
+   `Makefile.local`), and writes the `keyword_search`, `semantic_search`,
+   `hybrid_search` and `read_note` rows of the last `DAYS` days (1 to 365) to
    `.search-eval/usage-export.jsonl` (`SEARCH_EVAL_DIR` to move it): a `0700`
    directory, a `0600` file, git-ignored. **It is tenant data**: query text,
    the paths agents read, owner ids. Never commit it, upload it or paste it
@@ -966,6 +966,16 @@ and needs nothing; the real run is this path, from a checkout with
    carries the server's search settings (`FTS_CONFIGS`, the embedding
    provider settings, and a `SECRET_KEY`, which the settings module needs
    to import). `MIN_QUERIES` (50) and `SEED` (0) are overridable.
+   `ARM_OPTS="key=value …"` passes one `--arm-opt` per pair to the replay;
+   every arm of the run sees the same options. The fusion arms of
+   `hybrid_search` (#354) use it: `ARMS="keyword semantic
+   scripts.search_eval_arms.hybrid:make_arm
+   scripts.search_eval_arms.hybrid:make_arm_alt" ARM_OPTS="hybrid_k=60
+   hybrid_alt_k=20"` scores two values of `HYBRID_RRF_K` in one report
+   (`make_arm` defaults `hybrid_k` to the setting; `make_arm_alt` refuses to
+   run without `hybrid_alt_k`). A hybrid arm fails the run if the embedding
+   provider is down during replay, because a keyword-only answer is not
+   evidence for the fusion.
 7. **Attach `report.json` to the PR only if it says `attachable: true`.** It
    carries metrics, counts and hashes, no query text and no note paths. A
    `CORPUS_LOSS` verdict means the candidate lost searchable notes for that
