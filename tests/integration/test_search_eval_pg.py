@@ -243,7 +243,7 @@ def test_make_search_eval_export_against_a_real_server(main_db, tmp_path):
     assert (out.stat().st_mode & 0o777) == 0o700
     f = out / "usage-export.jsonl"
     assert (f.stat().st_mode & 0o777) == 0o600
-    assert not (out / "usage-export.jsonl.tmp").exists()
+    assert not list(out.glob("*.tmp")), "no temp file left behind"
     lines = f.read_text().splitlines()
     rows = [json.loads(line) for line in lines]
     assert len(rows) == 17, "find_related and the 100-day-old row are outside the export"
@@ -283,7 +283,7 @@ def test_a_failed_export_leaves_nothing_behind(main_db, tmp_path):
     sentinel.write_bytes(b"sentinel\n")
     res = make_export(out, "does_not_exist")
     assert res.returncode != 0
-    assert not (out / "usage-export.jsonl.tmp").exists()
+    assert not list(out.glob("*.tmp")), "no temp file left behind"
     assert sentinel.read_bytes() == b"sentinel\n"
 
 

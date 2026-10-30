@@ -983,6 +983,20 @@ def test_the_cli_pipeline_writes_owner_only_files(tmp_path):
     assert exc.value.code == EXIT_USAGE
 
 
+def test_atomic_write_never_follows_a_planted_temp_symlink(tmp_path):
+    from scripts.search_eval._io import atomic_write
+
+    victim = tmp_path / "victim"
+    victim.write_text("untouched")
+    target = tmp_path / "qrels.json"
+    (tmp_path / "qrels.json.tmp").symlink_to(victim)
+    atomic_write(target, "{}")
+    assert victim.read_text() == "untouched"
+    assert target.read_text() == "{}" and not target.is_symlink()
+    assert (target.stat().st_mode & 0o777) == 0o600
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["qrels.json", "qrels.json.tmp", "victim"]
+
+
 def test_the_fixture_needs_no_database_settings():
     import sys
 

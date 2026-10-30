@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -38,21 +39,26 @@ def ensure_private_dir(path: Path) -> Path:
 
 
 def atomic_write(path: Path, data: str | bytes) -> str:
-    """Write `data` to `path` via `path.tmp` + rename, mode 0600. Returns its sha256."""
+    """Write `data` to `path` via a fresh temp file + rename, mode 0600. Returns its sha256.
+
+    The temp file is created by `tempfile` in the destination directory with
+    an unpredictable name and `O_EXCL`, so a pre-existing file or symlink at a
+    guessable `<name>.tmp` is never opened or followed.
+    """
     path = Path(path)
     raw = data.encode("utf-8") if isinstance(data, str) else data
-    tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    tmp = tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
+                                      delete=False)
     try:
-        with os.fdopen(fd, "wb") as fh:
+        with tmp as fh:
+            os.chmod(fh.name, 0o600)
             fh.write(raw)
             fh.flush()
             os.fsync(fh.fileno())
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
+        os.replace(tmp.name, path)
     except BaseException:
         try:
-            os.unlink(tmp)
+            os.unlink(tmp.name)
         except FileNotFoundError:
             pass
         raise

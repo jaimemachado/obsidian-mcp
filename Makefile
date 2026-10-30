@@ -553,9 +553,9 @@ search-eval:
 # text and the paths agents read): it lands in a 0700 directory as a 0600
 # file, under umask 077, and `.search-eval/` is git-ignored. On a multi-user
 # deployment set USER_ID= to your own id for a report you will attach to a PR
-# (design D10). The file is written to `.tmp` and renamed into place only when
-# psql succeeds; on failure the `.tmp` is removed and an earlier export is left
-# untouched. DB_EXEC stays overridable from the command line: the integration
+# (design D10). The file is written to a fresh `mktemp` file and renamed into
+# place only when psql succeeds; on failure the temp file is removed (trap) and
+# an earlier export is left untouched. DB_EXEC stays overridable from the command line: the integration
 # gate swaps in tests/integration/fixtures/local-db-exec.sh. DAYS is a
 # target-specific default so `make concurrency-report` keeps its own.
 SEARCH_EVAL_DIR ?= .search-eval
@@ -572,14 +572,15 @@ search-eval-export:
 	mkdir -p "$(SEARCH_EVAL_DIR)" && chmod 700 "$(SEARCH_EVAL_DIR)" || exit 1; \
 	OUT="$(SEARCH_EVAL_DIR)/usage-export.jsonl"; \
 	umask 077; \
+	TMP=$$(mktemp "$(SEARCH_EVAL_DIR)/usage-export.XXXXXX.tmp") || exit 1; \
+	trap 'rm -f "$$TMP"' EXIT; \
 	if $(DB_EXEC) -i psql -U postgres -d "$(SEARCH_EVAL_DB_NAME)" -X -q -A -t -v ON_ERROR_STOP=1 \
-			-v days=$(DAYS) -v user_id=$(USER_ID) < scripts/search_eval_export.sql > "$$OUT.tmp"; then \
-		chmod 600 "$$OUT.tmp" && mv -f "$$OUT.tmp" "$$OUT" || { rm -f "$$OUT.tmp"; exit 1; }; \
+			-v days=$(DAYS) -v user_id=$(USER_ID) < scripts/search_eval_export.sql > "$$TMP"; then \
+		chmod 600 "$$TMP" && mv -f "$$TMP" "$$OUT" || exit 1; \
 		ROWS=$$(grep -c . "$$OUT" || true); \
 		echo "$(GREEN)Exported $$ROWS row(s) to $$OUT (last $(DAYS) days; $(if $(USER_ID),user $(USER_ID) only,all users))$(NC)"; \
 		echo "$(YELLOW)Tenant data: never commit it or paste it into an issue.$(NC)"; \
 	else \
-		rm -f "$$OUT.tmp"; \
 		echo "$(RED)Export FAILED: psql through DB_BACKEND=$(DB_BACKEND) returned non-zero; nothing was replaced$(NC)"; \
 		exit 1; \
 	fi
