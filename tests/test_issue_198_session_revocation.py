@@ -41,7 +41,6 @@ import logging
 import pydantic_settings
 import pytest
 
-
 _orig_init = pydantic_settings.BaseSettings.__init__
 
 

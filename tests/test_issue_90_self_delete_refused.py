@@ -28,8 +28,6 @@ presents, and would also forbid the very removal the new refusal directs the
 operator to ask for.
 """
 import asyncio
-
-import pytest
 import os
 
 import pydantic_settings
