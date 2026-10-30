@@ -269,10 +269,16 @@ certifying branch: embedded, certified-empty and excluded.
   non-volumetric, because the endpoint is unauthenticated and a count would be
   tenant-derived (Codex r2 B1). It never changes `status`. Exact per-owner
   counts stay on the panel and in the owner-scoped marker. Every surface
-  (marker, backlog, dashboard, progress endpoint, health) uses one predicate,
+  (marker, backlog, dashboard, progress endpoint, health) uses
   `embedded_chunking_version IS DISTINCT FROM :CHUNKING_VERSION`. A rollback
   to a lower version therefore re-selects and marks notes stamped higher
-  (Codex r2 B2). The ranking itself is still mixed (L1). A wipe would have avoided
+  (Codex r2 B2). **Amended after the implementation review:** the marker
+  and `/health` additionally require the note to hold vector rows
+  (`EXISTS (SELECT 1 FROM note_embeddings …) AND … IS DISTINCT FROM`, the
+  harness's `legacy_chunked_notes` definition), so a note created since the
+  last embed pass, with no vectors at all, does not raise the line in steady
+  state; the backlog, dashboard and progress endpoint keep the broad
+  predicate. The ranking itself is still mixed (L1). A wipe would have avoided
   the mix but left semantic search returning nothing for hours, which is
   worse. A new ADDED requirement in embedding-providers states the boundary:
   model identity is global and refuses, while the chunking format is per note
@@ -581,6 +587,11 @@ Two new BLOCKERs were found, both accepted and folded in.
 
 Declined: none.
 
+Amendment (after the implementation review, 2026-10-30): B2's single
+predicate is kept for the backlog, dashboard and progress endpoint, and
+narrowed for the marker and `/health` to notes that hold vectors of another
+generation (see D4). `IS DISTINCT FROM` stays on every surface.
+
 ## Codex spec review, round 3 (2026-10-30)
 
 PASS — both round-2 fixes VERIFIED, no findings. B1 (`/health` exposes only the
@@ -588,6 +599,26 @@ process-wide, non-volumetric `indexer.rechunk`, never a number) and B2 (one
 `IS DISTINCT FROM :CHUNKING_VERSION` predicate on every surface, with the
 higher-stamp rollback scenario) close their failing inputs and do not regress the
 round-1 fixes. Strict OpenSpec validation also passes.
+
+## Codex implementation review, round 1 (2026-10-30)
+
+FAIL on 8c89da6, with 1 MAJOR and 2 MINOR, all accepted and fixed; the
+`openspec-verifier` pass found 0 blocking and 8 minor items, all folded in.
+
+| # | Severity | Finding | Resolution |
+|---|---|---|---|
+| M1 | MAJOR | `semantic_search` interpolated the raw query into its header, so a multiline query displaced the `index_transition:` line or forged one above it. | Query and source path are echoed through `_header_scalar` (one escaped line); tests with multiline and control-bearing queries assert the marker is the only one and directly after the header. |
+| m1 | MINOR | The render tests never called `find_related_impl`. | Tests for non-empty and exact-fallback-empty results, named-owner scoping, locator rendering, transition placement and one-line previews. |
+| m2 | MINOR | search.md's projection table omitted the locator columns and called the two vector projections one shape. | Both shapes listed separately, `heading_path` / `section_ordinal` included, `embed_prefix` named as never projected. |
+
+Verifier items folded in: the marker / `/health` predicate narrowed to notes
+holding vectors (D4 amendment, two new scenarios); a setext test; NULL vs `{}`
+tags in the upsert; excluded and empty legacy notes converging without a
+provider call; `semantic_search` refusing a weaker open transaction, with a
+PostgreSQL test of the isolation in the tool path; the `_provenance_owner`
+reading; L11; bounded timeouts in the 034 downgrade.
+
+Declined: none.
 
 ## Implementation notes
 
@@ -602,13 +633,18 @@ Choices the spec left open, one line each.
 - The full-hash backstop keeps every body on that pass (`keep_bodies=backstop`, a re-derive's memory shape once per interval) and re-checks rows certified under the current version, both unchanged rows and same-hash re-upserts, after the upsert; it compares with `= :cv`, which is not one of the five transition surfaces.
 - The predicate helpers (`vectors_not_current_sql/_expr`, `not_rechunked_sql/_expr`) live in `embeddings.py` beside `CHUNKING_VERSION` and inline the version as a literal read at call time.
 - `EmbedBudget.enter_version_only()` starts a fresh allowance (clock and chunk counter) at the first version-only note of a single-scope pass; `leave_version_only()` restores the unbudgeted state before the exclusion sweep.
-- `/health`'s rechunk state is observed by one owner-scoped `count(*)` at the end of each embed stage (after the sweep); a failed count keeps the previous observation.
-- `semantic_search` issues `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY` only when its session has no open transaction; `find_related_impl` issues it first; the tools then call `rechunk_pending_count` on the same session.
+- `/health`'s rechunk state is observed by one owner-scoped `count(*)` under the marker's predicate (`legacy_vectors_sql`) at the end of each embed stage (after the sweep); a failed count keeps the previous observation.
+- `semantic_search` issues `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY` on a session with no open transaction, and otherwise reads `transaction_isolation` / `transaction_read_only` and raises unless they are `repeatable read` / `on`; `find_related_impl` issues it first; the tools then call `rechunk_pending_count` on the same session.
 - The transition line goes on the line after the header (the header's trailing blank line moves below it); on the empty paths it is the second line.
 - `_preview_line` maps each `str.isspace()` character to a space and collapses runs, then escapes `[\x00-\x1f\x7f-\x9f]`; U+0085 is whitespace in Python and so collapses rather than escapes.
 - The locator's 160-character cut drops whole outer components behind `…/`; a single innermost component still over 160 is itself cut with `…`.
 - `EMBEDDING_QUERY_INSTRUCTION` refuses C0 controls other than LF/TAB (as specified); DEL and C1 are accepted.
-- The harness owner for `legacy_chunked_notes` is derived from the queries of a single-user report (the miner guarantees one owner); a single-user report with no queries records `null`.
+- `_provenance_owner`: the harness owner for `legacy_chunked_notes` is read from the `user_id` of a single-user report's queries (the miner guarantees one owner, NULL included); a single-user report with no queries records `null`; a `"multi"` report counts all owners. The search-evaluation delta says the same.
+- Header echoes of caller text (the semantic query, the `find_related` source path, also in the stale-source line) go through `_header_scalar` — the inside of `change_feed.quote`'s JSON literal — keeping the existing quote marks; the argument caps bound the length.
+- Verifier reading (b): the full-hash backstop clears a note whose exclusion pattern changed (same `fnmatch` as the embed pass), and the backlog repairs it before the sweep; there is no oscillation, because the repaired note's digest then matches.
+- Verifier reading (c): the #150 `Plain.md` fixture now seeds `[]` tags; under the MODIFIED grammar requirement a tag difference alone invalidates, and `[]` is what extraction yields.
+- Verifier reading (d): L4 replaces #281's "a metadata-only edit makes no provider call" for tag and title edits; other frontmatter edits are still free.
+- Verifier reading (g): `_preview_line` collapses U+0085 and U+001C–U+001F as whitespace (they are `str.isspace()`); "expressed once" means each predicate is a paired SQL text and SQLAlchemy expression side by side in `embeddings.py`; containment holds because a chunk ends at the next heading of any depth, while `read_note`'s section runs further.
 - The startup line is `Embedding retrieval: <canonical JSON>`, logged right after the embedding transport line.
 - The upsert's tags comparison treats NULL and `{}` as equal (`COALESCE(tags, '{}')`), since both build the same prefix; otherwise a pre-existing NULL-tag row would be re-embedded by its first re-upsert.
 - Because an excluded note's digest is of `[]`, the full-hash backstop also clears the certification of a note whose exclusion pattern changed (in either direction); the backlog then repairs it, ahead of the exclusion sweep.
@@ -644,3 +680,6 @@ Choices the spec left open, one line each.
   shared Ollama.
 - **L10** — The heading-path components and the prefix are cut at fixed
   lengths, so a very long heading is embedded and shown truncated, marked `…`.
+- **L11** — The full-hash backstop keeps every note body in memory for the
+  pass, once per `INDEX_FULL_HASH_INTERVAL_HOURS` and at startup: the same
+  memory profile as a re-derive.

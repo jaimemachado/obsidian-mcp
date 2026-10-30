@@ -59,16 +59,18 @@ For every chunk, the input `embed_note` sends to the provider SHALL be `embed_pr
 
 The staleness annotation SHALL remain `embedded_content_hash IS DISTINCT FROM content_hash`, so a note selected only for its chunking version SHALL be reported fresh and keep its preview. Its stored vectors SHALL be served until its new rows commit, which replace all of them in one transaction. A version change SHALL NOT clear `embedded_content_hash`, SHALL NOT alter the stored embedding fingerprint and SHALL NOT refuse startup.
 
-**Mixed generations change ranking, and therefore membership at the cutoff.** A prefixed vector and a legacy vector of the same model sit at different distances from the same query. A re-embedded note can therefore displace a still-legacy note from a bounded page, so such a page is not a complete answer and the system SHALL NOT present it as one. While any note in the caller's owner scope has `embedded_chunking_version IS DISTINCT FROM CHUNKING_VERSION` (the running build's version, so a NULL, lower **or higher** stamp counts), every `semantic_search` and `find_related` response SHALL carry this line on its own, directly after the header: `index_transition: N notes not yet re-chunked; cross-generation ranking is approximate, re-run after the backlog drains`.
+**Mixed generations change ranking, and therefore membership at the cutoff.** A prefixed vector and a legacy vector of the same model sit at different distances from the same query. A re-embedded note can therefore displace a still-legacy note from a bounded page, so such a page is not a complete answer and the system SHALL NOT present it as one. While any note in the caller's owner scope **holds vector rows** and has `embedded_chunking_version IS DISTINCT FROM CHUNKING_VERSION` (the running build's version, so a NULL, lower **or higher** stamp counts), every `semantic_search` and `find_related` response SHALL carry this line on its own, directly after the header: `index_transition: N notes not yet re-chunked; cross-generation ranking is approximate, re-run after the backlog drains`.
 - N SHALL be the owner-scoped count of such notes, read in the same `REPEATABLE READ, READ ONLY` transaction as the vector query.
+- A note with no vector rows SHALL NOT be counted: it is not a generation mix, and counting it would raise the line for every note created since the last embed pass.
+- Caller-supplied text echoed in the header (the query, the source path) SHALL be rendered as one escaped line, so it can neither displace the line nor forge one above it.
 - The line SHALL be present on every return path that runs the query, the empty result included.
 - The line SHALL be absent when N is zero.
 
 The ranking itself remains mixed during the transition. That is a declared limitation.
 
-**One predicate.** The response marker, the embed backlog, the dashboard pending count, the re-embedding progress endpoint and the `/health` state SHALL all use the single owner-scoped predicate `embedded_chunking_version IS DISTINCT FROM :CHUNKING_VERSION`, expressed once. None of them SHALL compare with `<` or `>`.
+**Two predicates, each expressed once.** The embed backlog, the dashboard pending count and the re-embedding progress endpoint SHALL use the owner-scoped predicate `embedded_chunking_version IS DISTINCT FROM :CHUNKING_VERSION`. The response marker and the `/health` state SHALL use the narrower `EXISTS (SELECT 1 FROM note_embeddings e WHERE e.note_id = n.id) AND n.embedded_chunking_version IS DISTINCT FROM :CHUNKING_VERSION` — notes that hold vectors of another generation, the definition the evaluation harness's `legacy_chunked_notes` uses. Each SHALL be expressed once, as paired SQL text and expression. None of them SHALL compare with `<` or `>`.
 
-The length of the re-embed SHALL NOT by itself increment any indexer health counter or degrade `/health`. `/health` is unauthenticated, so it SHALL NOT carry any count derived from the transition. It SHALL carry only `indexer.rechunk`, a process-wide state of `"in_progress"` or `"complete"`, held in process memory and set by the embed stages. It reads `"in_progress"` while the most recent embed stage of any scope observed a non-zero count under the one predicate, and `"complete"` otherwise. It SHALL NOT affect `status` or the HTTP status code, and it SHALL NOT name a scope, a path or a number. The exact per-owner counts SHALL be available only on the authenticated surfaces: the dashboard pending count, the progress endpoint, and the owner-scoped `index_transition:` line.
+The length of the re-embed SHALL NOT by itself increment any indexer health counter or degrade `/health`. `/health` is unauthenticated, so it SHALL NOT carry any count derived from the transition. It SHALL carry only `indexer.rechunk`, a process-wide state of `"in_progress"` or `"complete"`, held in process memory and set by the embed stages. It reads `"in_progress"` while the most recent embed stage of any scope observed a non-zero count under the marker's predicate, and `"complete"` otherwise. It SHALL NOT affect `status` or the HTTP status code, and it SHALL NOT name a scope, a path or a number. The exact per-owner counts SHALL be available only on the authenticated surfaces: the dashboard pending count, the progress endpoint, and the owner-scoped `index_transition:` line.
 
 #### Scenario: First passes after deploy
 - **WHEN** the 034 build starts over a fully embedded pre-034 index
@@ -95,6 +97,19 @@ The length of the re-embed SHALL NOT by itself increment any indexer health coun
 #### Scenario: The marker is owner-scoped
 - **WHEN** another tenant has legacy notes and the caller's scope has none
 - **THEN** the caller's responses SHALL carry no `index_transition:` line
+
+#### Scenario: A new note without vectors raises no marker
+- **WHEN** a note is created after the deploy and the embed pass has not reached it yet
+- **THEN** it SHALL be in the embed backlog and the dashboard pending count
+- **AND** no response SHALL carry the `index_transition:` line on its account
+
+#### Scenario: A legacy note whose certification was cleared is still counted
+- **WHEN** a note still serving pre-034 vectors has its certification cleared by a tag edit
+- **THEN** the marker SHALL still count it until its new rows commit
+
+#### Scenario: A multiline query cannot displace or forge the marker
+- **WHEN** a query contains line breaks, control characters or the text `index_transition:` and the scope has notes on another generation
+- **THEN** the header SHALL render the query on one escaped line, and the only `index_transition:` line SHALL be the one directly after it
 
 #### Scenario: Single-user transition is spread over passes
 - **WHEN** a single-user deployment's backlog holds only version-only notes whose embedding exceeds the time budget

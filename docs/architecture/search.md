@@ -462,17 +462,22 @@ drains`. N is `rechunk_pending_count`, owner-scoped (total mapping), read in
 the **same `REPEATABLE READ, READ ONLY` transaction** as the vector query —
 `semantic_search` opens it with `SET TRANSACTION` as its first statement when
 handed a session with no transaction open, `find_related_impl` as its first
-statement. Absent at zero. A brand-new note not yet embedded also counts
-(its stamp is NULL), so a freshly created note keeps the line up until the
-next embed pass.
+statement. Absent at zero. Only notes that **hold vectors** of another
+generation count (`legacy_vectors_sql` / `_expr`), so a note created since the
+last embed pass — in the backlog, with no vectors yet — does not raise the
+line, while a legacy note whose certification a tag edit cleared still does.
+The query (and `find_related`'s source path) is echoed in the header as one
+escaped line (`_header_scalar`), so a multiline query cannot push the line
+down or forge one above it.
 
 ## Read paths project what they render (#280)
 
-Six read statements select an explicit column list instead of whole entities:
+Seven read statements select an explicit column list instead of whole entities:
 
 | Path | Projected columns |
 | --- | --- |
-| `semantic_search` | `ne.note_id, ne.chunk_index, ne.chunk_text, nm.file_path, nm.title, nm.tags, nm.content_hash, nm.embedded_content_hash, nm.chunks_truncated, distance` (the `find_related_stmt` shape) |
+| `semantic_search` | `ne.note_id, ne.chunk_index, ne.chunk_text, ne.heading_path, ne.section_ordinal, nm.file_path, nm.title, nm.tags, nm.content_hash, nm.embedded_content_hash, nm.chunks_truncated, distance` |
+| `find_related_stmt` | `ne.note_id, ne.chunk_text, ne.heading_path, ne.section_ordinal, nm.file_path, nm.title, nm.tags, nm.content_hash, nm.embedded_content_hash, nm.chunks_truncated, distance` — a different shape: no `chunk_index`, because its dedupe keeps the nearest chunk per note by distance alone |
 | `keyword_search` | `nm.id, nm.file_path, nm.title, nm.tags, rank` (both ranking blocks); the snippet statement projects `id`, one `ts_headline` per config, the two `matched_in` flags, `has_excerpt` and the `matched_terms` counts — `body_excerpt` is read inside `ts_headline` and never projected |
 | `list_notes` | `file_path, file_size, modified_at` |
 | `get_recent` / `find_orphans` | `file_path, title, tags, modified_at` |
@@ -480,7 +485,10 @@ Six read statements select an explicit column list instead of whole entities:
 
 None of them ships `notes_metadata.content_tsvector` (the largest TOASTed
 column, which the planner does not cost), `notes_metadata.body_excerpt`,
-`note_embeddings.embedding` or `notes_metadata.frontmatter`. `ts_rank_cd`,
+`note_embeddings.embedding`, `note_embeddings.embed_prefix` (embedded input,
+never rendered; #355) or `notes_metadata.frontmatter`. The two vector
+statements project `heading_path` and `section_ordinal` because the locator
+renders them (#355). `ts_rank_cd`,
 `@@` and `ts_headline` still read the tsvector and the excerpt *server-side*;
 what is gone is shipping and hydrating them. **No predicate, no `SET LOCAL`,
 no overfetch and no exact-fallback condition of the vector paths changed.**

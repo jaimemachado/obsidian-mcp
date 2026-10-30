@@ -407,9 +407,10 @@ update it in the same change.** What stays here is the short list:
   `embedded_input_digest`; the upsert clears certification on a changed
   title/tags and the full-hash pass re-checks the digest. A version change
   re-selects notes through the backlog (budgeted in **every** mode, after
-  real edits) under one predicate, `IS DISTINCT FROM CHUNKING_VERSION`,
-  never `<`/`>`; vector responses carry `index_transition: N …` while the
-  caller's scope has any, and `/health` only `indexer.rechunk:
+  real edits) under `IS DISTINCT FROM CHUNKING_VERSION`, never `<`/`>`;
+  vector responses carry `index_transition: N …` while the caller's scope
+  has notes **holding vectors** of another generation (the query is echoed
+  as one escaped line), and `/health` only `indexer.rechunk:
   in_progress|complete`, never a number. Rows print `§ "<path>" (#N)` /
   `§ (top of note)`, withheld on stale and pre-034 rows; previews are one
   line from the uncut chunk. Every embedding call passes `kind=query|

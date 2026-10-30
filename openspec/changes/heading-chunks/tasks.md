@@ -157,7 +157,7 @@
 ## 10. Verification gates
 
 - [x] 10.1 `openspec validate heading-chunks --strict`.
-- [ ] 10.2 `openspec-verifier` subagent (a non-author) audits the implementation against these deltas and runs `make audit`, `make test-schema`, `make test-integration`, `make search-eval` (fixture) and `make db-check`. Iterate to zero blocking gaps.
+- [x] 10.2 `openspec-verifier` subagent (a non-author) audits the implementation against these deltas and runs `make audit`, `make test-schema`, `make test-integration`, `make search-eval` (fixture) and `make db-check`. Iterate to zero blocking gaps. — verifier: 0 blocking, 8 minor, all folded.
 - [ ] 10.3 Adversarial Codex (mandatory: search path, chunking and embedding). Commit first, pin `-m gpt-daybreak-blue-latest`, `--sandbox read-only`, stdin from a file, run in the background. Frame wrong as: a silently wrong or misleading search result (wrong ordinal, forged locator, reused vector for a different input, a note dropped from semantic search), a refused or crash-looping deploy, or `/health` degraded by a healthy transition. Attack:
   - ordinal parity on adversarial fences and terminators;
   - the reuse key and under-lock recheck;

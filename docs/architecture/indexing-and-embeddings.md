@@ -270,14 +270,16 @@ transaction under the generation lock.
 **The re-embed is a per-note backlog, outside the stored fingerprint.** A
 fingerprint change refuses startup and its reset empties semantic search, and
 clearing every `embedded_content_hash` would mark every result stale. So the
-chunking format is a per-note stamp instead, and the one predicate
+chunking format is a per-note stamp instead. The embed backlog, the
+dashboard pending count and the progress endpoint share
 `embedded_chunking_version IS DISTINCT FROM CHUNKING_VERSION` (never `<` or
-`>`, so a rollback to a lower version re-selects notes stamped higher) is
-shared by the embed backlog, the dashboard pending count, the progress
-endpoint, the `index_transition:` response marker and `/health`
-(`vectors_not_current_sql` / `_expr`, `not_rechunked_sql` / `_expr`; a test
-checks that the text and the expression agree and greps `src/` for an ordered
-comparison). Staleness is unchanged (`embedded_content_hash IS DISTINCT FROM
+`>`, so a rollback to a lower version re-selects notes stamped higher;
+`vectors_not_current_sql` / `_expr`). The `index_transition:` marker and
+`/health` use the narrower `legacy_vectors_sql` / `_expr`: the same version
+test **and** the note holds vector rows — a generation mix, not a note that
+simply has not been embedded yet (the harness's `legacy_chunked_notes` is the
+same definition). Each is paired SQL text and expression; a test checks they
+agree and greps `src/` for an ordered comparison. Staleness is unchanged (`embedded_content_hash IS DISTINCT FROM
 content_hash`), so a version-only note is fresh and keeps its preview. The
 model, and the space, are unchanged and stay in the refusing fingerprint; the
 mix still changes ranking (L1), so the vector tools declare it.
@@ -292,7 +294,7 @@ unbudgeted state for the sweep; a multi-scope pass is budgeted across both
 segments as before. A stop is not a failure.
 
 **`/health` stays non-volumetric.** Each embed stage counts its scope's
-not-re-chunked notes at its end under the one predicate and stores the count
+notes holding vectors of another generation at its end and stores the count
 in `indexer_health` (process memory). `/health` exposes only
 `indexer.rechunk: "in_progress" | "complete"`, process-wide — beside the
 "counts only, no path/error/user id" rule, this field carries **no number at
@@ -327,6 +329,8 @@ reused) until its next edit or the next full-hash backstop.
   Ollama.
 - **L10** — heading components and the prefix are cut at fixed lengths,
   marked `…`.
+- **L11** — the full-hash backstop holds every note body for the pass, once
+  per interval and at startup, the memory profile of a re-derive.
 
 ## Indexing decisions
 
