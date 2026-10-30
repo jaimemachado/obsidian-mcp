@@ -6,7 +6,10 @@ Order, which is the atomicity contract:
    generation id (an existing one is refused), the inputs, the selection, the
    arm names, a `runfile:`'s provenance, and a URL for database-backed arms.
    Any failure here is exit 64 and touches nothing.
-2. Atomically write `runs/manifest.json` with `status: "running"`. From this
+2. Reserve `runs/<generation>/` with an exclusive `mkdir` (an existing or
+   concurrently taken name is exit 64; the directory is kept after any
+   failure), then atomically write `runs/manifest.json`, and the
+   generation's own `_manifest.json` copy, with `status: "running"`. From this
    moment no earlier generation is the published one.
 3. Open the read-only replay engine and assert it, read the replay corpus,
    build each factory, and ask every arm every selected query, sequentially.
@@ -30,6 +33,7 @@ own `run` recorded on its own database.
 """
 from __future__ import annotations
 
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -51,6 +55,9 @@ from scripts.search_eval.scoring import (
 )
 
 DEFAULT_DEPTH = 20
+#: The generation's own copy of its manifest. An arm slug never starts with
+#: `_`, so it cannot collide with a staged arm file.
+GENERATION_MANIFEST_FILE = "_manifest.json"
 _GENERATION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
@@ -129,8 +136,6 @@ async def run_generation(
                         snapshot_sha256=data.snapshot_sha256, selected_qids_hash=sel_hash)
     runs_dir = data_dir / RUNS_DIR
     gen_dir = runs_dir / generation
-    if gen_dir.exists():
-        raise UsageError(f"generation {generation} already exists; choose another id")
     needs_db = any(a.requires_db for a in arms)
     url = None
     if needs_db:
@@ -151,8 +156,22 @@ async def run_generation(
         "depth": depth,
     }
     ensure_private_dir(runs_dir)
+    # Reserve the generation atomically before anything can fail: an early
+    # database or corpus failure, or a concurrent run with the same id, must
+    # find the name taken. The directory is kept after every failure.
+    try:
+        gen_dir.mkdir(mode=0o700, exist_ok=False)
+    except FileExistsError as e:
+        raise UsageError(f"generation {generation} already exists; choose another id") from e
+    os.chmod(gen_dir, 0o700)
     manifest_path = runs_dir / MANIFEST_FILE
-    atomic_write(manifest_path, pretty_json(manifest))
+
+    def publish(m: dict) -> None:
+        # The generation keeps its own copy; runs/manifest.json is the published one.
+        atomic_write(gen_dir / GENERATION_MANIFEST_FILE, pretty_json(m))
+        atomic_write(manifest_path, pretty_json(m))
+
+    publish(manifest)
 
     engine = None
     current: ResolvedArm | None = None
@@ -167,7 +186,6 @@ async def run_generation(
             maker = None
             replay = replay_corpus or (Corpus.load(fixture_corpus) if fixture_corpus else data.snapshot)
         ctx = ArmContext(session_factory=maker, corpus=replay, options=options)
-        ensure_private_dir(gen_dir)
         files: dict[str, dict] = {}
         for arm in arms:
             current = arm
@@ -211,7 +229,7 @@ async def run_generation(
             files[arm.spec] = {"path": rel, "sha256": digest}
         current = None
         manifest = {**manifest, "status": "complete", "files": files}
-        atomic_write(manifest_path, pretty_json(manifest))
+        publish(manifest)
         return RunOutcome(EXIT_OK, manifest)
     except Exception as e:  # noqa: BLE001 - any failure fails the generation
         label = current.label if current is not None else None
@@ -226,7 +244,7 @@ async def run_generation(
             "failed_arm": label,
             "error": f"{type(e).__name__} in arm {label}" if label else type(e).__name__,
         }
-        atomic_write(manifest_path, pretty_json(manifest))
+        publish(manifest)
         return RunOutcome(EXIT_FAILURE, manifest)
     finally:
         if engine is not None:

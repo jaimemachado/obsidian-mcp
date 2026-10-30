@@ -762,6 +762,24 @@ def test_a_failed_generation_cannot_be_scored_from_an_earlier_one(tmp_path, armm
     assert cli_main(["score", "--data", str(d), "--min-queries", "1"]) == EXIT_USAGE
 
 
+def test_an_early_failure_still_reserves_the_generation(tmp_path, monkeypatch):
+    monkeypatch.setenv("SEARCH_EVAL_DATABASE_URL", "postgresql+asyncpg://x:y@127.0.0.1:1/none")
+    d = tmp_path / "d"
+    write_data(d, [{"text": "q", "relevant": ["A.md"]}], SNAP)
+    out = run(d, ["keyword"], generation="EARLY")
+    assert out.exit_code == EXIT_FAILURE
+    reserved = d / "runs" / "EARLY"
+    assert reserved.is_dir() and (reserved.stat().st_mode & 0o777) == 0o700
+    kept = json.loads((reserved / "_manifest.json").read_text())
+    assert (kept["generation"], kept["status"]) == ("EARLY", "failed")
+    assert kept == manifest_of(d)
+    with pytest.raises(UsageError, match="already exists"):
+        run(d, ["fixture-title"], generation="EARLY")
+    assert cli_main(["run", "--data", str(d), "--arm", "fixture-title",
+                     "--generation", "EARLY"]) == EXIT_USAGE
+    assert manifest_of(d)["status"] == "failed", "the refused re-run published nothing"
+
+
 def test_a_running_manifest_is_refused(tmp_path, armmod):
     d = tmp_path / "d"
     _seventy(d)
@@ -810,7 +828,7 @@ def test_a_changed_run_file_or_a_reused_generation_is_refused(tmp_path, armmod):
     assert run(d, [f"{armmod}:fixed_a"]).exit_code == EXIT_OK
     with pytest.raises(UsageError, match="already exists"):
         run(d, [f"{armmod}:fixed_a"], generation="G1")
-    staged = next((d / "runs" / "G1").iterdir())
+    staged = d / "runs" / next(iter(manifest_of(d)["files"].values()))["path"]
     staged.write_text(staged.read_text().replace('"A.md"', '"B.md"'))
     with pytest.raises(UsageError, match="changed"):
         score(d, min_queries=1)
@@ -830,7 +848,7 @@ def test_output_is_deduplicated_and_truncated_in_order(tmp_path, armmod):
     d = tmp_path / "d"
     write_data(d, [{"text": "q", "relevant": ["B.md"]}], SNAP)
     assert run(d, [f"{armmod}:noisy"], depth=5).exit_code == EXIT_OK
-    staged = json.loads(next((d / "runs" / "G1").iterdir()).read_text())
+    staged = json.loads((d / "runs" / next(iter(manifest_of(d)["files"].values()))["path"]).read_text())
     (ranked,) = staged["runs"].values()
     assert ranked == ["A.md", "B.md", "N0.md", "N1.md", "N2.md"]
     assert score(d, min_queries=1).report["arms"][0]["metrics"]["overall"]["mrr"] == 0.5

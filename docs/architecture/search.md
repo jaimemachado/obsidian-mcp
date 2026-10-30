@@ -753,7 +753,7 @@ built-in arms replayed on a copy re-chunked after the snapshot; or #367's
 embedding-model trial as `runfile:<path>`, a staged arm file the harness's
 own `run` wrote on a re-embedded copy with the same qrels, snapshot and
 selection hashes, published by a complete manifest. Every `run` is a
-**generation**: `runs/manifest.json` is written `running` before any factory
+**generation**: its `runs/<generation>/` directory is reserved by an exclusive `mkdir` (a reused or concurrent id is exit 64, and the directory survives any failure), and `runs/manifest.json` is written `running` before any factory
 executes, rewritten `failed` (the failing arm and the exception type only, since a
 message can quote query text; the message goes to stderr; exit 1) on any exception or any answer that is not a
 list of strings, and `complete` with every staged file's sha256 only after
