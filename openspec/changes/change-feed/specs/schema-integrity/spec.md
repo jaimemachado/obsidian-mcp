@@ -2,7 +2,7 @@
 
 ### Requirement: Migration 033 SHALL add `content_changed_at` and the feed tables as marked, reconcilable objects
 Migration 033 (revising 032) SHALL add `notes_metadata.content_changed_at timestamptz`, backfill it with `COALESCE(modified_at, indexed_at)`, and then make it `NOT NULL` with `DEFAULT now()`. It SHALL create three tables, with the columns, CHECK constraints, unique constraints and indexes of the design, and **no foreign key on any of them**:
-- `note_events`, with a `bigint` identity surrogate key, a plain nullable `user_id`, a `seq bigint NOT NULL`, and `UNIQUE (user_id, seq) NULLS NOT DISTINCT`;
+- `note_events`, with a `bigserial` surrogate key, a plain nullable `user_id`, a `seq bigint NOT NULL`, and `UNIQUE (user_id, seq) NULLS NOT DISTINCT`;
 - `note_event_scopes`, with `user_id` unique `NULLS NOT DISTINCT`, `last_seq`, `pruned_through_seq` and `pruned_at`;
 - `note_event_gaps`.
 

@@ -56,7 +56,7 @@ The permanent-deletion path SHALL delete the scope's `note_events`, `note_event_
 - **THEN** it SHALL write no row
 
 ### Requirement: An event write SHALL never lose the change it describes
-`move_note`'s `moved` event SHALL be inserted inside the same transaction as its `notes_metadata` path update, all or nothing, so that a failed event also leaves the row at the old path for the next pass to pair and record. Every other tool publication is file-only. Its event SHALL be appended in its own transaction after the publication, and a failure there SHALL be logged and SHALL NOT raise: the next pass observes the change and records it as an `index` event. The consequence is misattribution, never loss. The index pass's append SHALL run in a savepoint with `lock_timeout = CHANGE_FEED_LOCK_TIMEOUT_MS`. On failure it SHALL roll back the savepoint and insert one `note_event_gaps` row (`user_id`, `gap_count`) in the pass's transaction. The scope's next successful append SHALL consume the gap rows into one `gap` event with `gap_reason = 'write_failed'` ahead of its own events. In-process state SHALL NOT be the only record of an unrecorded event.
+`move_note`'s `moved` event SHALL be inserted inside the same transaction as its `notes_metadata` path update, all or nothing, so that a failed event also leaves the row at the old path for the next pass to pair and record. Every other tool publication is file-only. Its event SHALL be appended in its own transaction after the publication, and a failure there SHALL be logged and SHALL NOT raise: the next pass observes the change and records it as an `index` event. The consequence is misattribution, never loss. The index pass's append, and every file-only tool's, SHALL run in a savepoint with `lock_timeout = CHANGE_FEED_LOCK_TIMEOUT_MS` (default 2,000 ms, bounds 100–30,000, validated at load). On failure it SHALL roll back the savepoint and insert one `note_event_gaps` row (`user_id`, `gap_count`) in the pass's transaction. The scope's next successful append SHALL consume the gap rows into one `gap` event with `gap_reason = 'write_failed'` ahead of its own events. In-process state SHALL NOT be the only record of an unrecorded event.
 
 #### Scenario: Move, failed append, restart
 - **WHEN** `move_note("A.md", "B.md")` renames the file, its metadata transaction's event insert fails, and the process restarts before any other append
@@ -95,7 +95,7 @@ After a confirmed publication, the tool that performed it SHALL append an event 
 - `edit_note` and `set_frontmatter` → `modified`;
 - `write_file`, `import_from_url` and `PUT /transfer/upload` on a `.md` path → `created` without an incumbent and `modified` with one;
 - `move_note` → `moved`, inside its metadata transaction, and one `modified` per backlink source whose rewrite it published;
-- `delete_note` and `delete_file` on a `.md` path → `deleted`.
+- `delete_note` → `deleted` with `reason = 'removed'`. (`delete_file` refuses every `.md` path and so never records an event.)
 
 A transfer upload SHALL be attributed to the actor and principal that minted the capability, the same principal the write-bucket charge at redemption already uses (`transfer.minting_principal`). This reuses that rule rather than defining a second one. A publication the tool reports as `publication_uncertain` SHALL record no event.
 
@@ -121,7 +121,7 @@ The index pass SHALL collect the following events with `source = 'index'` and no
 - `modified`: rows whose `content_hash` it changes;
 - `moved`: committed id-preserving moves;
 - `deleted`: **every** row it removes from the index, with `reason = 'removed'` for an ordinary prune, `'not_indexable'` for a present-but-not-indexable path, and `'quarantined'` for a quarantine removal;
-- `created` with `reason = 'not_indexable'`: a present-but-not-indexable path with no row, whose latest event is not already a `not_indexable` event.
+- `created` with `reason = 'not_indexable'`: a present path whose bytes are not valid UTF-8, with no row, whose latest event (from any source) is not already a `not_indexable` event. A path not indexable by its *name* (not UTF-8, over the path cap) cannot be stored in a feed row and SHALL record no event.
 
 After taking the feed lock, it SHALL suppress an event when the latest event *at* the path has `source = 'mcp'` and describes the same state. An event is at a path when the path is its `path` or its `from_path`, and the latest is the one with the highest `seq`. The same state means one of:
 - both are content events (`created` or `modified`) with the same non-NULL `content_hash`, or both have a NULL hash with `reason = 'not_indexable'`;
@@ -158,7 +158,7 @@ After taking the feed lock, it SHALL suppress an event when the latest event *at
 - **THEN** the feed SHALL hold three `moved` events in that order: the attributed one and two `human/sync` ones
 
 ### Requirement: The first pass over an empty scope SHALL be a baseline, not a stream of creations
-A pass over a scope that has no `notes_metadata` rows at its start SHALL record no per-note events and SHALL record one `reset` event. A provenance discard SHALL, in the discard's transaction, delete the scope's events, raise `note_event_scopes.pruned_through_seq` to `last_seq` and `pruned_at` to the newest deleted event's time, and record one `reset` event.
+A pass over a scope that has no `notes_metadata` rows at its start SHALL record no per-note events, and SHALL record one `reset` event when it writes at least one row; a pass over an empty scope that writes nothing (an empty vault) SHALL record nothing, and a baseline `reset` directly after the discard's own `reset` SHALL NOT be repeated. A provenance discard SHALL, in the discard's transaction, delete the scope's events and its `note_event_gaps` rows, raise `note_event_scopes.pruned_through_seq` to `last_seq` and `pruned_at` to the newest deleted event's time, and record one `reset` event.
 
 #### Scenario: Fresh install
 - **WHEN** the first pass indexes a 2,500-note vault into an empty index
@@ -167,10 +167,12 @@ A pass over a scope that has no `notes_metadata` rows at its start SHALL record 
 #### Scenario: Vault reassigned
 - **WHEN** a user's vault assignment changes so that the provenance is discarded
 - **THEN** none of the previous root's events SHALL remain visible to `get_changes` for that user
-- **AND** a cursor from before the discard SHALL read `history_truncated: true`
+- **AND** a cursor below the scope's `last_seq` at the discard SHALL read `history_truncated: true`
+- **AND** a caught-up cursor `ev:<last_seq at the discard>` SHALL read the `reset` without `history_truncated`, because nothing it had not seen was removed
+- **AND** a durable `write_failed` gap recorded under the previous root SHALL NOT appear in the new root's feed
 
 ### Requirement: Per-pass events SHALL be bounded
-A pass SHALL itemise at most `CHANGE_FEED_MAX_EVENTS_PER_PASS` events per scope, in the order moves, deletions, creations, modifications and path order within each, and SHALL record the remainder as one `gap` event with `gap_reason = 'pass_overflow'` and `gap_count` equal to the number not itemised.
+A pass SHALL itemise at most `CHANGE_FEED_MAX_EVENTS_PER_PASS` (default 2,000, bounds 100–50,000) events per scope, counted after suppression and excluding a consumed `write_failed` gap line, in the order moves, deletions, creations, modifications and path order within each, and SHALL record the remainder as one `gap` event with `gap_reason = 'pass_overflow'` and `gap_count` equal to the number not itemised.
 
 #### Scenario: Vault-wide rewrite
 - **WHEN** a pass changes 6,000 notes with the cap at 2,000

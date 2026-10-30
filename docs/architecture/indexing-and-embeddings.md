@@ -2546,4 +2546,9 @@ pass or tool transaction takes; after it come only rows nobody else can hold
 seq order commit order, and the tables carry no foreign key, so nothing after
 it waits on `users`. Retention (`change_feed.prune`) runs in the tick's
 `finally` after `cleanup_expired_tokens`, separately guarded, never inside a
-pass.
+pass. Its age cut is the **prefix** ending just before the oldest unexpired
+event — `occurred_at` is a transaction's start and not monotone in seq, so
+"every event older than the cutoff" could hit an unexpired one with a lower
+seq — which keeps `pruned_through_seq` a true watermark. A discard also
+drops the scope's gap rows, so a previous root's `write_failed` gap never
+reaches the new root's feed.

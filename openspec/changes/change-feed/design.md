@@ -36,8 +36,8 @@ What the index can know today, read from the code at 6bcc9d9:
   `move_note` updates the row's `file_path`, title, keyword head and link
   targets in its own transaction after the rename, so the next pass sees no
   move. `create_note`, `edit_note`, `set_frontmatter`, `delete_note`,
-  `write_file`, `delete_file`, `import_from_url` and the transfer upload
-  publish bytes and leave the row to the next pass.
+  `write_file`, `import_from_url` and the transfer upload
+  publish bytes (`delete_file` refuses every `.md` path) and leave the row to the next pass.
 - **Attribution exists at call time, not at index time.**
   `src.auth.session.actor_columns()` gives `(actor_kind, actor_label,
   actor_ref)` from `current_actor`, and `current_principal` gives
@@ -143,7 +143,7 @@ it needs its own table.
 
 ```
 note_events
-  id             bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY  -- surrogate; never rendered, never accepted
+  id             bigserial PRIMARY KEY  -- surrogate; never rendered, never accepted
   user_id        integer NULL            -- scope; NULL = single-user. NO foreign key (below)
   seq            bigint NOT NULL         -- per-scope sequence; the cursor
   occurred_at    timestamptz NOT NULL DEFAULT now()
@@ -161,9 +161,10 @@ note_events
   gap_count      integer      NULL
   reason         varchar(16)  NULL       -- removed|not_indexable|quarantined (D5); NULL otherwise
   CHECKs: kind and source enumerations; meta kinds have NULL path;
-          moved has non-NULL from_path; source='mcp' iff principal_kind IS NOT NULL
+          moved has non-NULL from_path; principal_kind and principal_ref both set or both NULL;
+          an index row has no actor, principal or tool (a tool row may lack a principal)
   UNIQUE (user_id, seq) NULLS NOT DISTINCT
-Indexes: (user_id, path, seq DESC); (user_id, from_path, seq DESC) WHERE from_path IS NOT NULL;
+Indexes: (user_id, path, seq); (user_id, from_path, seq) -- plain ascending, scanned backwards; not partial
          (occurred_at)
 
 note_event_scopes                         -- one row per scope that has ever had an event
@@ -173,7 +174,7 @@ note_event_scopes                         -- one row per scope that has ever had
   pruned_at          timestamptz NULL     -- occurred_at of the newest event removed
 
 note_event_gaps                           -- durable record of a failed pass append (D5)
-  id bigint identity PK, user_id integer NULL, gap_count integer NOT NULL, recorded_at timestamptz
+  id bigserial PK, user_id integer NULL, gap_count integer NOT NULL, recorded_at timestamptz
 ```
 
 **No foreign keys, on purpose.** Events must outlive their `notes_metadata`
@@ -216,7 +217,7 @@ inference. It is the same reason `usage_logs.actor_*` is denormalised
 | `create_note` | `created` (hash) | own short transaction after the confirmed publication |
 | `edit_note`, `set_frontmatter` | `modified` (hash) | same |
 | `write_file`, `import_from_url`, `PUT /transfer/upload` on a `.md` path | `created` if there was no incumbent, else `modified` (hash) | same; the upload is attributed to the principal that minted the link (the rule the write-bucket charge already applies at redemption), from `transfer_tokens.actor_*` |
-| `delete_note`, `delete_file` on `.md` | `deleted` | own short transaction after the confirmed delete |
+| `delete_note` | `deleted reason=removed` | own short transaction after the confirmed delete (`delete_file` refuses every `.md` path and records nothing) |
 | index pass | `created` / `modified` / `moved` / `deleted` for row changes it commits, unless suppressed | its final statement |
 
 **Rule: where a tool already writes the database for the mutation, the event
@@ -261,7 +262,7 @@ so there is nothing to suppress against.
 **Suppression (the pass):** after taking the feed lock (D4), the pass reads
 the latest event *at* each candidate path in one statement. An event is at a
 path when the path is its `path` or its `from_path`, served by the two
-`(user_id, path|from_path, seq DESC)` indexes; latest means highest `seq`.
+`(user_id, path|from_path, seq)` indexes (scanned backwards); latest means highest `seq`.
 It drops its own event when the latest event is `source='mcp'` and one of
 these holds:
 
@@ -746,3 +747,62 @@ adversarial pass judge them, not discover them:
 11. **The NUL transfer-upload scenario** is pinned through the route's own
     pieces (the streaming `CanonicalNoteHasher` and `record_tool_events` with
     the minting attribution) rather than an HTTP redemption.
+12. **A no-op `edit_note`** (a rewrite to identical bytes) records no event.
+13. **`CURRENT_EXTRACTION_VERSION` stays 4**: 033's backfill gives every row
+    a `content_changed_at`, so no re-derive is needed.
+14. **Overflow is counted after suppression**, and a consumed `write_failed`
+    gap line is outside `CHANGE_FEED_MAX_EVENTS_PER_PASS`.
+15. **An MCP row with no actor** renders `by agent via <tool>`.
+16. **`created` vs `modified` for `write_file` and the transfer upload** is
+    chosen from a pre-publish `lstat` (write_file) or the token's
+    `expected_fingerprint` (upload), so an overwrite minted without a
+    fingerprint can be labelled `created`. Both are content events, so
+    suppression and the reader's "this note changed" are unaffected.
+17. **A not-indexable `created` is suppressed against any source's** latest
+    `not_indexable` event, so it is reported once whoever reported it first.
+18. **`CHANGE_FEED_LOCK_TIMEOUT_MS`** (2,000; 100–30,000) bounds the file-only
+    tool appends as well as the pass's; the change-feed delta names it.
+19. **A discard also deletes the scope's gap rows**, and a caught-up cursor
+    (`ev:<last_seq at the discard>`) reads the `reset` without
+    `history_truncated`; only a cursor below that seq reads it (verifier).
+20. **NULL ordering columns** are excluded whenever any of the four listing
+    parameters is given, `order_by` alone included, so a first page and its
+    continuations agree (verifier).
+
+## Codex implementation review, round 1 (2026-10-30)
+
+Five findings; three fixed, two declined after triage.
+
+1. **Fixed** — age retention deleted by `max(seq)` of expired events, and
+   `occurred_at` is not monotone in seq, so an unexpired event with a lower
+   seq could go. The age cut is now the prefix ending just before the oldest
+   unexpired event; `pruned_through_seq` stays a prefix watermark.
+2. **Fixed** — `move_note` rewrote links after its metadata and event
+   transaction had failed; a rewrite of the moved note's own links changed
+   its hash, so the pass recorded `deleted` + `created` and the move was
+   lost. The rewrites now stop before any publication on that failure.
+3. **Fixed** — a provenance discard left the previous root's
+   `note_event_gaps` rows, which the new root's next append would consume
+   into a `write_failed` gap line. The discard now deletes them under the
+   feed lock.
+4. **Declined (L11)** — the cursor is not tamper-evident. By design the
+   cursor *is* the scope's plain seq: only a cursor above `last_seq` is
+   refused, and a lower one from elsewhere is a valid position in the
+   caller's own feed that returns the caller's own events after it. No
+   tenant's data crosses.
+5. **Declined (L12)** — the first event line may exceed a
+   1,000-character `MAX_READ_RESPONSE_CHARS` floor. The first event is always
+   admitted so the cursor advances; the overrun is bounded by the path cap
+   and its escaping.
+
+## Accepted limitations (continued)
+
+- L11: An `ev:` cursor is a plain per-scope seq, not a signed token. A lower
+  cursor taken elsewhere is simply an earlier position in the caller's own
+  feed; only one above `last_seq` is refused (Codex r1, finding 4).
+- L12: With `MAX_READ_RESPONSE_CHARS` near its 1,000-character floor, one
+  event line with a very long escaped path can exceed it: the first event is
+  always rendered so `next_since` advances (Codex r1, finding 5).
+- L13: A file-only tool's post-publication append waits for a pool
+  connection outside `lock_timeout` — the same exposure as `_log_usage`; the
+  tool's result is already decided and unaffected (verifier item 9).

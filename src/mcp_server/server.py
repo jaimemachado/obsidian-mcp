@@ -105,7 +105,7 @@ def _origin_patterns(origins) -> list[str]:
 #
 # The classification, pinned by `tests/test_issue_343_tool_metadata.py`
 # against the code rather than a list:
-#   read-only   = the sixteen tools that neither change vault bytes nor mint a
+#   read-only   = the seventeen tools that neither change vault bytes nor mint a
 #                 capability (idempotent, closed-world)
 #   destructive = the write-bucket set (`_tracked(write_class=True)`) minus
 #                 `create_note` (no-clobber, additive) plus `request_upload`
@@ -1311,8 +1311,9 @@ async def get_changes(
     (`YYYY-MM-DD`, or ISO 8601 with `Z`/`±HH:MM`). A date or datetime *starts*
     a feed and is approximate; `next_since` *continues* one without losing or
     repeating an event. Store `next_since` (it is in the header and the last
-    line) in your own notes and pass it next session. A cursor is valid only
-    for your own vault; one from elsewhere is refused (`invalid_argument`).
+    line) in your own notes and pass it next session. A cursor means
+    something only for your own vault; one above this vault's last event is
+    refused (`invalid_argument`).
 
     Each line: `- ev:<n> <UTC time> <kind> "<path>"` (a move shows
     `"<from>" -> "<to>"`; paths are JSON-quoted, so a newline in a name is

@@ -44,10 +44,11 @@ signal that just failed.
     row carries the caller's actor label and principal, written at call
     time. This covers `create_note`, `edit_note`, `set_frontmatter`,
     `move_note` (and the backlink sources it rewrites), `delete_note`, and
-    `write_file`, `delete_file` and `import_from_url` on a `.md` path, plus
+    `write_file` and `import_from_url` on a `.md` path, plus
     `PUT /transfer/upload` of a `.md` file. The upload is attributed to the
     principal that minted the link, reusing the rule the write-bucket charge
-    already applies at redemption. `move_note` writes its event inside its
+    already applies at redemption. `delete_file` refuses every `.md` path, so
+    it never records one. `move_note` writes its event inside its
     existing metadata transaction (all or nothing). Every other tool writes
     after its file-only publication, and if that write fails the next pass
     rediscovers the change unattributed. A tool event is appended only

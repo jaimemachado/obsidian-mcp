@@ -4,7 +4,7 @@
 `get_recent` and `list_notes` SHALL accept the optional parameters `since: str`, `until: str`, `order_by: str` (`"mtime"`, the default, or `"content_changed"`) and `cursor: str`.
 - `order_by` SHALL select both the ordering column and the column the bounds apply to: `modified_at` for `"mtime"`, `content_changed_at` for `"content_changed"`.
 - Ordering SHALL be that column descending, with `file_path` ascending as the tie-break.
-- `since` SHALL be inclusive and `until` exclusive. A row whose selected column is NULL SHALL be excluded whenever a bound or a cursor is given.
+- `since` SHALL be inclusive and `until` exclusive. A row whose selected column is NULL SHALL be excluded whenever any of `since`, `until`, `order_by` and `cursor` is given — `order_by` alone included — so that a first page and the pages its cursor continues select the same rows.
 - Any other `order_by` value SHALL be refused with `invalid_argument`.
 - `get_recent` SHALL label the time it shows `modified` or `changed` according to `order_by`.
 - The published descriptions of both tools SHALL state that notes whose content changed are found with `order_by="content_changed"` and `since`.

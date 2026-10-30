@@ -8,7 +8,7 @@
 
 - [x] 1.1 `src/models/db.py`: `NoteMetadata.content_changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), comment=_CONTENT_CHANGED_AT_MARKER)`, with a comment block covering D1 (stamped only on a hash change, `now()` for a change, mtime for a first-seen row, never moved by moves or re-upserts).
 - [x] 1.2 `src/models/db.py`: `NoteEvent` (`note_events`), `NoteEventScope` (`note_event_scopes`) and `NoteEventGap` (`note_event_gaps`), exactly as design D2.
-  - `note_events` has a surrogate identity `id`, a plain `user_id` with **no `ForeignKey`**, `seq`, `UNIQUE (user_id, seq)` with `postgresql_nulls_not_distinct=True`, `ix_note_events_user_path_seq` (`path`, `seq DESC`) and `ix_note_events_occurred_at`.
+  - `note_events` has a bigserial surrogate `id`, a plain `user_id` with **no `ForeignKey`**, `seq`, `UNIQUE (user_id, seq)` with `postgresql_nulls_not_distinct=True`, two plain ascending indexes `ix_note_events_user_path_seq` (`user_id`, `path`, `seq`) and `ix_note_events_user_from_path_seq` (`user_id`, `from_path`, `seq`, not partial), and `ix_note_events_occurred_at`.
   - `note_event_scopes` has `user_id` unique `NULLS NOT DISTINCT`, `last_seq`, `pruned_through_seq` and `pruned_at`.
   - `note_event_gaps` is as D2.
   - Each table carries a marker comment, and a comment block explains why there are no FKs (D2).
@@ -66,7 +66,7 @@
 - [x] 4.3 `move_note`:
   - Inside its existing metadata transaction, as the last statement before commit, call `append_events(..., bounded=False)` with `moved` (with the hash when the tool holds the bytes). A failure rolls the transaction back and takes the existing "DB update failed; reindex will reconcile" branch.
   - After the backlink rewrites, `record_tool_events` the `modified` events for each source it published. On `partial_completion`, record only what was published.
-- [x] 4.4 `delete_note`, `delete_file` (`.md`): `record_tool_events` with `deleted` after the confirmed delete, soft or permanent.
+- [x] 4.4 `delete_note`: `record_tool_events` with `deleted reason=removed` after the confirmed delete, soft or permanent. (`delete_file` refuses every `.md` path and records nothing.)
 - [x] 4.5 `PUT /transfer/upload` redemption of a `.md` path: record with the token row's `actor_kind` / `actor_label`, the minting principal (`transfer.minting_principal`), `user_id` of the token's owner, `tool = "transfer_upload"`, and `canonical_note_hash` of the stored bytes.
   - This reuses the minting-principal rule the write-bucket charge already applies at redemption (owner decision 4); do not add a second rule.
   - Do not go through `current_*`, which the public route does not set.
@@ -180,3 +180,6 @@
 - L8: Feed history (events, seq counters, watermarks) is durable and restored with backups, but a restore rolls `last_seq` back to the dump. A cursor taken after the dump is then above `last_seq` and is refused, and the agent restarts from a datetime `since`.
 - L9: A datetime `since` is approximate (`occurred_at` is a transaction's start time). Only an `ev:` cursor is exact.
 - L10: A `move_note` of a note that was never indexed and whose bytes the tool did not read may be followed by an unsuppressed `created` from the pass (no hash to match).
+- L11: An `ev:` cursor is a plain per-scope seq, not a signed token; a lower cursor from elsewhere is an earlier position in the caller's own feed, and only one above `last_seq` is refused.
+- L12: Near the 1,000-character `MAX_READ_RESPONSE_CHARS` floor, one event line with a very long escaped path can exceed the cap; the first event is always rendered so `next_since` advances.
+- L13: A file-only tool's post-publication append waits for a pool connection outside `lock_timeout`, the same exposure as `_log_usage`; the tool's result is unaffected.

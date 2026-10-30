@@ -406,7 +406,7 @@ update it in the same change.** What stays here is the short list:
   mount is not detected (L1) — see
   [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
 - **Every tool publishes a `title` and all four `ToolAnnotations` hints
-  explicitly** (#343). Sixteen read tools are read-only/idempotent/closed;
+  explicitly** (#343). Seventeen read tools are read-only/idempotent/closed;
   the destructive set is the write-bucket set minus `create_note` plus
   `request_upload` (its `overwrite=True` link overwrites on redemption);
   `import_from_url` alone is open-world. **Hints, not enforcement** — nothing

@@ -1405,7 +1405,10 @@ uncertain publication. `move_note` is the one tool that writes the database
 for its mutation, so its `moved` event is inside that metadata transaction,
 unbounded: a failure rolls the path update back and takes the existing "DB
 update failed; reindex will reconcile" branch, and the pass then pairs the
-move and records it `human/sync`. Every other tool appends in its own short
+move and records it `human/sync`. On that branch the link rewrites are
+**stopped before any publication** and every planned source is reported
+unrewritten: a rewrite of the moved note's own links would change its hash,
+and the pass would then record `deleted` + `created` instead of the move. Every other tool appends in its own short
 transaction (`record_tool_events`), bounded by the feed lock timeout, and
 swallows every failure: the returned text, the `BodyOutcome` and the usage
 classification are identical whether the event write succeeds, times out or
