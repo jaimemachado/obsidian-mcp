@@ -59,7 +59,7 @@ from src.services.embeddings import (
     chunk_note_bounded,
     clean_at_version,
     embed_note,
-    not_rechunked_sql,
+    legacy_vectors_sql,
     vectors_not_current_sql,
 )
 from src.services.fts import (
@@ -6102,7 +6102,7 @@ async def _observe_rechunk(session, user_id: int | None, log_suffix: str) -> Non
             await session.execute(
                 text(
                     f"SELECT count(*) FROM notes_metadata nm "
-                    f"WHERE {owner_clause} AND {not_rechunked_sql('nm')}"
+                    f"WHERE {owner_clause} AND {legacy_vectors_sql('nm')}"
                 ),
                 params,
             )

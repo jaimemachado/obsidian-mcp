@@ -106,7 +106,7 @@ async def legacy_chunked_notes(session, owner: "tuple[bool, int | None]") -> int
     """
     from sqlalchemy import text
 
-    from src.services.embeddings import CHUNKING_VERSION
+    from src.services.embeddings import legacy_vectors_sql
 
     present = (await session.execute(text(
         "SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('public.notes_metadata') "
@@ -116,12 +116,12 @@ async def legacy_chunked_notes(session, owner: "tuple[bool, int | None]") -> int
         return None
     scoped, user_id = owner
     where = "m.user_id IS NOT DISTINCT FROM CAST(:owner AS integer)" if scoped else "TRUE"
-    params = {"cv": int(CHUNKING_VERSION)}
+    params: dict = {}
     if scoped:
         params["owner"] = user_id
+    # The marker's own predicate (vectors of another generation), so the
+    # report and the tools' `index_transition:` line count the same notes.
     return int((await session.execute(text(
         "SELECT count(*) FROM notes_metadata m "
-        f"WHERE {where} "
-        "AND EXISTS (SELECT 1 FROM note_embeddings e WHERE e.note_id = m.id) "
-        "AND m.embedded_chunking_version IS DISTINCT FROM CAST(:cv AS smallint)"
+        f"WHERE {where} AND {legacy_vectors_sql('m')}"
     ), params)).scalar() or 0)

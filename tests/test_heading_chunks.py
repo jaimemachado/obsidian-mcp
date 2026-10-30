@@ -362,3 +362,12 @@ def test_every_chunk_ordinal_resolves_through_read_note_section_selector():
             parts, err = extract_section_parts(body, f"#{spec.section_ordinal}")
             assert err is None
             assert parts[0].lstrip("#").strip() == spec.heading_path[-1]
+
+
+def test_a_setext_heading_is_body_text():
+    """L6: only ATX headings are boundaries, as in section addressing."""
+    body = "Title\n=====\nbody\n"
+    specs, _ = chunks(body)
+    assert specs == [ChunkSpec(body, (), 0)]
+    _parts, err = extract_section_parts(body, "#1")
+    assert err is not None

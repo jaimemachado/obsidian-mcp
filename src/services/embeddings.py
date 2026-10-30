@@ -378,6 +378,29 @@ def vectors_not_current_sql(alias: str = "nm") -> str:
     )
 
 
+def legacy_vectors_sql(alias: str = "nm") -> str:
+    """The **marker / `/health`** predicate (#355, amended after the verifier):
+    the note holds vector rows **and** its chunking version is not the
+    current one. Narrower than the backlog's, on purpose: a note with no
+    vectors yet (newly created, or failing to embed) is not a generation mix,
+    so it must not raise `index_transition:`. A legacy note whose
+    certification a tag edit cleared still serves its old vectors and still
+    counts. The same definition as the harness's `legacy_chunked_notes`.
+    """
+    return (
+        f"(EXISTS (SELECT 1 FROM note_embeddings ne_v WHERE ne_v.note_id = {alias}.id) "
+        f"AND {not_rechunked_sql(alias)})"
+    )
+
+
+def legacy_vectors_expr():
+    from sqlalchemy import exists
+
+    return exists().where(NoteEmbedding.note_id == NoteMetadata.id).correlate(
+        NoteMetadata
+    ) & not_rechunked_expr()
+
+
 def not_rechunked_expr():
     from sqlalchemy import literal_column
 
@@ -1848,8 +1871,9 @@ def section_of(row, stale: bool) -> dict | None:
 
 
 async def rechunk_pending_count(session: AsyncSession, user_id: int | None) -> int:
-    """Notes in `user_id`'s owner scope (total mapping: None is `IS NULL`) not
-    yet re-chunked under the one predicate (#355, D4). Read by the vector tools
+    """Notes in `user_id`'s owner scope (total mapping: None is `IS NULL`) that
+    hold vectors of another chunking generation (`legacy_vectors_expr`, #355
+    D4 as amended). Read by the vector tools
     in the same `REPEATABLE READ, READ ONLY` transaction as their query."""
     from sqlalchemy import func
 
@@ -1861,7 +1885,7 @@ async def rechunk_pending_count(session: AsyncSession, user_id: int | None) -> i
     return int(
         (
             await session.execute(
-                select(func.count(NoteMetadata.id)).where(owner, not_rechunked_expr())
+                select(func.count(NoteMetadata.id)).where(owner, legacy_vectors_expr())
             )
         ).scalar()
         or 0
@@ -1908,12 +1932,28 @@ async def semantic_search(
     # One `REPEATABLE READ, READ ONLY` snapshot for the vector query and the
     # owner-scoped transition count the tool reads after it (#355, D4), so the
     # `index_transition:` line describes exactly the index this page was
-    # ranked against. It must be the transaction's first statement, so it is
-    # issued only on a session with no transaction open — which is what every
-    # production caller (the tool, the harness arm) hands in; a caller that
-    # already opened one owns its isolation.
+    # ranked against. It must be the transaction's first statement. Every
+    # production caller (the tool, the harness arm) hands in a fresh session;
+    # a caller that already opened a transaction must have opened it with
+    # exactly this isolation, which is verified rather than assumed — a
+    # silently weaker snapshot would let the count and the page disagree.
     in_tx = getattr(session, "in_transaction", None)
-    if not (callable(in_tx) and in_tx()):
+    if callable(in_tx) and in_tx():
+        isolation, read_only = (
+            await session.execute(
+                text(
+                    "SELECT current_setting('transaction_isolation'), "
+                    "current_setting('transaction_read_only')"
+                )
+            )
+        ).one()
+        if (isolation, read_only) != ("repeatable read", "on"):
+            raise RuntimeError(
+                "semantic_search needs a REPEATABLE READ, READ ONLY snapshot: "
+                "hand it a fresh session, or open the transaction with "
+                f"exactly that isolation (found {isolation}, read_only={read_only})"
+            )
+    else:
         await session.execute(
             text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         )

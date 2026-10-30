@@ -342,9 +342,15 @@ def downgrade() -> None:
     """Delete heading-era vectors, un-certify their notes, then drop only the
     marked constraints and columns (design D5)."""
     bind = op.get_bind()
+    # Bounded, like upgrade(): the generation-lock wait below fails after
+    # 10 s behind an in-flight pass instead of queueing indefinitely.
+    op.execute("SET LOCAL lock_timeout = '10s'")
+    op.execute("SET LOCAL statement_timeout = '60s'")
     _pin_search_path()
     for table in TABLES:
         if _oid(bind, f"public.{table}") is None:
+            op.execute("RESET lock_timeout")
+            op.execute("RESET statement_timeout")
             op.execute("RESET search_path")
             return
         _assert_is_the_qualified_table(bind, table)
@@ -384,4 +390,6 @@ def downgrade() -> None:
             continue
         op.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
 
+    op.execute("RESET lock_timeout")
+    op.execute("RESET statement_timeout")
     op.execute("RESET search_path")

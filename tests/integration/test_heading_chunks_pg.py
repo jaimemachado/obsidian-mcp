@@ -344,10 +344,14 @@ async def test_the_marker_is_owner_scoped(sessionmaker, world):
             "RETURNING id"
         ))).scalar()
         for i in range(3):
-            await session.execute(text(
+            # Legacy vectors (the marker counts notes that HAVE vectors of
+            # another generation), owned by the other tenant.
+            nid = (await session.execute(text(
                 "INSERT INTO notes_metadata (user_id, file_path, title, content_hash) "
-                "VALUES (:u, :p, 't', 'h')"
-            ), {"u": uid, "p": f"o{i}.md"})
+                "VALUES (:u, :p, 't', 'h') RETURNING id"
+            ), {"u": uid, "p": f"o{i}.md"})).scalar()
+            session.add(NoteEmbedding(note_id=nid, chunk_index=0, chunk_text="x",
+                                      embedding=vector_of(f"o{i}")))
         await session.commit()
     assert await pending(sessionmaker, None) == 0
     assert await pending(sessionmaker, uid) == 3
@@ -538,3 +542,120 @@ async def test_health_stays_ok_through_a_long_healthy_transition(sessionmaker, w
         assert indexer_health.snapshot()["status"] == "ok"
     assert await pending(sessionmaker) == 0
     assert indexer_health.snapshot()["rechunk"] == "complete"
+
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# The marker's predicate (amended): vectors of another generation only
+# ══════════════════════════════════════════════════════════════════════════
+
+
+async def test_a_new_note_without_vectors_raises_no_marker(sessionmaker, world):
+    """Created after deploy, not yet embedded: in the backlog (and pending on
+    the dashboard), but not a generation mix, so no `index_transition:`."""
+    root = world["root"]
+    write(root, "New.md", "# N\nfresh\n")
+    await indexer.index_vault(user_id=None)
+    assert await not_current(sessionmaker) == 1
+    assert await pending(sessionmaker) == 0
+    assert "index_transition" not in await tools.semantic_search_impl("fresh", limit=5)
+    await indexer.embed_vault(user_id=None)
+    assert indexer_health.snapshot()["rechunk"] == "complete"
+
+
+async def test_a_legacy_note_with_cleared_certification_still_counts(sessionmaker, world):
+    """A tag edit clears a legacy note's certification; its old vectors are
+    still served until it is re-embedded, so the marker still counts it."""
+    root = world["root"]
+    await seed_legacy(sessionmaker, root, {"L.md": "# L\nlegacy body\n"})
+    write(root, "L.md", "---\ntags: [new]\n---\n# L\nlegacy body\n")
+    await indexer.index_vault(user_id=None)
+    rows = await note_rows(sessionmaker)
+    assert rows["L.md"].embedded_content_hash is None
+    assert await pending(sessionmaker) == 1
+    out = await tools.semantic_search_impl("legacy", limit=5)
+    assert out.splitlines()[1].startswith("index_transition: 1 notes not yet re-chunked")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# V3 — NULL and {} tags are one prefix; V4 — empty/excluded converge free
+# ══════════════════════════════════════════════════════════════════════════
+
+
+async def test_null_and_empty_tags_compare_equal_in_the_upsert(sessionmaker, world):
+    root = world["root"]
+    write(root, "N.md", "# H\nno tags here\n")
+    write(root, "A.md", "# H\nno tags either\n")
+    await indexer.index_vault(user_id=None)
+    await indexer.embed_vault(user_id=None)
+    async with sessionmaker() as session:
+        await session.execute(text(
+            "UPDATE notes_metadata SET extraction_version = 3, tags = CASE "
+            "WHEN file_path = 'N.md' THEN NULL ELSE ARRAY['a']::varchar[] END"
+        ))
+        await session.commit()
+    await indexer.index_vault(user_id=None)
+    rows = await note_rows(sessionmaker)
+    assert rows["N.md"].embedded_content_hash == rows["N.md"].content_hash, "NULL -> [] kept"
+    assert rows["A.md"].embedded_content_hash is None, "['a'] -> [] cleared"
+
+
+async def test_excluded_and_empty_legacy_notes_converge_without_a_provider_call(
+    sessionmaker, world, monkeypatch
+):
+    root, provider = world["root"], world["provider"]
+    (root / "Private").mkdir()
+    monkeypatch.setattr(settings, "embedding_exclude_patterns", ["Private/*"], raising=False)
+    write(root, "Private/X.md", "# X\nsecret\n")
+    write(root, "Blank.md", "   \n\t\n")
+    await indexer.index_vault(user_id=None)
+    async with sessionmaker() as session:
+        # Pre-034 certified state: no chunking version, no digest.
+        await session.execute(text(
+            "UPDATE notes_metadata SET embedded_content_hash = content_hash, "
+            "embedded_chunking_version = NULL, embedded_input_digest = NULL"
+        ))
+        await session.commit()
+    assert await not_current(sessionmaker) == 2
+    provider.documents.clear()
+    await indexer.embed_vault(user_id=None)
+    assert provider.documents == []
+    rows = await note_rows(sessionmaker)
+    for p in ("Private/X.md", "Blank.md"):
+        assert rows[p].embedded_chunking_version == embeddings_service.CHUNKING_VERSION
+        assert rows[p].embedded_input_digest == embeddings_service.input_digest([])
+    assert await not_current(sessionmaker) == 0
+    await indexer.embed_vault(user_id=None)
+    assert provider.documents == []
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# V5 — the vector query really runs in REPEATABLE READ, READ ONLY
+# ══════════════════════════════════════════════════════════════════════════
+
+
+async def test_semantic_search_runs_in_its_snapshot_and_refuses_a_weaker_one(
+    sessionmaker, world, monkeypatch
+):
+    root = world["root"]
+    write(root, "S.md", "# S\nsnapshot body\n")
+    await indexer.index_vault(user_id=None)
+    await indexer.embed_vault(user_id=None)
+    seen = {}
+    real = embeddings_service.rechunk_pending_count
+
+    async def spy(session, uid):
+        seen["iso"] = (await session.execute(text(
+            "SELECT current_setting('transaction_isolation'), "
+            "current_setting('transaction_read_only')"
+        ))).one()
+        return await real(session, uid)
+
+    monkeypatch.setattr(tools, "rechunk_pending_count", spy)
+    await tools.semantic_search_impl("snapshot", limit=5)
+    assert tuple(seen["iso"]) == ("repeatable read", "on")
+
+    async with sessionmaker() as session:
+        await session.execute(text("SELECT 1"))  # a READ COMMITTED transaction
+        with pytest.raises(RuntimeError, match="REPEATABLE READ, READ ONLY"):
+            await embeddings_service.semantic_search(session, "snapshot", limit=5)

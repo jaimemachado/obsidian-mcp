@@ -744,6 +744,16 @@ def _preview_line(text: str, limit: int = 200) -> str:
     return escaped[:limit]
 
 
+def _header_scalar(value: str) -> str:
+    """A caller- or note-supplied string echoed inside a result header, as
+    one escaped line (#355, Codex impl r1 M1): the inside of one JSON string
+    literal (`change_feed.quote` — newlines, C0/C1, DEL, U+2028/U+2029 and
+    `"` escaped), without its outer quotes. So a multiline query cannot push
+    the `index_transition:` line off the line after the header, or forge one
+    above it. The argument caps already bound its length."""
+    return change_feed.quote(value)[1:-1]
+
+
 def _with_transition(lines: list[str], pending: int) -> list[str]:
     """`lines` with the `index_transition:` line directly after the header
     (the first line), or unchanged at zero (#355, D4)."""
@@ -770,7 +780,7 @@ def _stale_source_line(path: str) -> str:
     # emitted on both: "these neighbours were computed from…" is nonsense above
     # an empty list, and the empty list is where this line does the most work.
     return (
-        f"**`{path}` changed after it was embedded**, so this search ran "
+        f"**`{_header_scalar(path)}` changed after it was embedded**, so this search ran "
         "against the vector of its previous content and answers a superseded "
         "question. The next embed pass repairs this on its own."
     )
@@ -2899,13 +2909,13 @@ async def semantic_search_impl(
         )
     if not results:
         return "\n".join(_with_transition(
-            [f"No semantic results for '{query}' (embeddings may still be building)"],
+            [f"No semantic results for '{_header_scalar(query)}' (embeddings may still be building)"],
             pending,
         ))
     stale_count = sum(1 for r in results if r["stale"])
     truncated_count = sum(1 for r in results if r["embedding_truncated"])
     lines = [
-        f"Found {len(results)} semantic matches for '{query}' — "
+        f"Found {len(results)} semantic matches for '{_header_scalar(query)}' — "
         f"{stale_count} stale, {truncated_count} truncated:\n"
     ]
     for r in results:
@@ -4307,7 +4317,7 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
         # the vector searched with describes content the note no longer has.
         # A first draft put this line only above a non-empty list, which loses
         # it exactly where it explains the most.
-        empty = [f"No related notes for `{path}`"]
+        empty = [f"No related notes for `{_header_scalar(path)}`"]
         if source_stale:
             empty.append(_stale_source_line(path))
         return "\n".join(_with_transition(empty, pending))
@@ -4353,7 +4363,7 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
     stale_count = sum(1 for r in ranked if r["stale"])
     truncated_count = sum(1 for r in ranked if r["embedding_truncated"])
     lines = [
-        f"Top {len(ranked)} related notes for `{path}` — "
+        f"Top {len(ranked)} related notes for `{_header_scalar(path)}` — "
         f"{stale_count} stale, {truncated_count} truncated:\n"
     ]
     if source_stale:

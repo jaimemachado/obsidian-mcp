@@ -47,3 +47,18 @@ def test_034_mirrors_both_check_predicates():
 def test_034_chains_from_033():
     m = _load_034()
     assert (m.revision, m.down_revision) == ("034", "033")
+
+
+def test_034_bounds_both_directions():
+    """`lock_timeout` / `statement_timeout` are set and reset in upgrade()
+    and in downgrade(), whose generation-lock wait they bound."""
+    import inspect
+
+    m = _load_034()
+    for fn in (m.upgrade, m.downgrade):
+        src = inspect.getsource(fn)
+        for setting in ("lock_timeout", "statement_timeout"):
+            assert f"SET LOCAL {setting}" in src, (fn.__name__, setting)
+            assert f"RESET {setting}" in src, (fn.__name__, setting)
+    down = inspect.getsource(m.downgrade)
+    assert down.index("SET LOCAL lock_timeout") < down.index("pg_advisory_xact_lock")

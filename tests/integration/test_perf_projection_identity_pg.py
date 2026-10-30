@@ -788,6 +788,10 @@ async def _semantic_pair(sessionmaker, embed_as, vec, **kw):
     token = timing.begin()
     try:
         async with sessionmaker() as session:
+            # #355: semantic_search requires its REPEATABLE READ, READ ONLY
+            # snapshot; this test opens the transaction, so it opens it so.
+            await session.execute(text(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
             await session.execute(text("SET LOCAL enable_indexscan = off"))
             new = await semantic_search(session, "q", **kw)
         new_fb = timing.current()["exact_fallback"]
