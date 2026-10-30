@@ -5,7 +5,7 @@ Refs #350. Read `proposal.md`, `design.md` (D1–D11) and `specs/` before starti
 - [x] 1.1 Write `alembic/versions/032_note_tasks.py` (`revision="032"`, `down_revision="031"`), following 022's and 031's docstring and reconcile-or-refuse shape. Create `note_tasks` exactly as design D1 and the `schema-integrity` delta define it (CHECKs on `state` and `priority`, `UNIQUE(note_id, line)`, `ix_note_tasks_note`, `ix_note_tasks_state_due`, table-comment marker `"task rows derived per note (032_note_tasks)"`). Add `notes_metadata.tasks_truncated` and `notes_metadata.tasks_failed` (both `BOOLEAN NOT NULL DEFAULT false`) with the column-comment markers `"task-extraction truncation marker (032_note_tasks)"` and `"task-derivation failure marker (032_note_tasks)"`. The table has `tags varchar(128)[]` and `tags_cut boolean NOT NULL DEFAULT false`. Set `lock_timeout`/`statement_timeout` and `RESET` them. Write no data. Downgrade drops only marked objects.
 - [x] 1.2 In `src/models/db.py`, add `class NoteTask`, `NoteMetadata.tasks_truncated` and `NoteMetadata.tasks_failed` mirroring 032 byte for byte (marker constants `_NOTE_TASKS_TABLE_MARKER`, `_TASKS_TRUNCATED_COLUMN_MARKER`, each with a "byte identical to …" comment like the existing ones). Add no ORM relationship that would load tasks with a note.
 - [x] 1.3 Classify `note_tasks` as derived: add it to `pg_dump --exclude-table-data` in `Makefile` (`db-backup`) and in `deploy/kubernetes/components/db-backup/configmap.yaml`, and to the derived list in `tests/test_backup_derived_tables.py`.
-- [ ] 1.4 Run `make test-schema` (fresh upgrade, plus a stamp-back to 031 and re-upgrade), which must be clean. Extend the schema gate's impostor checks if it has per-migration cases (see how 031 is covered). Confirm `test_nonsuperuser_migrations_pg.py` passes with 032.
+- [x] 1.4 Run `make test-schema` (fresh upgrade, plus a stamp-back to 031 and re-upgrade), which must be clean. Extend the schema gate's impostor checks if it has per-migration cases (see how 031 is covered). Confirm `test_nonsuperuser_migrations_pg.py` passes with 032.
 
 ## 2. Extractor (`src/services/tasks.py`) and unit tests
 
@@ -50,9 +50,9 @@ Refs #350. Read `proposal.md`, `design.md` (D1–D11) and `specs/` before starti
 
 ## 6. Gates
 
-- [ ] 6.1 `pytest tests` (offline subset) green. `make test-integration` green, and the report says it ran. Do not run it concurrently with `make test-schema`.
-- [ ] 6.2 `make test-schema` clean, and `make audit` clean.
-- [ ] 6.3 `openspec validate list-tasks --strict`.
+- [x] 6.1 `pytest tests` (offline subset) green. `make test-integration` green, and the report says it ran. Do not run it concurrently with `make test-schema`.
+- [x] 6.2 `make test-schema` clean, and `make audit` clean.
+- [x] 6.3 `openspec validate list-tasks --strict`.
 - [ ] 6.4 `openspec-verifier` subagent against this change, iterated to zero blocking gaps.
 - [ ] 6.5 Adversarial Codex (mandatory: a chunking/indexing-path change and a new read surface that agents act on). Frame "wrong" as a silently missing or phantom task, a task under the wrong path or tenant, a forged row, an unbounded response, or a pass that a task value can fail. Two rounds by default, with triage per the workflow.
 - [ ] 6.6 After deploy: `make db-check` (or `docker exec obsidian-mcp alembic check`) clean. End-to-end against the live server: call `list_tasks()`, `list_tasks(status="done", folder=…)`, `list_tasks(due_by=<today>)` and follow one `next`, plus `get_vault_guide`. Record which tools were called and that the not-yet-scanned count reached 0.
