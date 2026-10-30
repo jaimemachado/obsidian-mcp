@@ -221,7 +221,7 @@ Choices the spec left open, one line each:
 - An abbreviation step that would change nothing (no tags, no preview, a value ≤ 45 rendered) is skipped and adds no label; the omitted form adds `title_cut`/`path_cut` if the cut step had not already.
 - The renderer reserves the header (computed over the whole page, which bounds any prefix's), the keyword-only footer when degraded, and the cap footer's 75 always; abbreviation labels follow the server fields, joined by ` — `.
 - The ≤ 340 structure bound is measured on the **cut** form (labels `tags omitted`, `preview omitted`, `title_cut`, `path_cut`, `abbreviated`; 332 measured), the form the 985 floor sum adds 45 + 45 to; the omitted form trades ≥ 80 rendered characters of value for 31 of labels, so it is always shorter.
-- The cap footer is `Response cap reached: N more result(s) omitted; narrow the query.` (≤ 69).
+- The cap footer is `Response cap reached: N more result(s) omitted; narrow the query.` (64 at most).
 - `_between_arms_hook` (module attribute, `None` in production) is the integration suite's seam between step 4 and step 5.
 - `required_options` on a harness factory is checked by `run_generation` before the generation is reserved, which is how `make_arm_alt` without `hybrid_alt_k` exits 64 (the factory also raises `UsageError` on its own); a non-integer or out-of-range `hybrid_k`/`hybrid_alt_k` is a `UsageError` from the factory.
 - A keyword-only replay answer raises `KeywordOnlyAnswer` (a `RuntimeError`), so the manifest records `failed` with that type.
