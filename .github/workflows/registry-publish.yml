@@ -59,6 +59,8 @@ env:
 
 jobs:
   publish:
+    # The registry listing belongs to upstream. A fork must not publish one.
+    if: github.repository == 'maxkuminov/obsidian-mcp'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
