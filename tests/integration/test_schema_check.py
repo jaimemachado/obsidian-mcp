@@ -60,7 +60,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "032"
+HEAD_REVISION = "033"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -6925,7 +6925,7 @@ def insert_task_032(url, note_id, line, **extra):
 
 def test_032_creates_the_table_and_both_columns_on_a_fresh_db():
     with throwaway_db("schema_032_fresh") as url:
-        assert alembic_version(url) == HEAD_REVISION == "032"
+        assert alembic_version(url) == HEAD_REVISION
         assert fetchval(
             url, "SELECT obj_description('public.note_tasks'::regclass, 'pg_class')"
         ) == NOTE_TASKS_MARKER_032
@@ -6973,7 +6973,7 @@ def test_032_chains_from_031():
     config = Config()
     config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_current_head() == HEAD_REVISION == "032"
+    assert script.get_current_head() == HEAD_REVISION
     assert script.get_revision("032").down_revision == "031"
 
 
@@ -7147,3 +7147,196 @@ def test_downgrade_032_leaves_units_it_did_not_create():
         assert fetchval(url, "SELECT to_regclass('public.note_tasks')") is not None
         assert column_state_029(url, "notes_metadata", "tasks_failed") is not None
         assert column_state_029(url, "notes_metadata", "tasks_truncated") is None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 033 — notes_metadata.content_changed_at and the change-feed tables (#351)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# One backfilled NOT NULL column and three durable tables with no foreign key.
+# Alembic compares neither CHECK predicates nor NULLS NOT DISTINCT nor the
+# absence of an FK, so all three are asserted here through `pg_constraint`.
+
+CONTENT_CHANGED_MARKER_033 = "content-change stamp (033_content_changed_at)"
+FEED_TABLES_033 = {
+    "note_events": "change-feed events (033_content_changed_at)",
+    "note_event_scopes": "change-feed scope counters (033_content_changed_at)",
+    "note_event_gaps": "change-feed write gaps (033_content_changed_at)",
+}
+
+
+def constraints_033(url, table):
+    return {
+        r["conname"]: (r["contype"], r["def"])
+        for r in fetch(
+            url,
+            "SELECT conname, contype::text AS contype, pg_get_constraintdef(oid) AS def "
+            "FROM pg_constraint WHERE conrelid = $1::regclass",
+            f"public.{table}",
+        )
+    }
+
+
+def refuse_033(url, *, must_mention):
+    _harness.run_alembic(url, "stamp", "032", dimensions=DIM)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "033 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    assert alembic_version(url) == "032", "nothing should have been recorded"
+    return combined
+
+
+def test_033_chains_from_032():
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config()
+    config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    assert script.get_current_head() == HEAD_REVISION == "033"
+    assert script.get_revision("033").down_revision == "032"
+
+
+def test_033_creates_the_column_and_three_marked_tables_without_fks():
+    with throwaway_db("schema_033_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+        assert column_state_029(url, "notes_metadata", "content_changed_at") == (
+            "timestamp with time zone", True, "now()", CONTENT_CHANGED_MARKER_033,
+        )
+        for table, marker in FEED_TABLES_033.items():
+            assert fetchval(
+                url, f"SELECT obj_description('public.{table}'::regclass, 'pg_class')"
+            ) == marker
+            kinds = {kind for kind, _ in constraints_033(url, table).values()}
+            assert "f" not in kinds, f"{table} carries a foreign key"
+        events = constraints_033(url, "note_events")
+        assert events["uq_note_events_user_id_seq"] == (
+            "u", "UNIQUE NULLS NOT DISTINCT (user_id, seq)",
+        )
+        assert constraints_033(url, "note_event_scopes")["uq_note_event_scopes_user_id"] == (
+            "u", "UNIQUE NULLS NOT DISTINCT (user_id)",
+        )
+        checks = {name for name, (kind, _) in events.items() if kind == "c"}
+        assert checks == {
+            "ck_note_events_kind", "ck_note_events_source", "ck_note_events_reason",
+            "ck_note_events_gap_reason", "ck_note_events_principal_kind",
+            "ck_note_events_path", "ck_note_events_from_path", "ck_note_events_principal",
+        }
+        assert "'created'" in events["ck_note_events_kind"][1]
+        assert "'reset'" in events["ck_note_events_kind"][1]
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_033_backfills_from_modified_at_then_indexed_at():
+    with throwaway_db("schema_033_backfill", revision="032") as url:
+        insert_stat_note(url, 1, "a.md", (1, 2, 3, 4))
+        insert_stat_note(url, 2, "b.md", (1, 2, 3, 4))
+        sql(url, "UPDATE notes_metadata SET modified_at = '2026-01-02T03:04:05Z', "
+                 "indexed_at = '2026-05-05T00:00:00Z' WHERE id = 1")
+        sql(url, "UPDATE notes_metadata SET modified_at = NULL, "
+                 "indexed_at = '2026-06-06T00:00:00Z' WHERE id = 2")
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        rows = {
+            r["id"]: r["c"]
+            for r in fetch(url, "SELECT id, content_changed_at AS c FROM notes_metadata")
+        }
+        assert rows[1] == datetime.datetime(2026, 1, 2, 3, 4, 5, tzinfo=datetime.timezone.utc)
+        assert rows[2] == datetime.datetime(2026, 6, 6, tzinfo=datetime.timezone.utc)
+
+
+def test_033_constraints_hold():
+    with throwaway_db("schema_033_enforced") as url:
+        ins = ("INSERT INTO note_events (user_id, seq, kind, path, from_path, source, "
+               "principal_kind, principal_ref, actor_kind) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)")
+        sql(url, ins, None, 1, "created", "a.md", None, "index", None, None, None)
+        with pytest.raises(asyncpg.UniqueViolationError):
+            sql(url, ins, None, 1, "created", "b.md", None, "index", None, None, None)
+        sql(url, ins, 7, 1, "created", "a.md", None, "index", None, None, None)
+        for bad in (
+            (None, 2, "renamed", "a.md", None, "index", None, None, None),
+            (None, 3, "gap", "a.md", None, "index", None, None, None),
+            (None, 4, "created", None, None, "index", None, None, None),
+            (None, 5, "moved", "b.md", None, "index", None, None, None),
+            (None, 6, "created", "a.md", "x.md", "index", None, None, None),
+            (None, 7, "created", "a.md", None, "index", "api_key", "1", None),
+            (None, 8, "created", "a.md", None, "mcp", "api_key", None, None),
+            (None, 9, "created", "a.md", None, "index", None, None, "api_key"),
+        ):
+            with pytest.raises(asyncpg.CheckViolationError):
+                sql(url, ins, *bad)
+        sql(url, ins, None, 10, "moved", "b.md", "a.md", "mcp", "oauth", "g", "oauth")
+        # No FK: an event for a user id that does not exist is accepted.
+        sql(url, ins, 424242, 1, "deleted", "x.md", None, "index", None, None, None)
+        sql(url, "INSERT INTO note_event_scopes (user_id, last_seq) VALUES (NULL, 1)")
+        with pytest.raises(asyncpg.UniqueViolationError):
+            sql(url, "INSERT INTO note_event_scopes (user_id, last_seq) VALUES (NULL, 2)")
+
+
+def test_033_stamp_back_rerun_keeps_rows():
+    with throwaway_db("schema_033_rerun") as url:
+        sql(url, "INSERT INTO note_events (user_id, seq, kind, source) VALUES (NULL, 1, 'reset', 'index')")
+        _harness.run_alembic(url, "stamp", "032", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(url, "SELECT count(*) FROM note_events") == 1
+        assert_alembic_check_clean(url, DIM)
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        ("unmarked_events", ["COMMENT ON TABLE note_events IS NULL"],
+         "note_events already exists but it does not carry 033's comment marker"),
+        ("fk_on_events",
+         ["ALTER TABLE note_events ADD CONSTRAINT fk_x FOREIGN KEY (user_id) REFERENCES users(id)"],
+         "FOREIGN KEY 'fk_x'"),
+        ("impostor_check",
+         ["ALTER TABLE note_events DROP CONSTRAINT ck_note_events_kind",
+          "ALTER TABLE note_events ADD CONSTRAINT ck_note_events_kind CHECK (true)"],
+         "note_events already exists but its constraints differ"),
+        ("nulls_distinct_unique",
+         ["ALTER TABLE note_events DROP CONSTRAINT uq_note_events_user_id_seq",
+          "ALTER TABLE note_events ADD CONSTRAINT uq_note_events_user_id_seq UNIQUE (user_id, seq)"],
+         "note_events already exists but its constraints differ"),
+        ("extra_index", ["CREATE INDEX squat ON note_event_gaps (gap_count)"],
+         "note_event_gaps already exists but its indexes differ"),
+        ("wrong_column", ["ALTER TABLE note_event_scopes ALTER COLUMN last_seq TYPE integer"],
+         "note_event_scopes already exists but its columns differ"),
+        ("column_unmarked", ["COMMENT ON COLUMN notes_metadata.content_changed_at IS NULL"],
+         "notes_metadata.content_changed_at does not carry 033's comment marker"),
+        ("column_nullable",
+         ["ALTER TABLE notes_metadata ALTER COLUMN content_changed_at DROP NOT NULL"],
+         "notes_metadata.content_changed_at is nullable"),
+    ],
+)
+def test_033_refuses_a_unit_of_another_shape(label, ddl, fragment):
+    with throwaway_db(f"schema_033_foreign_{label}") as url:
+        for statement in ddl:
+            sql(url, statement)
+        refuse_033(url, must_mention=[fragment, "Nothing has been changed"])
+
+
+def test_downgrade_033_drops_the_marked_units_and_upgrade_rebuilds_them():
+    with throwaway_db("schema_033_downgrade") as url:
+        insert_stat_note(url, 1, "a.md", (1, 2, 3, 4))
+        _harness.run_alembic(url, "downgrade", "032", dimensions=DIM)
+        assert alembic_version(url) == "032"
+        for table in FEED_TABLES_033:
+            assert fetchval(url, f"SELECT to_regclass('public.{table}')") is None
+        assert column_state_029(url, "notes_metadata", "content_changed_at") is None
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(url, "SELECT count(*) FROM notes_metadata WHERE content_changed_at IS NOT NULL") == 1
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_downgrade_033_leaves_units_it_did_not_create():
+    with throwaway_db("schema_033_downgrade_foreign") as url:
+        sql(url, "COMMENT ON TABLE note_event_gaps IS 'somebody else'")
+        result = _harness.run_alembic(url, "downgrade", "032", dimensions=DIM)
+        combined = result.stdout + result.stderr
+        assert "033 downgrade: leaving note_event_gaps in place" in combined
+        assert fetchval(url, "SELECT to_regclass('public.note_event_gaps')") is not None
+        assert fetchval(url, "SELECT to_regclass('public.note_events')") is None

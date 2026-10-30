@@ -348,6 +348,12 @@ _BODY_EXCERPT_COLUMN_MARKER = "keyword excerpt (031_keyword_head_and_excerpt)"
 _NOTE_TASKS_TABLE_MARKER = "task rows derived per note (032_note_tasks)"
 _TASKS_TRUNCATED_COLUMN_MARKER = "task-extraction truncation marker (032_note_tasks)"
 _TASKS_FAILED_COLUMN_MARKER = "task-derivation failure marker (032_note_tasks)"
+# Migration 033 (#351, the change feed). Byte identical to the migration's
+# literals, so `alembic check` compares them.
+_CONTENT_CHANGED_AT_COLUMN_MARKER = "content-change stamp (033_content_changed_at)"
+_NOTE_EVENTS_TABLE_MARKER = "change-feed events (033_content_changed_at)"
+_NOTE_EVENT_SCOPES_TABLE_MARKER = "change-feed scope counters (033_content_changed_at)"
+_NOTE_EVENT_GAPS_TABLE_MARKER = "change-feed write gaps (033_content_changed_at)"
 # The all-or-none CHECK over those four columns. The predicate is the
 # migration's `STAT_PREDICATE`, byte for byte.
 _NOTE_STAT_CHECK_NAME = "ck_notes_metadata_stat_all_or_none"
@@ -592,6 +598,24 @@ class NoteMetadata(Base):
     indexed_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    # When the row's *content* last changed (#351, migration 033, design D1).
+    # Written in exactly one place: the index pass's batch upsert, in the same
+    # statement that overwrites `content_hash` — `now()` (the pass
+    # transaction's start) when the stored hash differs from the new one, the
+    # existing value otherwise, and the file's mtime for a row inserted at a
+    # path that had none. So a `touch`, a stat refresh, a stale-marker or
+    # re-derive re-upsert with the same hash, either move path, the keyword
+    # vector writers and the link backfill never move it. Not mtime on a
+    # change, deliberately: a sync client that preserves mtime would otherwise
+    # stamp a real edit in the past. The migration backfilled
+    # `COALESCE(modified_at, indexed_at)`; the server default exists only so a
+    # direct insert (tests, the move-less fallback) is never NULL.
+    content_changed_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        comment=_CONTENT_CHANGED_AT_COLUMN_MARKER,
+    )
 
     # `note_embeddings.note_id` is `ON DELETE CASCADE` (migration 001), so the
     # chunks of a deleted note go with it without the ORM loading one row per
@@ -738,6 +762,164 @@ class NoteTask(Base):
         Index("ix_note_tasks_note", "note_id"),
         Index("ix_note_tasks_state_due", "state", "due"),
         {"comment": _NOTE_TASKS_TABLE_MARKER},
+    )
+
+
+# ── The change feed (#351, migration 033) ────────────────────────────────
+#
+# **No foreign key on any of the three tables, on purpose (design D2).** An
+# event must outlive its `notes_metadata` row (a deletion is recorded *after*
+# the row is gone), so none to that table; and none to `users` either: the
+# INSERT's FK check takes `FOR KEY SHARE` on the `users` row *after* the index
+# pass already holds `notes_metadata` row locks, while a permanent user
+# deletion takes the `users` row first and then cascades into exactly those
+# rows — the documented deadlock (`ProvenanceLockUnavailable`). Cleanup is
+# explicit instead: `delete_user`'s permanent branch purges the scope under the
+# feed lock, and retention deletes rows of user ids that no longer exist.
+
+NOTE_EVENT_KINDS = ("created", "modified", "moved", "deleted", "gap", "reset")
+NOTE_EVENT_META_KINDS = ("gap", "reset")
+NOTE_EVENT_SOURCES = ("mcp", "index")
+NOTE_EVENT_REASONS = ("removed", "not_indexable", "quarantined")
+NOTE_EVENT_GAP_REASONS = ("pass_overflow", "write_failed")
+NOTE_EVENT_PRINCIPAL_KINDS = ("api_key", "oauth")
+
+
+def _sql_in(column: str, values) -> str:
+    return f"{column} IN (" + ", ".join(f"'{v}'" for v in values) + ")"
+
+
+#: The CHECK predicates, `{name: predicate}`, mirrored by migration 033 (which
+#: pins its own copy) and asserted through `pg_constraint` by the schema gate.
+NOTE_EVENT_CHECKS = {
+    "ck_note_events_kind": _sql_in("kind", NOTE_EVENT_KINDS),
+    "ck_note_events_source": _sql_in("source", NOTE_EVENT_SOURCES),
+    "ck_note_events_reason": _sql_in("reason", NOTE_EVENT_REASONS),
+    "ck_note_events_gap_reason": _sql_in("gap_reason", NOTE_EVENT_GAP_REASONS),
+    "ck_note_events_principal_kind": _sql_in(
+        "principal_kind", NOTE_EVENT_PRINCIPAL_KINDS
+    ),
+    # A meta line names no note; a note line always names one.
+    "ck_note_events_path": (
+        "(" + _sql_in("kind", NOTE_EVENT_META_KINDS) + " AND path IS NULL) OR ("
+        "kind NOT IN ('gap', 'reset') AND path IS NOT NULL)"
+    ),
+    # Only a move has a source path, and a move always has one.
+    "ck_note_events_from_path": (
+        "(kind = 'moved' AND from_path IS NOT NULL) OR "
+        "(kind <> 'moved' AND from_path IS NULL)"
+    ),
+    # A principal is a pair, and only a tool event carries an actor.
+    "ck_note_events_principal": (
+        "(principal_kind IS NULL) = (principal_ref IS NULL) AND "
+        "(source = 'mcp' OR (principal_kind IS NULL AND actor_kind IS NULL "
+        "AND actor_label IS NULL AND tool IS NULL))"
+    ),
+}
+
+
+class NoteEvent(Base):
+    """One change-feed line (#351, design D2).
+
+    `seq` is the per-scope sequence, assigned only by
+    `src.services.change_feed.append_events` under the scope's advisory lock
+    held to commit, so a reader's `ev:<seq>` cursor is exact and reveals
+    nothing about another tenant. `id` is a surrogate: never rendered, never
+    accepted. `principal_ref` is compared for `by="me"` and never rendered;
+    `actor_ref` is deliberately not stored (a column nobody reads is a column
+    somebody later renders).
+    """
+
+    __tablename__ = "note_events"
+    _TABLE_MARKER: ClassVar[str] = _NOTE_EVENTS_TABLE_MARKER
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    occurred_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    from_path: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source: Mapped[str] = mapped_column(String(8), nullable=False)
+    tool: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    actor_kind: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    actor_label: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    principal_kind: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    principal_ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    gap_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    gap_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "seq", name="uq_note_events_user_id_seq",
+            postgresql_nulls_not_distinct=True,
+        ),
+        *(CheckConstraint(predicate, name=name)
+          for name, predicate in NOTE_EVENT_CHECKS.items()),
+        # Suppression and `get_changes`: the latest event *at* a path is the
+        # highest seq whose `path` or `from_path` is it. A b-tree scans
+        # backwards for `ORDER BY seq DESC`, so neither index is declared DESC.
+        Index("ix_note_events_user_path_seq", "user_id", "path", "seq"),
+        Index("ix_note_events_user_from_path_seq", "user_id", "from_path", "seq"),
+        Index("ix_note_events_occurred_at", "occurred_at"),
+        {"comment": _NOTE_EVENTS_TABLE_MARKER},
+    )
+
+
+class NoteEventScope(Base):
+    """One row per scope that has ever had an event (#351, design D4/D9).
+
+    `last_seq` never decreases, so a seq is never reused even after retention
+    or a discard removed the event that held it. `pruned_through_seq` /
+    `pruned_at` are the retention watermark `get_changes` turns into
+    `history_truncated`; they live here rather than in `indexer_state`, which
+    backups dump schema-only, because they must be restored with the events.
+    """
+
+    __tablename__ = "note_event_scopes"
+    _TABLE_MARKER: ClassVar[str] = _NOTE_EVENT_SCOPES_TABLE_MARKER
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    pruned_through_seq: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("0")
+    )
+    pruned_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", name="uq_note_event_scopes_user_id",
+            postgresql_nulls_not_distinct=True,
+        ),
+        {"comment": _NOTE_EVENT_SCOPES_TABLE_MARKER},
+    )
+
+
+class NoteEventGap(Base):
+    """A pass append that failed (#351, design D5): `gap_count` events that
+    are not in `note_events`. Committed with the pass; the scope's next
+    successful append consumes every row into one `gap write_failed` line."""
+
+    __tablename__ = "note_event_gaps"
+    _TABLE_MARKER: ClassVar[str] = _NOTE_EVENT_GAPS_TABLE_MARKER
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    gap_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    recorded_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_note_event_gaps_user_id", "user_id"),
+        {"comment": _NOTE_EVENT_GAPS_TABLE_MARKER},
     )
 
 
