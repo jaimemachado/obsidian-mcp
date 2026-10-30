@@ -256,4 +256,3 @@ The response SHALL begin with one header line that always carries the count show
 
 - **WHEN** no task matches
 - **THEN** the response SHALL be the header with zero shown and no cursor, and SHALL NOT be a refusal
-
