@@ -447,3 +447,13 @@ def test_the_primer_names_the_feed_neutrally():
 def test_server_instructions_are_unchanged_by_the_feed():
     from src.mcp_server import server
     assert "get_changes" not in server.SERVER_INSTRUCTIONS
+
+
+def test_the_listing_descriptions_name_the_content_change_call():
+    from src.mcp_server.server import mcp
+
+    tools_by_name = {t.name: t for t in mcp._tool_manager.list_tools()}
+    for name in ("get_recent", "list_notes"):
+        description = tools_by_name[name].description
+        assert 'order_by="content_changed"' in description, name
+        assert "`since`" in description, name

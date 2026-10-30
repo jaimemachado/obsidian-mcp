@@ -202,7 +202,7 @@ async def test_the_stamp_moves_only_on_a_hash_change(vault, sessionmaker):
         fh.write(b"SECOND\n")
     os.utime(note, ns=(st.st_atime_ns, st.st_mtime_ns))
     await indexer.index_vault(user_id=None, full_hash=True)
-    assert await stamp(sessionmaker, "a.md") >= changed
+    assert await stamp(sessionmaker, "a.md") > changed
 
     before = await stamp(sessionmaker, "a.md")
     note.rename(vault / "b.md")  # an external, id-preserving move
@@ -339,7 +339,10 @@ async def test_a_failed_move_event_rolls_back_and_the_pass_records_the_move(
     vault, sessionmaker, monkeypatch,
 ):
     await baseline(vault, sessionmaker)
-    (vault / "A.md").write_text("moving\n")
+    # A self-link: with rewrite_links=True the moved note itself is a rewrite
+    # source, and rewriting it would change its hash and break the pairing.
+    body = "moving, see [[A]]\n"
+    (vault / "A.md").write_text(body)
     await index_once()
     real = change_feed.append_events
 
@@ -349,8 +352,10 @@ async def test_a_failed_move_event_rolls_back_and_the_pass_records_the_move(
         return await real(session, uid, events, **kw)
 
     monkeypatch.setattr(change_feed, "append_events", failing)
-    out = await tools.move_note_impl("A.md", "B.md")
+    out = await tools.move_note_impl("A.md", "B.md", rewrite_links=True)
     assert "DB update failed" in out, out
+    assert "link rewrites were stopped" in out, out
+    assert (vault / "B.md").read_text() == body, "no rewrite after a failed metadata update"
     monkeypatch.setattr(change_feed, "append_events", real)
     async with sessionmaker() as session:
         assert (await session.execute(text(
@@ -414,12 +419,28 @@ async def test_a_failing_event_insert_changes_nothing_the_caller_sees(
     async def broken(*_a, **_k):
         raise RuntimeError("no feed today")
 
+    logged = []
+
+    async def record_usage(tool, params, duration_ms, response_size):
+        logged.append((tool, dict(params), response_size))
+        return True
+
+    monkeypatch.setattr(tools, "_log_usage", record_usage)
     expected = await tools.create_note_impl("ok.md", "body\n")
     real = change_feed.append_events
     monkeypatch.setattr(change_feed, "append_events", broken)
     got = await tools.create_note_impl("ok2.md", "body\n")
     monkeypatch.setattr(change_feed, "append_events", real)
     assert got == expected.replace("ok.md", "ok2.md")
+    # The usage rows are the same success: no error marker, same shape.
+    assert [t for t, _, _ in logged] == ["create_note", "create_note"]
+    first, second = (p for _, p, _ in logged)
+    for params in (first, second):
+        assert "error" not in params and "outcome" not in params, params
+    first.pop("path"), second.pop("path")
+    first.pop("concurrency", None), second.pop("concurrency", None)
+    assert first == second
+    assert (logged[0][2], logged[1][2]) == (len(expected), len(got))
     await index_once()
     events = await note_events(sessionmaker)
     assert [(e.path, e.source) for e in events] == [("ok.md", "mcp"), ("ok2.md", "index")]
@@ -493,11 +514,19 @@ async def test_a_cursor_above_last_seq_is_refused(vault, sessionmaker):
 async def test_a_lock_timeout_leaves_a_durable_gap(vault, sessionmaker, monkeypatch):
     await baseline(vault, sessionmaker)
     monkeypatch.setattr(settings, "change_feed_lock_timeout_ms", 100, raising=False)
+    from src.services import indexer_health
+
+    indexer_health.reset()
+    before = indexer_health.snapshot()
     holder = sessionmaker()
     await change_feed.lock_scope(holder, None)
     (vault / "late.md").write_text("late\n")
     result = await indexer.index_vault(user_id=None)  # commits despite the lock
     assert result[1] == 1
+    indexer.record_index_outcome(None, True, result)
+    after = indexer_health.snapshot()
+    assert after["status"] == before["status"] == "ok"
+    assert after.get("failing_scopes", 0) == before.get("failing_scopes", 0) == 0
     await holder.rollback()
     await holder.close()
     async with sessionmaker() as session:
@@ -888,3 +917,137 @@ async def test_an_invalid_utf8_tool_write_whose_event_failed_is_rediscovered(
         ("deleted", "A.md", "not_indexable", "index"),
         ("created", "B.md", "not_indexable", "index"),
     ], events
+
+
+# ── fix round (Codex implementation review r1, verifier) ──────────────────────
+
+
+async def test_age_retention_prunes_only_the_expired_prefix(vault, sessionmaker, monkeypatch):
+    """`occurred_at` is not monotone in seq: an unexpired seq 1 below an
+    expired seq 2 must survive, and so must everything after it."""
+    await make_users(sessionmaker, 7)
+    await append(sessionmaker, 7, [Event("modified", path=f"p{i}.md") for i in range(3)], KEY_A)
+    async with sessionmaker() as session:
+        await session.execute(text(
+            "UPDATE note_events SET occurred_at = now() - interval '200 days' "
+            "WHERE user_id = 7 AND seq = 2"))
+        await session.commit()
+    monkeypatch.setattr(settings, "change_feed_retention_days", 90, raising=False)
+    assert await change_feed.prune(session_factory=sessionmaker) == 0
+    assert [r.seq for r in await feed(sessionmaker, 7)] == [1, 2, 3]
+    async with sessionmaker() as session:
+        assert (await session.execute(text(
+            "SELECT pruned_through_seq FROM note_event_scopes WHERE user_id = 7"
+        ))).scalar() == 0
+
+
+async def test_a_discard_drops_the_previous_roots_gap_rows(vault, sessionmaker):
+    await make_users(sessionmaker, 7)
+    await append(sessionmaker, 7, [Event("modified", path="old.md")], KEY_A)
+    async with sessionmaker() as session:
+        await change_feed.record_gap(session, 7, 4)  # a failed pass under root A
+        await session.commit()
+    async with sessionmaker() as session:
+        await session.execute(text("UPDATE users SET vault_path = '/vaults/B' WHERE id = 7"))
+        await change_feed.discard_scope(session, 7)
+        await session.commit()
+    await change_feed.record_tool_events(
+        [Event("created", path="new.md")], root="/vaults/B",
+        session_factory=sessionmaker, user_id=7, attribution=KEY_A)
+    rows = await feed(sessionmaker, 7)
+    assert [(r.kind, r.path) for r in rows] == [("reset", None), ("created", "new.md")]
+    async with sessionmaker() as session:
+        assert (await session.execute(text(
+            "SELECT count(*) FROM note_event_gaps WHERE user_id = 7"))).scalar() == 0
+
+
+async def test_an_append_after_a_committed_deletion_writes_nothing(vault, sessionmaker):
+    """The second order of the deletion/pass interleave: the deletion commits
+    first, then a pass-shaped append for the same user takes the lock."""
+    await make_users(sessionmaker, 7)
+    await append(sessionmaker, 7, [Event("modified", path="a.md")], KEY_A)
+    async with sessionmaker() as session:
+        await session.execute(text("DELETE FROM users WHERE id = 7"))
+        await change_feed.purge_scope(session, 7)
+        await session.commit()
+    async with sessionmaker() as session:
+        n = await change_feed.append_events(
+            session, 7, [Event("modified", path="a.md")], source="index", suppress=True)
+        await session.commit()
+    assert n == 0
+    async with sessionmaker() as session:
+        for table in FEED_TABLES:
+            assert (await session.execute(text(
+                f"SELECT count(*) FROM {table} WHERE user_id = 7"))).scalar() == 0
+
+
+async def test_a_re_derive_keeps_the_stamp_and_writes_no_events(vault, sessionmaker, monkeypatch):
+    from src.services import vault as vault_service
+
+    root = vault / "tenant7"
+    root.mkdir()
+    (root / "r.md").write_text("re-derive me\n")
+    async with sessionmaker() as session:
+        await session.execute(text(
+            "INSERT INTO users (id, username, password_hash, vault_path, is_active) "
+            "VALUES (7, 'user7', 'x', :v, true)"), {"v": str(root)})
+        await session.commit()
+        await vault_service.warm_user_vault_cache(session, user_id=7)
+    try:
+        await indexer.index_vault(user_id=7)
+        async with sessionmaker() as session:
+            first = (await session.execute(text(
+                "SELECT content_changed_at FROM notes_metadata WHERE user_id = 7"))).scalar_one()
+            # Forget the recorded provenance: the next pass re-derives the
+            # scope, re-upserting every row with an unchanged hash.
+            await session.execute(text(
+                "UPDATE users SET indexed_vault_assignment = NULL, indexed_vault_realpath = NULL "
+                "WHERE id = 7"))
+            await session.commit()
+        count = len(await feed(sessionmaker, 7))
+        result = await indexer.index_vault(user_id=7)
+        assert result.rederive is not None, "the pass must have been a re-derive"
+        async with sessionmaker() as session:
+            assert (await session.execute(text(
+                "SELECT content_changed_at FROM notes_metadata WHERE user_id = 7"
+            ))).scalar_one() == first
+        assert len(await feed(sessionmaker, 7)) == count
+    finally:
+        vault_service.clear_user_vault_cache(user_id=7)
+
+
+async def test_a_multi_user_tool_event_is_bound_to_its_callers_root(
+    vault, sessionmaker, monkeypatch,
+):
+    """End to end in multi-user mode: two users, a real `create_note`, the
+    event lands in the caller's scope through `_vault_root` and the binding."""
+    from src.auth.session import current_vault_root
+    from src.services import vault as vault_service, vault_overlap
+
+    roots = {}
+    async with sessionmaker() as session:
+        for uid in (7, 9):
+            roots[uid] = vault / f"mu{uid}"
+            roots[uid].mkdir()
+            await session.execute(text(
+                "INSERT INTO users (id, username, password_hash, vault_path, is_active) "
+                "VALUES (:i, :u, 'x', :v, true)"),
+                {"i": uid, "u": f"user{uid}", "v": str(roots[uid])})
+        await session.commit()
+        for uid in (7, 9):
+            await vault_service.warm_user_vault_cache(session, user_id=uid)
+    monkeypatch.setattr(settings, "multi_user_mode", True, raising=False)
+    vault_overlap.publish_synthetic_snapshot()
+    tokens = [(current_user_id, current_user_id.set(7)),
+              (current_vault_root, current_vault_root.set((7, roots[7])))]
+    try:
+        out = await tools.create_note_impl("mine.md", "hello\n")
+        assert "Created" in out, out
+    finally:
+        for var, token in reversed(tokens):
+            var.reset(token)
+        vault_service.clear_user_vault_cache()
+    seven = await feed(sessionmaker, 7)
+    assert [(r.kind, r.path, r.source, r.principal_ref) for r in seven] == [
+        ("created", "mine.md", "mcp", "12")]
+    assert await feed(sessionmaker, 9) == [] and await feed(sessionmaker, None) == []

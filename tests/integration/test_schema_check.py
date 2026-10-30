@@ -7329,6 +7329,18 @@ def test_downgrade_033_drops_the_marked_units_and_upgrade_rebuilds_them():
         _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
         assert alembic_version(url) == HEAD_REVISION
         assert fetchval(url, "SELECT count(*) FROM notes_metadata WHERE content_changed_at IS NOT NULL") == 1
+        # The round trip rebuilds the same shape: both NULLS NOT DISTINCT
+        # uniques, every CHECK, no foreign key, every marker.
+        events = constraints_033(url, "note_events")
+        assert events["uq_note_events_user_id_seq"] == (
+            "u", "UNIQUE NULLS NOT DISTINCT (user_id, seq)",
+        )
+        assert sum(1 for kind, _ in events.values() if kind == "c") == 8
+        for table, marker in FEED_TABLES_033.items():
+            assert "f" not in {k for k, _ in constraints_033(url, table).values()}
+            assert fetchval(
+                url, f"SELECT obj_description('public.{table}'::regclass, 'pg_class')"
+            ) == marker
         assert_alembic_check_clean(url, DIM)
 
 
