@@ -230,8 +230,8 @@ async def hybrid_search(
 
     # ── 7. Keyword snippets for the page's keyword rows, capped ─────────────
     cap = settings.keyword_snippet_rows
+    started = time.monotonic()
     if cap > 0:
-        started = time.monotonic()
         snippet_rows = [k_by_path[r.path] for r in page if r.path in k_by_path][:cap]
         if snippet_rows:
             await search.keyword_snippets(session, snippet_rows, k_arm)
@@ -240,7 +240,9 @@ async def hybrid_search(
                 row.snippet = kd.get("snippet")
                 row.head = kd.get("head")
                 row.matched_in = kd.get("matched_in") or None
-        timing.add_ms("snippet_ms", time.monotonic() - started)
+    # Recorded on every call, as 0-ish when the cap is off (#354 D7): the key
+    # is part of every hybrid usage row.
+    timing.add_ms("snippet_ms", time.monotonic() - started)
     timing.add_ms("db_ms", time.monotonic() - db_start)
 
     overlap = len(k_by_path.keys() & s_by_path.keys())

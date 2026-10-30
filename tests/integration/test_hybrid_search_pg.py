@@ -194,6 +194,19 @@ async def test_the_folder_filter_applies_to_both_arms(maker, corpus):
 
 async def test_tags_and_frontmatter_apply_to_both_arms(maker, corpus):
     u7 = corpus["u7"]
+    # Unfiltered, these two notes are in BOTH arms; the filters must remove
+    # them from both, not from one.
+    unfiltered = {r.path: r for r in (await _hybrid(maker, folder="Projects/", user_id=u7)).rows}
+    for path in ("Projects/zx81-runbook.md", "Projects/zx81-also.md"):
+        assert unfiltered[path].keyword_rank is not None, path
+        assert unfiltered[path].semantic_rank is not None, path
+    for filters in (dict(tags=["keep"]), dict(frontmatter={"status": "keep"})):
+        keyword, semantic = await _arm_orders(maker, folder="Projects/", user_id=u7, **filters)
+        res = await _hybrid(maker, folder="Projects/", user_id=u7, **filters)
+        for path in ("Projects/zx81-runbook.md", "Projects/zx81-also.md"):
+            assert path not in keyword and path not in semantic, (filters, path)
+            assert path not in [r.path for r in res.rows], (filters, path)
+        assert res.keyword_rows == len(keyword) and res.semantic_rows == len(semantic)
     tagged = await _hybrid(maker, folder="Projects/", tags=["keep"], user_id=u7)
     assert {r.path for r in tagged.rows} == {"Projects/both.md", "Projects/paraphrase.md"}
     both = next(r for r in tagged.rows if r.path == "Projects/both.md")

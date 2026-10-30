@@ -76,6 +76,8 @@ class _Session:
         self.answers = {k: list(v) for k, v in answers.items()}
         self.log: list[tuple[str, str]] = []
         self.fail_on: str | None = None
+        self.honour_limit = False
+        self.limits: list[tuple[str, str, int | None]] = []
 
     async def execute(self, clause, *_a, **_k):
         sql = str(clause)
@@ -86,7 +88,12 @@ class _Session:
         if kind == "set":
             return _Result()
         queue = self.answers.get(kind) or []
-        return _Result(queue.pop(0) if queue else [])
+        rows = queue.pop(0) if queue else []
+        limit = getattr(clause, "_limit", None)
+        self.limits.append((kind, sql, limit))
+        if self.honour_limit and isinstance(limit, int):
+            rows = rows[:limit]
+        return _Result(rows)
 
     async def __aenter__(self):
         return self
@@ -235,13 +242,20 @@ def test_a_consensus_note_beyond_both_arm_depths_is_not_a_candidate(monkeypatch)
     B.md's semantic-only 1/61 ≈ 0.0164 over the full rankings; RRF is over
     each arm's top 50, so it is the documented omission (L3)."""
     monkeypatch.setattr(settings, "keyword_snippet_rows", 0, raising=False)
-    keyword = [kw_row(100 + i, f"k{i:02d}.md") for i in range(50)]
+    # Both arms' full rankings hold A.md at rank 51; the session honours each
+    # statement's LIMIT, as the database would, so only the arm depth (the
+    # LIMIT the arms bind) keeps A.md out.
+    keyword = [kw_row(100 + i, f"k{i:02d}.md") for i in range(50)] + [kw_row(999, "A.md")]
     semantic = [sem_row(1, "B.md", distance=0.0)] + [
-        sem_row(200 + i, f"s{i:02d}.md", distance=0.01 * (i + 1)) for i in range(49)]
+        sem_row(200 + i, f"s{i:02d}.md", distance=0.01 * (i + 1)) for i in range(49)
+    ] + [sem_row(999, "A.md", distance=0.9)]
     session = _Session(ranked=[keyword], semantic=[semantic])
+    session.honour_limit = True
     result = _search(session, limit=50)
     paths = [r.path for r in result.rows]
     assert "B.md" in paths and "A.md" not in paths
+    limits = [lim for kind, _, lim in session.limits if kind in ("ranked", "semantic")]
+    assert limits == [hybrid.HYBRID_ARM_DEPTH, hybrid.HYBRID_ARM_DEPTH] == [50, 50]
     text, _ = _render("q", result)
     assert "arm_depth: keyword 50/50, semantic 50/50 chunks" in text
     assert 2 / 111 > 1 / 61  # the omission is real, not an arithmetic accident
@@ -286,19 +300,42 @@ def test_an_embedding_failure_degrades_to_the_keyword_arm(monkeypatch, caplog, e
     assert "SECRET-QUERY-ECHO" not in text
 
 
+ZERO_TOKENS = (
+    "rrf_k: 60", "arm_depth: keyword 0/50, semantic 0/50 chunks",
+    "semantic: 0 notes, keyword: 0 notes (all 0, any 0), in both: 0",
+    "stale: 0, truncated: 0", "without excerpt: 0", "shown: 0",
+)
+
+
 def test_degraded_and_empty_says_keyword_only(monkeypatch):
+    monkeypatch.setattr(settings, "keyword_snippet_rows", 20, raising=False)
+
     async def _fail(_text):
         raise RuntimeError("down")
 
     monkeypatch.setattr(embeddings, "get_embedding", _fail)
     result = _search(_Session())
     text, paths = _render("nothing", result)
-    assert text.splitlines()[0] == (
+    line = text.splitlines()[0]
+    assert line.startswith(
         'No hybrid results for "nothing" — arms: keyword-only '
-        "(semantic unavailable: provider_error)")
+        "(semantic unavailable: provider_error) — ")
+    for token in ZERO_TOKENS:
+        assert token in line, token
+    assert text.splitlines()[1] == tools.HYBRID_KEYWORD_ONLY_FOOTER
     assert paths == []
-    both, _ = _render("nothing", HybridResult())
-    assert both == 'No hybrid results for "nothing" — arms: both'
+    # Both arms ran and found nothing: the same tokens, at zero.
+    async def _embed(_text):
+        return [1.0, 0.0, 0.0]
+
+    monkeypatch.setattr(embeddings, "get_embedding", _embed)
+    both_result = _search(_Session())
+    assert both_result.arms == "both"
+    both, _ = _render("a" * 100, both_result)
+    assert both.startswith('No hybrid results for "' + "a" * 64 + '" — query_cut — arms: both — ')
+    for token in ZERO_TOKENS:
+        assert token in both, token
+    assert "\n" not in both
 
 
 def test_provider_down_returns_the_keyword_arm_marked(monkeypatch):
@@ -322,9 +359,10 @@ def test_provider_down_returns_the_keyword_arm_marked(monkeypatch):
     assert params["arms"] == "keyword_only"
     assert params["semantic_unavailable"] == "provider_error"
     assert params["result_count"] == 3 and params["result_paths"] == ["a.md", "b.md", "c.md"]
-    for key in ("embed_ms", "db_ms", "exact_fallback", "fallback", "any_rows",
+    for key in ("embed_ms", "db_ms", "exact_fallback", "fallback", "any_rows", "snippet_ms",
                 "keyword_rows", "semantic_rows", "overlap", "rrf_k"):
         assert key in params, key
+    assert settings.keyword_snippet_rows == 0, "snippet_ms is recorded with the cap off"
 
 
 def test_the_query_cap_is_pre_body(monkeypatch):
@@ -437,13 +475,25 @@ def test_provenance_of_a_both_arm_row():
 
 
 def test_header_tokens_are_present_at_zero():
+    """Zero results: every provenance token is still stated, at zero."""
+    text, paths = _render("q", _result([], keyword_rows=0, keyword_all=0))
+    assert paths == [] and len(text.splitlines()) == 1
+    assert text.startswith('No hybrid results for "q" — arms: both — ')
+    for token in ZERO_TOKENS:
+        assert token in text, token
+    assert "query_cut" not in text and "snippets:" not in text
+    # And with a result whose counts are zero.
     text, _ = _render("q", _result([_row()], keyword_rows=1, keyword_all=1))
     header = text.splitlines()[0]
     for token in ("arms: both", "rrf_k: 60", "arm_depth: keyword 1/50, semantic 0/50 chunks",
                   "semantic: 0 notes, keyword: 1 notes (all 1, any 0), in both: 0",
                   "stale: 0, truncated: 0", "without excerpt: 0", "shown: 1"):
         assert token in header, token
-    assert "query_cut" not in header and "snippets:" not in header
+
+
+def test_snippets_off_is_stated(monkeypatch):
+    text, _ = _render("q", _result([_row()], snippet_cap=0))
+    assert " — snippets: off:" in text.splitlines()[0]
 
 
 @pytest.mark.parametrize("ranks, fields, expected", [

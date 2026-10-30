@@ -1458,6 +1458,10 @@ class SemanticArm:
     #: returned, before the per-note dedupe — `hybrid_search`'s `arm_depth`.
     chunk_rows: int
     exact_fallback: bool
+    #: `time.monotonic()` right after the last statement, before the Python
+    #: re-sort and dedupe — where `semantic_search`'s `db_ms` has always
+    #: stopped (#354 keeps its telemetry unchanged).
+    fetched_at: float = 0.0
 
 
 async def semantic_arm_rows(
@@ -1549,6 +1553,7 @@ async def semantic_arm_rows(
         rows = (await session.execute(stmt)).fetchall()
         exact_fallback = True
     chunk_rows = len(rows)
+    fetched_at = time.monotonic()
 
     # Re-sort by the full-precision distance before dedupe/truncate:
     # `relaxed_order` does not promise a globally sorted stream, the scan was
@@ -1631,7 +1636,8 @@ async def semantic_arm_rows(
             for row in deduped
         )
     ]
-    return SemanticArm(rows=results, chunk_rows=chunk_rows, exact_fallback=exact_fallback)
+    return SemanticArm(rows=results, chunk_rows=chunk_rows, exact_fallback=exact_fallback,
+                       fetched_at=fetched_at)
 
 
 async def semantic_search(
@@ -1695,7 +1701,7 @@ async def semantic_search(
         frontmatter=frontmatter, user_id=user_id,
     )
     timing.record("exact_fallback", arm.exact_fallback)
-    timing.add_ms("db_ms", time.monotonic() - db_start)
+    timing.add_ms("db_ms", arm.fetched_at - db_start)
 
     results = arm.rows[:limit]
     # Result telemetry, recorded after the dedupe so the count and the paths

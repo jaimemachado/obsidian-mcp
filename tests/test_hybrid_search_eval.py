@@ -6,6 +6,7 @@ service; the integration suite replays it against PostgreSQL."""
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -194,6 +195,47 @@ def test_the_arm_passes_text_owner_filters_depth_and_k(monkeypatch):
     alt = hybrid_arm.make_arm_alt(ArmContext(_Session, Corpus({}), {"hybrid_alt_k": "7"}))
     asyncio.run(alt(_query(), 20))
     assert calls[0][1]["rrf_k"] == 7
+
+
+def _stub_replay_db(monkeypatch):
+    import scripts.search_eval.db as db
+
+    class _Engine:
+        async def dispose(self):
+            pass
+
+    async def fake_open(url):
+        return _Engine(), _Session
+
+    async def fake_membership(session):
+        return {"1": {"A.md": dict(ALL), "B.md": dict(ALL)}}
+
+    monkeypatch.setattr(db, "open_readonly", fake_open)
+    monkeypatch.setattr(db, "fetch_membership", fake_membership)
+    monkeypatch.setenv("SEARCH_EVAL_DATABASE_URL", "postgresql+asyncpg://u:p@127.0.0.1:1/x")
+
+
+def test_an_ab_of_k_in_one_report(tmp_path, monkeypatch):
+    """Both factories in one generation, `hybrid_k=60` and `hybrid_alt_k=20`:
+    one report scores both arms on the same qrels, snapshot and selection, and
+    each arm ran with its own k."""
+    calls = _stub_service(monkeypatch)
+    _stub_replay_db(monkeypatch)
+    d = tmp_path / "d"
+    write_data(d, [{"text": "q", "relevant": ["A.md"]}],
+               {"1": {"A.md": dict(ALL), "B.md": dict(ALL)}})
+    arms = ["scripts.search_eval_arms.hybrid:make_arm",
+            "scripts.search_eval_arms.hybrid:make_arm_alt"]
+    out = run(d, arms, arm_options={"hybrid_k": "60", "hybrid_alt_k": "20"})
+    assert out.exit_code == EXIT_OK, out.manifest
+    assert sorted(kw["rrf_k"] for _, kw in calls) == [20, 60]
+    metas = [json.loads((d / "runs" / out.manifest["files"][a]["path"]).read_text())["meta"]
+             for a in arms]
+    for key in ("qrels_sha256", "snapshot_sha256", "selected_qids_hash", "generation"):
+        assert metas[0][key] == metas[1][key] == out.manifest.get(key, metas[0][key]), key
+    assert all(m["membership"] == "keyword_or_semantic" for m in metas)
+    res = score(d, arms, baseline=arms[0], min_queries=1)
+    assert [a["arm"] for a in res.report["arms"]] == arms
 
 
 def test_a_keyword_only_answer_fails_the_run(tmp_path, monkeypatch):

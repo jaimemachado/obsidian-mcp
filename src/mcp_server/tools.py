@@ -3062,11 +3062,13 @@ def _hybrid_abbreviated_row(r, k: int, room: int) -> str:
     return line()
 
 
-def _hybrid_header(q_lit: str, query_cut: bool, result, rows, found: int) -> str:
+def _hybrid_provenance_tokens(query_cut: bool, result, rows) -> list[str]:
+    """The provenance tokens every hybrid response carries, the zero-result
+    line included (each stated even when zero): `query_cut` when cut, `arms`,
+    `rrf_k`, `arm_depth`, the per-arm counts, stale/truncated, `without
+    excerpt`, `shown`, and the snippet-cap token."""
     keyword_rows = [r for r in rows if r.keyword_rank is not None]
-    parts = [f"Found {found} hybrid results for {q_lit}"]
-    if query_cut:
-        parts.append("query_cut")
+    parts = ["query_cut"] if query_cut else []
     parts += [
         _hybrid_arms_token(result),
         f"rrf_k: {result.rrf_k}",
@@ -3083,7 +3085,14 @@ def _hybrid_header(q_lit: str, query_cut: bool, result, rows, found: int) -> str
         parts.append("snippets: off")
     elif len(keyword_rows) > result.snippet_cap:
         parts.append(f"snippets: first {result.snippet_cap}")
-    return _HYBRID_SEP.join(parts) + ":"
+    return parts
+
+
+def _hybrid_header(q_lit: str, query_cut: bool, result, rows, found: int) -> str:
+    return _HYBRID_SEP.join([
+        f"Found {found} hybrid results for {q_lit}",
+        *_hybrid_provenance_tokens(query_cut, result, rows),
+    ]) + ":"
 
 
 def render_hybrid_results(query: str, result, *, budget: int | None = None
@@ -3100,10 +3109,12 @@ def render_hybrid_results(query: str, result, *, budget: int | None = None
     q_lit, query_cut = _hybrid_query_echo(query)
     keyword_only = result.arms != hybrid_service.ARMS_BOTH
     if not result.rows:
-        line = f"No hybrid results for {q_lit}"
-        if query_cut:
-            line += _HYBRID_SEP + "query_cut"
-        line += _HYBRID_SEP + _hybrid_arms_token(result)
+        # The same provenance tokens as a non-empty header, all at zero where
+        # nothing was found: an absent token is not evidence of absence.
+        line = _HYBRID_SEP.join([
+            f"No hybrid results for {q_lit}",
+            *_hybrid_provenance_tokens(query_cut, result, []),
+        ])
         if keyword_only:
             line += "\n" + HYBRID_KEYWORD_ONLY_FOOTER
         return line, []
