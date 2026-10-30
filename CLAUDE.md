@@ -106,6 +106,7 @@ specific to this MCP server.
 | Schema drift | `make db-check` (`docker exec obsidian-mcp alembic check`) |
 | Schema gate (any change carrying a migration) | `make test-schema` |
 | Integration suite (real Postgres) | `make test-integration` |
+| Search-quality fixture | `make search-eval` |
 | Search eval (any search-path change) | `make search-eval-snapshot` then `make search-eval SEARCH_EVAL_DATA=.search-eval SEARCH_EVAL_DATABASE_URL=<restored BACKUP_FULL=1 copy>` — attach `report.json` only if `attachable: true` (`USER_ID=` export on multi-user), incumbent as `BASELINE`; `CORPUS_LOSS` invalidates |
 | Deploy | merge to `main` → CI → `image` workflow → Flux (homelab k3s); `make deploy` for a compose host |
 
