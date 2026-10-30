@@ -479,7 +479,7 @@ baseline corpus.
 grows) changes with every commit, so a committed golden file cannot
 contain it. `scoring.stable_projection(report)` is documented in the
 module. It returns the report minus the keys in `UNSTABLE_KEYS =
-{"commit_sha", "generated_at"}`. The fixture test compares that
+{"commit_sha", "generated_at", "generation"}`. The fixture test compares that
 projection with `expected-report.json`, which is itself a projection. It
 separately asserts that `commit_sha` matches `^[0-9a-f]{40}$` and equals
 `git rev-parse HEAD`, run in the repo.
@@ -672,6 +672,60 @@ provenance)` as its first line. The fixture test asserts both values (D7).
   uncertainty is, and `INSUFFICIENT_DATA` stops a 12-query verdict from
   looking like a result.
 
+- **L13. `SEARCH_EVAL_DATA` is not checked against `SEARCH_EVAL_DIR`.**
+  `SEARCH_EVAL_DATA` may point outside `SEARCH_EVAL_DIR`; the recipe does
+  not verify it is git-ignored. Both are the same directory by convention,
+  and the 0700/0600 modes still apply.
+- **L14. Escaped truncated queries.** A truncated query containing a NUL or
+  a lone surrogate is not caught by `is_truncated`, because #310's escaping
+  can grow the stored string past 201 characters. Implausible input; not
+  handled.
+
+## Decisions taken during implementation
+
+- `DAYS ?= 90` is a default for the `search-eval-export` target only. A
+  global default would change `make concurrency-report`, which passes
+  `--days` whenever `DAYS` is set.
+- `make` reports a failing recipe as exit 2, so "exits 64" for a Make
+  target is the recipe's code (make prints `Error 64`). The distinct codes
+  0/1/2/64 come from `python -m scripts.search_eval score` (and the other
+  subcommands) directly.
+- D5 classifier additions: a token starting with `#` or a backtick followed
+  by a word character, and a letter next to a digit (`v2`, `sha256`), also
+  count. A digit between two word characters counts, so any token with
+  three or more digits makes a short query `identifier`: `2026`,
+  `taxes 2026` and `top 100 books` are identifiers. The qid is sensitive to
+  tag order (the tags list is hashed as logged).
+- Per-query deltas are reported as a sorted list of numbers without qids,
+  because a qid is a hash of the owner and the query text, and a short
+  query could be confirmed by guessing.
+- A truncated `folder` filter is excluded as `folder_truncated`, for the
+  same reason a truncated query is: it cannot be replayed faithfully.
+- Snapshot entries carry `stale_vector` (information only; the report
+  counts `stale_vector_judged`). It never affects membership.
+- `run --fixture-corpus` copies the fixture corpus into the data directory
+  as `corpus-snapshot.json`, so `score` reads one snapshot path in both
+  modes.
+- Real-data `make search-eval` passes `$(SEARCH_EVAL_DATA)/manual.jsonl` to
+  `mine` when that file exists.
+- An imported factory is database-backed unless it sets
+  `requires_db = False`; a non-database factory without a membership
+  defaults to `metadata`.
+- `mining.passes_usable_filter` is the seam the integration test uses to
+  compare the Python usable filter with `analysable_sql`.
+- Helper modules beyond the proposal's list: `_io` (canonical JSON, hashes,
+  owner-only atomic writes), `corpus` (membership), `db` (the read-only
+  engine and the membership SQL), `commands` (file-level steps) and
+  `runner` (the generation).
+- Task 6.3's optional asyncpg execution of the export SQL was skipped: it
+  is a convenience, psql's `:'var'` syntax would have to be substituted,
+  and the real Make target already runs in the integration gate.
+- The report's leak check compares the generation, arm labels and option
+  keys and values by exact equality only (they are stamps and operator
+  words); every other string also gets the substring test. A failed
+  manifest records the exception type and the arm label only (D4); the
+  message goes to stderr.
+
 ## Migration Plan
 
 No migration, no setting, no dependency and no deploy step. The change
@@ -761,4 +815,15 @@ against.
 
 The next Codex pass on this change verifies these fixes and does not
 sweep for new surfaces.
+
+## Codex spec review, round 3 (verification only)
+
+Round 3 verified the round-2 fixes and swept for nothing new. It confirmed
+the generation/manifest atomicity fix and the provenance/attachability fix.
+It found one wording regression: the hybrid membership was named
+`keyword_or_semantic` and defined as OR, while the required scenario treats
+loss of only the semantic constituent as corpus loss. It was fixed in
+0c09439 by renaming the membership `keyword_and_semantic`, defined as both
+constituents, and verified by grep and `openspec validate --strict` without
+a fourth round.
 

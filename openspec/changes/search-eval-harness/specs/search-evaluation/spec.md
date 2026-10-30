@@ -105,7 +105,7 @@ The replay corpus SHALL never be used to shrink the qrels.
 
 #### Scenario: No snapshot, no real score
 - **WHEN** `make search-eval` is run on a real data directory without `corpus-snapshot.json`
-- **THEN** it exits 64 and names the snapshot step
+- **THEN** the recipe exits 64 (make reports Error 64) and names the snapshot step
 
 ### Requirement: Replay SHALL connect only to the named URL, the built-in arms SHALL write nothing, and the read-only session default SHALL be asserted as a backstop
 The `run` step SHALL connect only to the URL named by `SEARCH_EVAL_DATABASE_URL` or `--database-url`, never `DATABASE_URL`. The documented replay target, and the only one the docs and Makefile describe, is a disposable database restored from a `BACKUP_FULL=1` dump.
