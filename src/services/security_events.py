@@ -350,6 +350,11 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     # operator seeing a burst needs to know whether the file or the database is
     # the one misbehaving. Neither fails the call.
     "move_post_rename_failed": frozenset({"tool", "error_type", "reason"}),
+    # A change-feed tool event dropped under the feed lock because the
+    # caller's vault assignment no longer matches the root the tool ran under
+    # (#351, design D4). Names the user and the tool only: never a path, a
+    # root or the root's digest.
+    "change_feed_root_changed": frozenset({"user_id", "tool"}),
     # ── Vault and quota admission (Slice A) ──
     "quota_admission_failed": frozenset({"key_id", "day", "error_type"}),
     "quota_counter_prune_failed": frozenset({"error_type"}),

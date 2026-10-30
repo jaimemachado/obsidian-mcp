@@ -416,6 +416,25 @@ class Settings(BaseSettings):
     # the panel's Reindex, and once this many hours have elapsed since that
     # scope's last *successful* one (one that committed with nothing skipped).
     index_full_hash_interval_hours: int = Field(24, ge=1)
+    # The change feed (#351, `note_events`, design D9/D10). Retention runs in
+    # the periodic tick's `finally`, never inside a pass. The age limit is a
+    # `NullableLimit`-style "null disables" setting (`OAUTH_CLIENT_UNUSED_
+    # EXPIRY_DAYS`' rule) with `0` refused at load — "delete every event the
+    # moment it is written" is an outage, not a setting. The per-scope row cap
+    # is deliberately **not** disable-able: it is what keeps a shared database
+    # bounded with the age limit off (unbounded history is how #308 started).
+    # Env: CHANGE_FEED_RETENTION_DAYS, CHANGE_FEED_MAX_EVENTS_PER_SCOPE,
+    # CHANGE_FEED_MAX_EVENTS_PER_PASS, CHANGE_FEED_LOCK_TIMEOUT_MS.
+    change_feed_retention_days: Annotated[
+        Annotated[int, Field(ge=1, le=3650)] | None,
+        BeforeValidator(_off_means_none),
+    ] = 90
+    change_feed_max_events_per_scope: int = Field(100_000, ge=1_000, le=100_000_000)
+    # Events one pass itemises per scope; the remainder is one `gap` line.
+    change_feed_max_events_per_pass: int = Field(2_000, ge=100, le=50_000)
+    # The bounded wait for the scope's feed lock (a pass or a file-only tool);
+    # a timeout is a `gap` (pass) or a rediscovered `human/sync` event (tool).
+    change_feed_lock_timeout_ms: int = Field(2_000, ge=100, le=30_000)
     embedding_model: str = "bge-m3"
     embedding_dimensions: int = Field(1024, ge=1, le=16000)
     # bge-m3 design point. Must stay strictly greater than `chunk_overlap`:

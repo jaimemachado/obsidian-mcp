@@ -261,6 +261,7 @@ nothing binds the request address into a ContextVar (residual R8).
 | `move_rewrite_failed` | WARNING | `error_type`, `tool` | `move_note`'s link rewrite failing for one source, and the confirmation outage that stops the remaining ones; the move carries on or stops, but the rename stands. The path is named in the tool's reply and in the move's `params`, not in a field |
 | `move_rewrite_overlap_refused` | WARNING | `error_type`, `tool` | `move_note` aborting the **whole** move because one source holds a link nested inside another link to the same note (#211). Distinct from `move_rewrite_failed`: nothing was mutated |
 | `move_post_rename_failed` | WARNING | `error_type`, `reason`, `tool` | the two best-effort failures after the rename has stood; `reason` is `title_read_failed` or `db_update_failed`. Neither fails the call |
+| `change_feed_root_changed` | WARNING | `tool`, `user_id` | a tool's change-feed event dropped under the feed lock because the caller's vault assignment no longer matches the root the tool ran under (#351, D4). Names no path, root or root digest; the tool's result is unchanged |
 | `quota_admission_failed` | ERROR | `day`, `error_type`, `key_id` | `src/services/quotas.py` — re-raised unchanged; a quota that has stopped deciding is an incident |
 | `quota_counter_prune_failed` | WARNING | `error_type` | the same module's housekeeping prune |
 | `publication_refused_confirmation_unavailable` | WARNING | `error_type`, `user_id` | `src/services/vault.py` — the assignment is *unknown*, which is not "changed" |
