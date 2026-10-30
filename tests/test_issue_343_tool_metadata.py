@@ -15,8 +15,10 @@ What an MCP client learns about a tool before calling it is exactly what
   lead with their contract;
 - the tool surface is otherwise unchanged: names, order, `inputSchema` and
   `outputSchema` of the first 25 tools equal a fixture generated on `main` at
-  5a391ca (frozen), and every tool after them equals, in order,
-  `tests/fixtures/tools_list_schema_additions.json` (#350, design D12).
+  5a391ca (frozen) — or, for a deliberately amended tool, its replacement entry
+  in `tests/fixtures/tools_list_schema_amendments.json` (#351) — and every tool
+  after them equals, in order, `tests/fixtures/tools_list_schema_additions.json`
+  (#350, design D12).
 
 Everything is read from the server's own registry (#89's reason): the string a
 client receives is the contract, not the module function a test might follow.
@@ -81,13 +83,17 @@ from src.services import concurrency  # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "tools_list_schema_5a391ca.json"
 ADDITIONS = Path(__file__).resolve().parent / "fixtures" / "tools_list_schema_additions.json"
+# Deliberate schema changes to one of the first 25 tools, as full replacement
+# entries; the frozen fixture itself is never edited (#351).
+AMENDMENTS = Path(__file__).resolve().parent / "fixtures" / "tools_list_schema_amendments.json"
+NOTE_WINDOW_PROPERTIES = {"since", "until", "order_by", "cursor"}
 
 DESCRIPTION_CAP = 4_000
 LEAD_CHARS = 1_500
 INSTRUCTIONS_CAP = 2_000
 INSTRUCTIONS_LEAD = 512
 
-# The sixteen tools that neither change vault bytes nor mint a capability. Named
+# The seventeen tools that neither change vault bytes nor mint a capability. Named
 # explicitly so a read tool added without annotations fails on its name, not
 # only on a count.
 READ_TOOLS = frozenset({
@@ -95,6 +101,7 @@ READ_TOOLS = frozenset({
     "get_recent", "get_vault_guide", "read_file", "list_files", "get_backlinks",
     "get_links", "get_neighborhood", "find_related", "find_orphans", "check_upload",
     "list_tasks",  # #350
+    "get_changes",  # #351
 })
 RESTRUCTURED_WRITE_TOOLS = ("edit_note", "move_note", "set_frontmatter")
 # The refusal statement is qualified in every description that makes one: the
@@ -185,9 +192,9 @@ def tool_shaped_references(text: str, words: frozenset[str]) -> set[str]:
 # ── 1. completeness ──────────────────────────────────────────────────────────
 
 
-def test_exactly_26_tools():
-    # 25 → 26: `list_tasks` (#350).
-    assert len(listed()) == 26
+def test_exactly_27_tools():
+    # 25 → 26: `list_tasks` (#350); 26 → 27: `get_changes` (#351).
+    assert len(listed()) == 27
 
 
 @pytest.mark.parametrize("tool", listed(), ids=lambda t: t.name)
@@ -452,9 +459,10 @@ def test_read_note_leads_with_its_fields():
 async def test_names_order_and_schemas_match_the_5a391ca_fixture():
     frozen = json.loads(FIXTURE.read_text(encoding="utf-8"))
     additions = json.loads(ADDITIONS.read_text(encoding="utf-8"))
+    amendments = {row["name"]: row for row in json.loads(AMENDMENTS.read_text(encoding="utf-8"))}
     assert len(frozen) == 25
-    assert [row["name"] for row in additions][:1] == ["list_tasks"]
-    fixture = frozen + additions
+    assert [row["name"] for row in additions] == ["list_tasks", "get_changes"]
+    fixture = [amendments.get(row["name"], row) for row in frozen] + additions
     live = await mcp.list_tools()
     # The first 25 are the frozen surface, in order; the rest the additions.
     assert [t.name for t in live[:25]] == [row["name"] for row in frozen]
@@ -499,3 +507,21 @@ def test_the_live_dotted_reference_is_covered():
     text = description("read_file")
     assert "`read_note.frontmatter_yaml`" in text
     assert "read_note" in tool_shaped_references(text, first_words())
+
+
+def test_the_amendments_add_only_the_four_optional_window_properties():
+    """#351: `get_recent` and `list_notes` gain `since`, `until`, `order_by`
+    and `cursor`, all optional; nothing else of their frozen schemas moves."""
+    frozen = {row["name"]: row for row in json.loads(FIXTURE.read_text(encoding="utf-8"))}
+    amendments = json.loads(AMENDMENTS.read_text(encoding="utf-8"))
+    assert sorted(row["name"] for row in amendments) == ["get_recent", "list_notes"]
+    for row in amendments:
+        before = frozen[row["name"]]
+        assert row["outputSchema"] == before["outputSchema"], row["name"]
+        added = set(row["inputSchema"]["properties"]) - set(before["inputSchema"]["properties"])
+        assert added == NOTE_WINDOW_PROPERTIES, row["name"]
+        assert not added & set(row["inputSchema"].get("required", [])), row["name"]
+        trimmed = json.loads(json.dumps(row["inputSchema"]))
+        for name in NOTE_WINDOW_PROPERTIES:
+            del trimmed["properties"][name]
+        assert trimmed == before["inputSchema"], row["name"]

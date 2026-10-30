@@ -768,3 +768,21 @@ writes NULL on every log row and every note, and `usage_logs.user_id` is
 `ON DELETE SET NULL`, so a deleted user's rows join the ownerless slice rather
 than vanishing. That is the honest reading — those rows *are* now unattributed
 — and it is the same treatment the ownerless indexer passes get.
+
+## The change feed's actor columns (#351)
+
+`note_events` carries its own denormalised attribution, written by the tool
+at call time rather than joined from `usage_logs` (whose row is written after
+the body, asynchronously committed, carries no path list for write tools and
+is pruned on its own schedule — a time join would be fuzzy by a tick and wrong
+whenever a person and an agent edit in the same tick). `actor_kind` and
+`actor_label` come from the same `actor_columns()` as `usage_logs` (same
+widths, same truncation), so a deleted key's events keep its name. **`actor_ref`
+is deliberately not copied**: the feed never renders it, and a column nobody
+reads is a column somebody later renders. `principal_kind` / `principal_ref`
+(`("api_key", id)` or `("oauth", grant_id)`, the rate-bucket identity) exist
+for one comparison — `get_changes(by="me")` and the `(you)` marker — and are
+**never rendered and never used for authorization**. A transfer upload's
+event carries the minting principal and the token row's actor. Index-pass
+events carry none of these columns (a CHECK enforces it) and render
+`human/sync`.

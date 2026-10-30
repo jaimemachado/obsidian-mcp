@@ -19,6 +19,7 @@ from pathlib import Path
 from sqlalchemy import (
     String,
     bindparam,
+    case,
     delete,
     func,
     literal,
@@ -65,7 +66,7 @@ from src.services.fts import (
     index_tsvector_sql,
     rehead_tsvector_sql,
 )
-from src.services import empty_prune, indexer_health
+from src.services import change_feed, empty_prune, indexer_health
 from src.services.rate_limits import flush_expired
 from src.services.index_state import (
     KEY_EMBEDDING_FINGERPRINT,
@@ -88,6 +89,7 @@ from src.services.links import (
 )
 from src.oauth.grants import lock_account_guard
 from src.services.tasks import extract_tasks_bounded, frontmatter_line_offset
+from src.services.note_hash import canonical_note_text_strict, text_hash
 from src.services import vault_overlap
 from src.services.transfer import canonical_vault_root
 from src.services.vault import (
@@ -725,7 +727,10 @@ logger = logging.getLogger(__name__)
 
 
 def _content_hash(content: str) -> str:
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+    """The note hash of already-canonical text: `note_hash.text_hash`, so the
+    pass's `content_hash` equals `canonical_note_hash` of the file's bytes
+    (#351, D3) — one definition shared with every change-feed event."""
+    return text_hash(content)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1979,18 +1984,28 @@ def read_note_at(
     that could describe a different file from the one that was hashed. Not the
     reason for the anchoring; a free consequence of it.
 
-    Text mode with the default universal-newline translation, exactly as the
-    `Path.read_text` it replaces — a binary read would leave `\\r\\n` intact and
-    silently change every CRLF note's `content_hash`, forcing a re-embed.
+    The text is `note_hash.canonical_note_text_strict` of the bytes read
+    (#351, D3): a strict UTF-8 decode, `\\r\\n` and lone `\\r` translated to
+    `\\n` exactly as the text-mode read it replaced (`Path.read_text`'s
+    universal newlines — a binary read that kept `\\r\\n` would silently change
+    every CRLF note's `content_hash` and force a re-embed), and U+0000
+    removed. The same function computes every change-feed event's hash, so a
+    tool's event and the pass's row agree on a CRLF or NUL note.
+    `tests/test_note_hash.py` pins it against the old text-mode read.
     """
     fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC, dir_fd=parent_fd)
     try:
         stat = os.fstat(fd)
-        with open(fd, "r", encoding="utf-8", errors="strict", closefd=False) as handle:
-            text_ = handle.read()
+        with open(fd, "rb", closefd=False) as handle:
+            data = handle.read()
     finally:
         os.close(fd)
-    nul = text_.count("\x00")
+    # Raises `UnicodeDecodeError` on bytes that are not UTF-8, exactly as the
+    # strict text-mode read did; every caller's not-indexable branch keys on it.
+    text_ = canonical_note_text_strict(data)
+    # A 0x00 byte in UTF-8 is only ever U+0000, so the bytes' count is the
+    # number of characters the canonical text removed.
+    nul = data.count(b"\x00")
     if nul:
         logger.warning(
             "Removed %d NUL character(s) from %s before indexing; the file on "
@@ -1998,7 +2013,6 @@ def read_note_at(
             nul,
             _loggable_path(rel if rel is not None else name),
         )
-        text_ = text_.replace("\x00", "")
     return text_, stat
 
 
@@ -2575,6 +2589,13 @@ async def _reconcile_provenance(
                 delete(NoteMetadata).where(NoteMetadata.user_id == user_id)
             )
             stamped = await _stamp_provenance(session, user_id, facts)
+            if stamped == 1:
+                # #351, D5: the previous root's events go with its rows —
+                # their paths name another root — the watermark rises so an
+                # old cursor reads `history_truncated`, and one `reset` starts
+                # this root's history. In this transaction (all or nothing),
+                # the feed lock last.
+                await change_feed.discard_scope(session, user_id)
             if stamped != 1:
                 # The stamp must land on exactly the row we locked. Zero rows
                 # means the record does not exist, and a delete standing beside
@@ -3419,6 +3440,10 @@ async def _index_vault_attempt(
                 "extraction_version": CURRENT_EXTRACTION_VERSION,
                 "file_size": found.size,
                 "modified_at": datetime.fromtimestamp(found.mtime, tz=timezone.utc),
+                # #351, D1: the value for a row inserted at a path that had
+                # none (no previous content, so no observed change). On
+                # conflict the upsert decides it from the stored hash instead.
+                "content_changed_at": datetime.fromtimestamp(found.mtime, tz=timezone.utc),
                 **_stat_params(found.stat),
             })
 
@@ -3686,6 +3711,22 @@ async def _index_vault_attempt(
                         "stat_ctime_ns": stmt.excluded.stat_ctime_ns,
                         "stat_ino": stmt.excluded.stat_ino,
                         "indexed_at": text("now()"),
+                        # #351, D1: moved only when the stored hash differs
+                        # from the one this statement writes — compared in the
+                        # statement that overwrites it, so the stamp cannot
+                        # drift from the hash it describes. `now()` (this
+                        # pass's start), not the new mtime: a sync client that
+                        # preserves mtime would stamp a real edit in the past.
+                        # The only writer of this column.
+                        "content_changed_at": case(
+                            (
+                                NoteMetadata.content_hash.is_distinct_from(
+                                    stmt.excluded.content_hash
+                                ),
+                                func.now(),
+                            ),
+                            else_=NoteMetadata.content_changed_at,
+                        ),
                         # #311, D3: a rewrite of the row's derived state is
                         # not derived under any root until a re-deriving
                         # pass's tail marks it, in this same transaction.
@@ -4127,6 +4168,37 @@ async def _index_vault_attempt(
                 _format_skips(skips),
             )
 
+        # ── The change feed (#351, D5): the attempt's FINAL statement ─────
+        # Collected from this pass's own classification only — `existing`,
+        # `to_upsert`, the committed moves, the final `deleted_paths` — which
+        # no derivation stage mutates, and appended after every one of them
+        # (keyword vectors, links, tasks, the re-derive tail and its stamp).
+        # **Any future stage goes above this block**, so a `PoisonNote` it
+        # raises restarts the attempt before an event exists. The feed lock
+        # is the last lock this transaction takes. A failed append never
+        # fails the pass: it leaves one durable `note_event_gaps` row,
+        # committed with the pass (a plain INSERT that waits on nothing).
+        feed_events = _collect_feed_events(
+            locked=locked,
+            existing=existing,
+            to_upsert=to_upsert,
+            moves=moves,
+            moved_new_paths=moved_new_paths,
+            upsert_hash=upsert_hash,
+            deleted_paths=deleted_paths,
+            not_indexable_rows=not_indexable_rows,
+            not_indexable=scan.not_indexable,
+        )
+        if feed_events:
+            written = await change_feed.append_events(
+                session, user_id, feed_events,
+                source=change_feed.SOURCE_INDEX,
+                suppress=True,
+                max_items=settings.change_feed_max_events_per_pass,
+            )
+            if written < 0:
+                await change_feed.record_gap(session, user_id, -written)
+
         # Metadata hashes, keyword vectors, deletions, and link rows describe
         # one filesystem snapshot. Commit them together so a failure in a
         # later stage cannot leave a new hash paired with stale search data
@@ -4194,6 +4266,78 @@ async def _index_vault_attempt(
         walk_protected=len(protected),
         rederive_pending=rederive_pending,
     )
+
+
+def _collect_feed_events(
+    *,
+    locked: dict,
+    existing: dict,
+    to_upsert: list,
+    moves: list,
+    moved_new_paths: set,
+    upsert_hash: dict,
+    deleted_paths: set,
+    not_indexable_rows: set,
+    not_indexable: dict,
+) -> list:
+    """The pass's change-feed candidates (#351, design D5), in the fixed order
+    moves, deletions, creations, modifications, path order within each.
+
+    - `created`: inserted rows that are not move destinations;
+    - `modified`: upserts whose hash differs from the locked row's — the
+      same-hash marker and re-derive re-upserts are excluded, exactly the rows
+      whose `content_changed_at` did not move;
+    - `moved`: the committed id-preserving moves;
+    - `deleted`: every row this pass removes, `reason=removed` for an ordinary
+      prune, `not_indexable` for a present-but-not-indexable path,
+      `quarantined` for a quarantine removal;
+    - `created reason=not_indexable`: a path whose *content* cannot be indexed
+      and that has no row (suppressed under the lock once the feed already
+      says so). A path not indexable by its *name* cannot be stored in a feed
+      row either, so it has no event.
+
+    Nothing for protected (#309) or C5-deferred rows: this pass does not
+    change them. A scope with no rows at the attempt's start is a baseline:
+    one `reset` instead of a creation per note, and only when the pass
+    actually writes rows (an empty vault's every tick is not a reset).
+    """
+    if not locked:
+        if to_upsert:
+            return [change_feed.Event("reset")]
+        return []
+    moved = [
+        change_feed.Event("moved", path=new, from_path=old,
+                          content_hash=upsert_hash.get(new))
+        for old, new in sorted(moves, key=lambda m: m[1])
+        if new in moved_new_paths
+    ]
+    deleted = []
+    for p in sorted(deleted_paths):
+        if p in not_indexable_rows:
+            reason = (change_feed.REASON_QUARANTINED if not_indexable.get(p) == QUARANTINED
+                      else change_feed.REASON_NOT_INDEXABLE)
+        else:
+            reason = change_feed.REASON_REMOVED
+        deleted.append(change_feed.Event("deleted", path=p, reason=reason))
+    created, modified = [], []
+    for e in sorted(to_upsert, key=lambda e: e["file_path"]):
+        p, h = e["file_path"], e["content_hash"]
+        if p not in existing:
+            created.append(change_feed.Event("created", path=p, content_hash=h))
+        elif existing[p] != h:
+            modified.append(change_feed.Event("modified", path=p, content_hash=h))
+    for p in sorted(not_indexable):
+        if (p not in existing and not_indexable[p] == NOT_UTF8_CONTENT
+                and change_feed.is_note_path(p)):
+            created.append(change_feed.Event(
+                "created", path=p, reason=change_feed.REASON_NOT_INDEXABLE
+            ))
+    created.sort(key=lambda e: e.path)
+    events = moved + deleted + created + modified
+    return [e for e in events if e.kind == "reset" or (
+        change_feed.is_note_path(e.path)
+        and (e.from_path is None or change_feed.is_note_path(e.from_path))
+    )]
 
 
 async def _rederive_invariant(session, user_id: int, facts, *, lock: bool):
@@ -8040,6 +8184,12 @@ async def run_indexer_loop():
                 await cleanup_expired_tokens()
             except Exception as e:  # noqa: BLE001 - housekeeping, never fatal
                 logger.error(f"Expired-token cleanup failed: {e}")
+            # Change-feed retention (#351, D9), separately guarded so neither
+            # housekeeping failure masks the other, and never inside a pass.
+            try:
+                await change_feed.prune()
+            except Exception as e:  # noqa: BLE001 - housekeeping, never fatal
+                logger.error(f"Change-feed retention failed: {e}")
             # The refusal coalescer's standalone flush: any window that closed
             # since the last tick writes the row it owes, so a principal that
             # was refused in a burst and then went quiet still has its count

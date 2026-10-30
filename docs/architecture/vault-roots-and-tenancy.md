@@ -972,3 +972,34 @@ only a fully drained overflow epoch permits new dedicated assignments. This can
 be stricter under registry pressure; it cannot become a tenancy exemption. Shadow
 mode records this hypothetical admission pressure but preserves existing tool
 outcomes and performs no concurrency refusal or additional wait.
+
+## The change feed is scoped like the index (#351)
+
+`note_events.user_id` is the scope, read through the same total owner
+mapping as `notes_metadata` (`IS NULL` for an ownerless caller), and an event
+is only ever written into the scope whose root its paths are relative to:
+tools write the caller's `current_user_id` (the user `_vault_root` resolved
+and `_confirmed_publication` confirmed), the pass writes its own scope.
+**Seqs are per scope**, assigned under the scope's lock, so a tenant sees a
+gapless 1, 2, 3, … whatever any other tenant does — no number on a page
+depends on another tenant's volume — and an `ev:` cursor from another scope
+is refused as above that scope's `last_seq`. Within one scope every
+attributed event was written by a principal of that scope's own account, so
+a label is only ever shown to its own tenant.
+
+**The root binding.** A tool appends with a digest of the root it ran under;
+under the feed lock the helper re-reads `users.vault_path` (a plain read, no
+row lock) and writes nothing, logging `change_feed_root_changed` (user and
+tool only), when the digest differs. The harm it closes is a stale path from
+the **same user's former root** surviving in that user's own feed after a
+reassignment — not a cross-tenant leak — and it is closed anyway: an append
+before the discard is purged by it, one after it sees the new assignment.
+
+**Discard and deletion.** A provenance discard deletes the scope's events in
+its own transaction, raises the watermark (an old cursor reads
+`history_truncated`) and appends `reset`. Permanent user deletion purges the
+scope's three feed tables after the `users` DELETE and its cascade, taking
+the feed lock last; an append that takes the lock after the deletion
+committed finds the user gone and writes nothing, and retention removes any
+row whose `user_id` has no `users` row as a backstop. The tables carry no
+foreign key, by design (schema note, 033).

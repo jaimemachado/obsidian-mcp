@@ -94,5 +94,72 @@
       "title": "list_tasksOutput",
       "type": "object"
     }
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "by": {
+          "default": "any",
+          "title": "By",
+          "type": "string"
+        },
+        "folder": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Folder"
+        },
+        "kinds": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Kinds"
+        },
+        "limit": {
+          "default": 50,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "since": {
+          "title": "Since",
+          "type": "string"
+        }
+      },
+      "required": [
+        "since"
+      ],
+      "title": "get_changesArguments",
+      "type": "object"
+    },
+    "name": "get_changes",
+    "outputSchema": {
+      "properties": {
+        "result": {
+          "title": "Result",
+          "type": "string"
+        }
+      },
+      "required": [
+        "result"
+      ],
+      "title": "get_changesOutput",
+      "type": "object"
+    }
   }
 ]

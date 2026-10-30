@@ -2472,3 +2472,83 @@ and (span-diff-scoped, direction-aware) its embeddings, under the restored
 grammar, without touching `content_hash`. Comparing legacy-to-legacy instead —
 which is what a registry without the frozen v1 entry would do — would certify
 the stale vectors for ever.
+
+## Change feed (#351)
+
+`get_changes` reads `note_events`, the durable record of what changed in a
+scope. The index pass is one of its two writers; the full contract is in
+`openspec/changes/archive/2026-10-30-change-feed/design.md` and
+`src/services/change_feed.py`.
+
+**`content_changed_at` is stamped in exactly one statement.** The batch
+upsert's `ON CONFLICT … SET content_changed_at = CASE WHEN
+notes_metadata.content_hash IS DISTINCT FROM excluded.content_hash THEN now()
+ELSE notes_metadata.content_changed_at END`; an inserted row takes the file's
+mtime. The comparison sits in the statement that overwrites the hash, so the
+stamp cannot drift from it, and a touch, a stat refresh, a stale-marker or
+re-derive re-upsert with the same hash, either move path, the keyword-vector
+writers and the link backfill never name the column (a guard test pins it).
+`now()` and not the new mtime, because a sync client that preserves mtime
+would otherwise stamp a real edit in the past. The cost is a lag of one tick
+(and up to `INDEX_FULL_HASH_INTERVAL_HOURS` for an edit that kept all four
+stat fields, perf-L3).
+
+**Events are collected from the pass's own classification** —
+`existing`, `to_upsert`, the committed moves and the final `deleted_paths`,
+none of which a derivation stage mutates — and appended as the attempt's
+**final statement before `session.commit()`**, after the keyword vectors,
+links, tasks and the re-derive tail with its stamp. Any later stage goes
+above that block, so a `PoisonNote` it raises restarts the attempt before an
+event exists; a rolled-back attempt leaves none. `created` is "first seen at
+this path"; `modified` is exactly the rows whose stamp moved; `deleted`
+covers every row the pass removes, with `reason=removed`, `not_indexable`
+(present but undecodable) or `quarantined`; a present-but-undecodable path
+with no row is one `created reason=not_indexable`, once. Protected (#309)
+and C5-deferred rows get nothing — this pass does not change them. A path not
+indexable by its *name* (not UTF-8, over the cap) cannot be stored in a feed
+row and has no event.
+
+**Suppression is read under the feed lock.** The pass drops its own line when
+the latest event at the path (by `path` or `from_path`, highest seq) is an
+MCP event describing the same state: the same canonical hash for a content
+event (or both NULL with `not_indexable`), the same reason for a deletion,
+and for a move the same pair **and** that MCP move latest at both endpoints.
+`read_note_at` reads bytes and derives its text through
+`note_hash.canonical_note_text_strict`, so the stored `content_hash` *is*
+`canonical_note_hash(file bytes)`, the function every tool event uses — a
+CRLF or NUL note hashes the same on both sides (parity test:
+`tests/test_note_hash.py`).
+
+**Baseline, discard, overflow.** A scope with no rows at the attempt's start
+records one `reset` (only when the pass writes rows, so an empty vault's
+ticks record nothing), never a creation per note. A provenance discard
+deletes the scope's events in the discard's transaction, raises
+`note_event_scopes.pruned_through_seq` to `last_seq` (an old cursor reads
+`history_truncated`) and appends `reset`. A pass itemises at most
+`CHANGE_FEED_MAX_EVENTS_PER_PASS` events per scope — moves, deletions,
+creations, modifications, path order within each — and the rest is one
+`gap pass_overflow` line.
+
+**The feed never fails a pass.** The append runs in a savepoint under
+`lock_timeout = CHANGE_FEED_LOCK_TIMEOUT_MS`. On any failure the savepoint
+rolls back and the pass inserts one `note_event_gaps` row in its own
+transaction — a plain INSERT of a new row, which waits on nothing — so the
+row changes and the record of what was not itemised commit together; the
+scope's next successful append turns the gap rows into one `gap
+write_failed` line ahead of its own. No in-process state is the only record
+of a lost event, and no `indexer_health` counter moves.
+
+**The lock-order exception.** The feed lock (`pg_advisory_xact_lock(
+NOTE_EVENTS_LOCK_NS, user_id or 0)`, held to commit) is the **last** lock a
+pass or tool transaction takes; after it come only rows nobody else can hold
+(the scope row, new event rows, this scope's gap rows). That inverts
+`embeddings.py`'s "advisory before any row lock" on purpose: it is what makes
+seq order commit order, and the tables carry no foreign key, so nothing after
+it waits on `users`. Retention (`change_feed.prune`) runs in the tick's
+`finally` after `cleanup_expired_tokens`, separately guarded, never inside a
+pass. Its age cut is the **prefix** ending just before the oldest unexpired
+event — `occurred_at` is a transaction's start and not monotone in seq, so
+"every event older than the cutoff" could hit an unexpired one with a lower
+seq — which keeps `pruned_through_seq` a true watermark. A discard also
+drops the scope's gap rows, so a previous root's `write_failed` gap never
+reaches the new root's feed.

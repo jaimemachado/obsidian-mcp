@@ -756,6 +756,22 @@ deployment; on a compose-file deployment the equivalents are plain
   `docker compose -f docker-compose.simple.yml exec obsidian-mcp alembic check`
   should print "No new upgrade operations detected."
 
+  **Upgrading across migration 033 (change feed, #351).** 033 adds
+  `notes_metadata.content_changed_at`, backfilled in one UPDATE from each
+  note's `modified_at` (or `indexed_at` where that is NULL), and three
+  change-feed tables. Nothing is re-embedded and nothing is re-derived:
+  the extraction version stays 4. The feed starts with the first pass
+  after the upgrade, and nothing before 033 has events. The three feed
+  tables are **durable** and are dumped with their rows by `make db-backup`
+  and the Kubernetes backup Job. `get_changes` joins the `scan`
+  concurrency class, so `CLASS_MAPPING_VERSION` moves to 4 and starts a new
+  readiness epoch. There are four new settings, all with working defaults:
+  `CHANGE_FEED_RETENTION_DAYS`, `CHANGE_FEED_MAX_EVENTS_PER_SCOPE`,
+  `CHANGE_FEED_MAX_EVENTS_PER_PASS` and `CHANGE_FEED_LOCK_TIMEOUT_MS`
+  (README, Configuration). Rollback: the previous image reads none of these
+  objects, and `alembic downgrade 032` drops them, losing only the feed
+  history.
+
   **Upgrading across migration 032 (task listing, #350).** 032 adds the
   `note_tasks` table and two `notes_metadata` bits; it writes no row. The
   extraction version moves to 4, so the first pass after the upgrade

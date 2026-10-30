@@ -16,6 +16,7 @@ from src.mcp_server.tools import (
     find_orphans_impl,
     find_related_impl,
     get_backlinks_impl,
+    get_changes_impl,
     get_links_impl,
     get_neighborhood_impl,
     get_recent_impl,
@@ -104,7 +105,7 @@ def _origin_patterns(origins) -> list[str]:
 #
 # The classification, pinned by `tests/test_issue_343_tool_metadata.py`
 # against the code rather than a list:
-#   read-only   = the sixteen tools that neither change vault bytes nor mint a
+#   read-only   = the seventeen tools that neither change vault bytes nor mint a
 #                 capability (idempotent, closed-world)
 #   destructive = the write-bucket set (`_tracked(write_class=True)`) minus
 #                 `create_note` (no-clobber, additive) plus `request_upload`
@@ -298,12 +299,21 @@ async def list_notes(
     limit: int = 50,
     tags: list[str] | None = None,
     frontmatter: dict | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    order_by: str | None = None,
+    cursor: str | None = None,
 ) -> str:
     """List notes in a vault folder, sorted by most recently modified.
 
     Results come from the index, so a note that exists on disk but has not yet been
     picked up by the indexer will not appear (lag is bounded by the index interval,
     typically up to 5 minutes).
+
+    Notes whose content changed in a window: `order_by="content_changed"` with
+    `since` (and optionally `until`). File mtime (the default order) also moves
+    when a file is merely touched or re-synced; `content_changed` moves only when
+    the indexed content hash changes.
 
     Args:
         folder: Vault-relative folder path (e.g. "Cards/", "Projects/"). Empty for vault root.
@@ -312,8 +322,18 @@ async def list_notes(
             (e.g. ["idea"]).
         frontmatter: Optional dict of frontmatter key/value pairs; strict type match
             (e.g. {"status": "active"}).
+        since: Optional UTC lower bound, inclusive: `YYYY-MM-DD` (that whole UTC
+            day) or an ISO 8601 datetime with `Z` or `±HH:MM` (no offset is refused).
+        until: Optional UTC upper bound, exclusive; a date includes that whole day.
+        order_by: `"mtime"` (default) or `"content_changed"`; the bounds apply to it.
+        cursor: The `more: cursor=…` value from the previous page of the same call.
+            When any of since/until/order_by/cursor is given, a full page ends with
+            that footer.
     """
-    return await list_notes_impl(folder, limit=limit, tags=tags, frontmatter=frontmatter)
+    return await list_notes_impl(
+        folder, limit=limit, tags=tags, frontmatter=frontmatter,
+        since=since, until=until, order_by=order_by, cursor=cursor,
+    )
 
 
 @mcp.tool(title="List tags", annotations=_READ_ONLY)
@@ -332,11 +352,22 @@ async def get_recent(
     folder: str | None = None,
     tags: list[str] | None = None,
     frontmatter: dict | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    order_by: str | None = None,
+    cursor: str | None = None,
 ) -> str:
     """Get recently modified notes, newest first.
 
     Each line shows the note's modification time in UTC, as
     "YYYY-MM-DD HH:MM UTC".
+
+    Notes whose content changed since a point in time:
+    `order_by="content_changed"` with `since`. File mtime (the default order)
+    also moves when a file is touched or re-synced without a content change;
+    `content_changed` moves only when the indexed content hash changes, and each
+    line is then labelled `changed`. For an exact list of creations, edits,
+    moves and deletions since a stored cursor, see `get_changes`.
 
     Args:
         limit: Number of recent notes to return (default 20).
@@ -345,9 +376,17 @@ async def get_recent(
             (e.g. ["meeting"]).
         frontmatter: Optional dict of frontmatter key/value pairs; strict type match
             (e.g. {"status": "active"}).
+        since: Optional UTC lower bound, inclusive: `YYYY-MM-DD` (that whole UTC
+            day) or an ISO 8601 datetime with `Z` or `±HH:MM` (no offset is refused).
+        until: Optional UTC upper bound, exclusive; a date includes that whole day.
+        order_by: `"mtime"` (default) or `"content_changed"`; the bounds apply to it.
+        cursor: The `more: cursor=…` value from the previous page of the same call.
+            When any of since/until/order_by/cursor is given, a full page ends with
+            that footer.
     """
     return await get_recent_impl(
-        limit=limit, folder=folder, tags=tags, frontmatter=frontmatter
+        limit=limit, folder=folder, tags=tags, frontmatter=frontmatter,
+        since=since, until=until, order_by=order_by, cursor=cursor,
     )
 
 
@@ -1254,6 +1293,58 @@ async def list_tasks(
     return await list_tasks_impl(
         folder=folder, status=status, due_by=due_by, scheduled_by=scheduled_by,
         tags=tags, limit=limit, cursor=cursor,
+    )
+
+
+@mcp.tool(title="Change feed", annotations=_READ_ONLY)
+async def get_changes(
+    since: str,
+    folder: str | None = None,
+    kinds: list[str] | None = None,
+    by: str = "any",
+    limit: int = 50,
+) -> str:
+    """List what changed in your vault after a cursor: one line per note created, modified, moved or deleted, oldest first.
+
+    `since` is either the `next_since` cursor a previous call returned
+    (`ev:<number>`, exclusive and exact) or a UTC date/datetime
+    (`YYYY-MM-DD`, or ISO 8601 with `Z`/`±HH:MM`). A date or datetime *starts*
+    a feed and is approximate; `next_since` *continues* one without losing or
+    repeating an event. Store `next_since` (it is in the header and the last
+    line) in your own notes and pass it next session. A cursor means
+    something only for your own vault; one above this vault's last event is
+    refused (`invalid_argument`).
+
+    Each line: `- ev:<n> <UTC time> <kind> "<path>"` (a move shows
+    `"<from>" -> "<to>"`; paths are JSON-quoted, so a newline in a name is
+    `\n`), then `reason=…` where it applies, then who: `by api_key "<name>"
+    via <tool>` or `by oauth "<client>" via <tool>`, marked `(you)` when it was
+    your own credential, or `by human/sync` for anything the index discovered
+    — edits outside MCP (Obsidian, a sync client, git, a shell) are
+    `human/sync`. `created` means first seen at this path: a new note, one half
+    of a rename that could not be paired, or a note that became indexable.
+    `deleted` always carries `reason=`: `removed` (the file is gone),
+    `not_indexable` (still on disk but cannot be indexed) or `quarantined`.
+
+    Two meta lines are always shown, whatever the filters: `gap` (events not
+    itemised, with a count) and `reset` (the index was rebuilt from empty).
+    After either, resync with `get_recent(order_by="content_changed",
+    since=…)`. `history_truncated: true` in the header means events older than
+    the retained history (default 90 days) were removed.
+
+    Args:
+        since: A `next_since` cursor (`ev:<n>`) or a UTC date/datetime.
+        folder: Only events whose path or source path is under this prefix (a
+            move out of the folder counts).
+        kinds: Subset of `created`, `modified`, `moved`, `deleted`.
+        by: `any` (default); `me` (your exact credential — the same API key,
+            or the same OAuth grant across token refreshes); `agents` (any MCP
+            caller of this vault); `human` (`human/sync`, discovered by the index).
+        limit: Events per page (1–500, default 50). A full page says
+            `more: true`; pass its `next_since` to continue.
+    """
+    return await get_changes_impl(
+        since=since, folder=folder, kinds=kinds, by=by, limit=limit
     )
 
 

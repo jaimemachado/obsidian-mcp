@@ -202,6 +202,7 @@ CALLS = [
     ('find_related', 'find_related_impl', lambda s: (('a.md',), {})),
     ('find_orphans', 'find_orphans_impl', lambda s: ((), {})),
     ('list_tasks', 'list_tasks_impl', lambda s: ((), {})),  # #350
+    ('get_changes', 'get_changes_impl', lambda s: (('ev:0',), {})),  # #351
     ('create_note', 'create_note_impl', lambda s: (('new.md', 'first\n'), {})),
     ('edit_note', 'edit_note_impl', lambda s: (('new.md', 'second\n'), {})),
     ('set_frontmatter', 'set_frontmatter_impl',

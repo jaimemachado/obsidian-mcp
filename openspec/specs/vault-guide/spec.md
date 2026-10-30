@@ -1,7 +1,8 @@
 # vault-guide Specification
 
 ## Purpose
-TBD - created by archiving change vault-guide-with-primer. Update Purpose after archive.
+What `get_vault_guide` serves: the shared Obsidian primer and the vault's own `CLAUDE.md`, the primer's neutral framing rules, and its pointers to the tools that answer common agent questions — `list_tasks` for checkbox tasks and (#351) `get_changes` with a stored `next_since` cursor for what changed since the last session.
+
 ## Requirements
 ### Requirement: Tool name and registration
 
@@ -119,3 +120,14 @@ The primer returned by `get_vault_guide` SHALL state, in its Tasks section and i
 - **WHEN** the server's `instructions` are inspected
 - **THEN** they SHALL contain `list_tasks`, the first 512 characters SHALL be unchanged by this change, and the total SHALL be at most 2,000 characters
 
+### Requirement: The guide SHALL describe the change-feed cursor convention in neutral framing
+The served primer SHALL contain one line that names `get_changes`, says that `get_changes(since=<stored cursor>)` lists what changed in the vault since the cursor, and says to store the returned `next_since` in the agent's own notes for the next session, and SHALL point to `order_by="content_changed"` with `since` on `get_recent` / `list_notes` for notes whose content changed. The line SHALL use the neutral framing the other guide references use. It SHALL NOT contain "MUST", "IMPORTANT" or an imperative to call the tool before any other.
+
+#### Scenario: The guide mentions the feed
+- **WHEN** `get_vault_guide` is invoked
+- **THEN** the primer SHALL mention `get_changes`, `next_since` and `order_by="content_changed"`
+- **AND** the primer section SHALL remain byte-identical between a vault with `CLAUDE.md` and one without
+
+#### Scenario: Neutral framing
+- **WHEN** the primer line naming `get_changes` is inspected
+- **THEN** it SHALL NOT contain "MUST", "IMPORTANT" or "call … first"

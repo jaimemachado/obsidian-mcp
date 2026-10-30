@@ -1380,3 +1380,64 @@ Content is preserved; bytes are not. Normalising on write would rewrite
 terminators the caller never touched, so this is accepted rather than fixed:
 the byte-identity guarantee is scoped to LF-bodied notes and both `edit_note`
 docstrings say so.
+
+## Change-feed events from the write tools (#351)
+
+Every markdown publication a tool performs records one `note_events` row
+through `change_feed.append_events`, attributed at call time with the
+caller's `actor_kind` / `actor_label` (as written to `usage_logs`), its exact
+principal (`("api_key", id)` or `("oauth", grant_id)`) and the server-authored
+tool name. `create_note` → `created`; `edit_note`, `set_frontmatter` →
+`modified`; `write_file`, `import_from_url` and `PUT /transfer/upload` on a
+`.md` path (the indexer's rule: `.md`, no dot component) → `created` without
+an incumbent, `modified` with one; `delete_note` → `deleted reason=removed`,
+soft or permanent; `move_note` → `moved` plus one `modified` per backlink
+source whose rewrite it actually published. `delete_file` refuses every
+`.md` path, so it never records one. Each content event carries
+`canonical_note_hash` of the bytes published (the streaming publishers hash
+as the bytes pass), so the next pass can recognise the tool's own edit; bytes
+that are not UTF-8 carry no hash and `reason=not_indexable`.
+
+**Ordering and failure.** The event is recorded only after the confirmed
+publication has returned — never between `_confirmed_publication`'s
+confirming read and the write — and never for a refusal, a dry run or an
+uncertain publication. `move_note` is the one tool that writes the database
+for its mutation, so its `moved` event is inside that metadata transaction,
+unbounded: a failure rolls the path update back and takes the existing "DB
+update failed; reindex will reconcile" branch, and the pass then pairs the
+move and records it `human/sync`. On that branch the link rewrites are
+**stopped before any publication** and every planned source is reported
+unrewritten: a rewrite of the moved note's own links would change its hash,
+and the pass would then record `deleted` + `created` instead of the move. Every other tool appends in its own short
+transaction (`record_tool_events`), bounded by the feed lock timeout, and
+swallows every failure: the returned text, the `BodyOutcome` and the usage
+classification are identical whether the event write succeeds, times out or
+fails, and the next pass records the change unattributed (L6). A tool append
+is bound to the root `_tracked` resolved for the call: under the feed lock
+the helper re-reads the user's assignment and writes nothing (and logs
+`change_feed_root_changed`) when it moved.
+
+**Transfer uploads** are attributed to the principal that **minted** the
+link and the actor the token row carries — the rule the write-bucket charge
+at redemption already applies (owner decision 4) — with `tool =
+"transfer_upload"`; the public route never consults `current_*`.
+
+## `get_changes` (#351)
+
+`get_changes(since, folder?, kinds?, by="any", limit=50)` returns the
+caller's own events (total owner mapping on `note_events.user_id`) after an
+`ev:<seq>` cursor (exclusive, exact) or at/after a UTC date/datetime
+(approximate: `occurred_at` is a transaction's start), in seq order, in one
+`REPEATABLE READ, READ ONLY` snapshot that also yields `last_seq` and the
+retention watermark. `folder` matches `path` **or** `from_path` (a move out
+of the folder is a change to it); `kinds` is a subset of the four note kinds;
+`by` is `agents` (`source='mcp'`), `human` (`source='index'`), or `me` (the
+caller's exact principal — a refreshed OAuth token is the same grant, a
+second key of the same account is not; a principal-less call is refused).
+`gap` and `reset` lines are never filtered out. `next_since` is the last
+rendered seq on a full or character-cut page, otherwise the larger of the
+scope's `last_seq` and the input cursor; a cursor above `last_seq` is refused
+(another vault's, another deployment's, or rolled back by a restore).
+`history_truncated: true` when the cursor is below `pruned_through_seq`, or a
+date `since` is at or before `pruned_at` (conservative). `created` means
+first seen at this path (L3); edits outside MCP are `human/sync` (L2).

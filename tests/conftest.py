@@ -41,6 +41,11 @@ SETTINGS_ENV_KEYS = (
     # The scan's stat shortcut and its backstop (#282).
     "INDEX_STAT_SHORTCUT",
     "INDEX_FULL_HASH_INTERVAL_HOURS",
+    # The change feed (#351).
+    "CHANGE_FEED_RETENTION_DAYS",
+    "CHANGE_FEED_MAX_EVENTS_PER_SCOPE",
+    "CHANGE_FEED_MAX_EVENTS_PER_PASS",
+    "CHANGE_FEED_LOCK_TIMEOUT_MS",
     "EMBEDDING_MODEL",
     "EMBEDDING_DIMENSIONS",
     "CHUNK_SIZE",
@@ -486,3 +491,47 @@ def _reset_indexer_scan_state():
     if indexer is not None:
         indexer._last_full_hash.clear()
         indexer.clear_sweep_state()
+
+
+#: Offline modules that exercise the change feed's own behaviour and must see
+#: the real helpers (they open no database session).
+_CHANGE_FEED_REAL = {"test_change_feed_offline.py", "test_note_hash.py"}
+
+
+@pytest.fixture(autouse=True)
+def _offline_change_feed(request):
+    """Stub the change feed's database writers in the offline suite (#351).
+
+    The offline suite's fake sessions model the database only as far as each
+    module's own contract needs; the feed's statements (the advisory lock, the
+    event INSERT, the purges) would fail against them and turn every
+    `move_note` into a "DB update failed" partial outcome. Those statements are
+    pinned against real PostgreSQL in `tests/integration/test_change_feed_pg.py`,
+    which this fixture leaves untouched.
+
+    Patched by hand rather than through `monkeypatch`: requesting that fixture
+    here would set it up ahead of every other autouse fixture and so undo the
+    test's own patches only after their teardowns had run.
+    """
+    path = Path(str(request.node.fspath))
+    if "integration" in path.parts or path.name in _CHANGE_FEED_REAL:
+        yield
+        return
+    from src.services import change_feed
+
+    async def _append(*_a, **_k):
+        return 0
+
+    async def _none(*_a, **_k):
+        return None
+
+    stubs = {"append_events": _append, "discard_scope": _none,
+             "purge_scope": _none, "record_tool_events": _none, "prune": _none}
+    saved = {name: getattr(change_feed, name) for name in stubs}
+    for name, stub in stubs.items():
+        setattr(change_feed, name, stub)
+    try:
+        yield
+    finally:
+        for name, real in saved.items():
+            setattr(change_feed, name, real)
