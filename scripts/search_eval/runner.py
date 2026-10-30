@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.search_eval import EXIT_FAILURE, EXIT_OK, UsageError
-from scripts.search_eval._io import atomic_write, ensure_private_dir, pretty_json, sha256_file
+from scripts.search_eval._io import atomic_write, ensure_private_dir, pretty_json
 from scripts.search_eval.arms import ArmContext, EvalQuery, ResolvedArm, resolve_arms
 from scripts.search_eval.corpus import Corpus
 from scripts.search_eval.metrics import dedup

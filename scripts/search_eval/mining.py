@@ -177,6 +177,11 @@ def _refusal_reason(params: dict) -> str | None:
     return None
 
 
+def passes_usable_filter(params: dict | None) -> bool:
+    """D1's usable filter alone: the Python mirror of `analysable_sql`."""
+    return _refusal_reason(params or {}) is None
+
+
 def usable_search(row: dict) -> tuple[bool, str | None]:
     """`(True, None)` for a usable search row, else `(False, reason)`."""
     if row.get("tool") not in SEARCH_TOOLS:

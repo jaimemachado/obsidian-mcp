@@ -49,7 +49,6 @@ from typing import Any
 from scripts.search_eval import EXIT_INSUFFICIENT, EXIT_OK, UsageError
 from scripts.search_eval._io import (
     atomic_write,
-    canonical_json,
     pretty_json,
     read_jsonl,
     sha256_bytes,
@@ -507,5 +506,5 @@ def score(data_dir: Path, arms: list[str] | None = None, *, baseline: str | None
 
 __all__ = [
     "UNSTABLE_KEYS", "DataDir", "Drift", "drift_drop", "select_qids", "selected_hash",
-    "score", "stable_projection", "render_table", "assert_no_leak", "canonical_json",
+    "score", "stable_projection", "render_table", "assert_no_leak",
 ]

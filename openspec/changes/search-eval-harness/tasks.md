@@ -135,14 +135,14 @@
 
 ## 6. Tests
 
-- [ ] 6.1 Create the fixture under `tests/fixtures/search_eval/`:
+- [x] 6.1 Create the fixture under `tests/fixtures/search_eval/`:
   - `usage-export.jsonl`, covering every D7 case, including two grants with the same `actor_ref` and one unresolvable principal;
   - `corpus.json`, the snapshot and replay corpus, with per-arm membership flags (all `keyword` and `semantic` true) and one judged path absent;
   - `manual.jsonl`, with one explicit class and one collision with a mined qid;
   - `expected-report.json`, a stable projection.
 
   Generate `expected-report.json` once with the implementation. Then check every number by hand for at least the `fixture-title` arm, and write that arithmetic in a comment block in the test.
-- [ ] 6.2 Write `tests/test_search_eval.py`. It runs fully offline, has no skip condition, and needs no `DATABASE_URL`. Cover:
+- [x] 6.2 Write `tests/test_search_eval.py`. It runs fully offline, has no skip condition, and needs no `DATABASE_URL`. Cover:
   - **Mining**
     - one test per mining scenario in the spec, including two grants of the same client and the unresolvable principal;
     - the classifier table, including the four spec examples;
@@ -186,7 +186,7 @@
     - Assert `provenance.users == "multi"` and `attachable is False` for the two-user fixture, and that the table's first line is the not-attachable notice.
     - Assert separately that `report["commit_sha"]` matches `^[0-9a-f]{40}$` and equals `git rev-parse HEAD` run in the repo root.
   - **Provenance.** The same fixture mined with `--user-id` set to one fixture user gives `provenance.users == 1` and `attachable is True`. An export with `deployment_users = 1` and one distinct `user_id` (or all NULL) is attachable. An empty export is `"multi"`.
-- [ ] 6.3 Write `tests/integration/fixtures/local-db-exec.sh`. It drops a leading `-i` and `exec`s the rest, with `PGHOST`, `PGPORT` and `PGPASSWORD` taken from the environment.
+- [x] 6.3 Write `tests/integration/fixtures/local-db-exec.sh`. It drops a leading `-i` and `exec`s the rest, with `PGHOST`, `PGPORT` and `PGPASSWORD` taken from the environment.
 
   Then write `tests/integration/test_search_eval_pg.py`, guarded on `PGVECTOR_TEST_ADMIN_URL` through `tests/integration/_harness.py`. When the URL is set and `psql` is not on `PATH`, the module **fails**; it never skips. It covers:
   - **The export gate.**
