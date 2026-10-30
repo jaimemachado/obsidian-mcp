@@ -499,7 +499,7 @@ _CHANGE_FEED_REAL = {"test_change_feed_offline.py", "test_note_hash.py"}
 
 
 @pytest.fixture(autouse=True)
-def _offline_change_feed(request, monkeypatch):
+def _offline_change_feed(request):
     """Stub the change feed's database writers in the offline suite (#351).
 
     The offline suite's fake sessions model the database only as far as each
@@ -508,6 +508,10 @@ def _offline_change_feed(request, monkeypatch):
     `move_note` into a "DB update failed" partial outcome. Those statements are
     pinned against real PostgreSQL in `tests/integration/test_change_feed_pg.py`,
     which this fixture leaves untouched.
+
+    Patched by hand rather than through `monkeypatch`: requesting that fixture
+    here would set it up ahead of every other autouse fixture and so undo the
+    test's own patches only after their teardowns had run.
     """
     path = Path(str(request.node.fspath))
     if "integration" in path.parts or path.name in _CHANGE_FEED_REAL:
@@ -521,9 +525,13 @@ def _offline_change_feed(request, monkeypatch):
     async def _none(*_a, **_k):
         return None
 
-    monkeypatch.setattr(change_feed, "append_events", _append)
-    monkeypatch.setattr(change_feed, "discard_scope", _none)
-    monkeypatch.setattr(change_feed, "purge_scope", _none)
-    monkeypatch.setattr(change_feed, "record_tool_events", _none)
-    monkeypatch.setattr(change_feed, "prune", _none)
-    yield
+    stubs = {"append_events": _append, "discard_scope": _none,
+             "purge_scope": _none, "record_tool_events": _none, "prune": _none}
+    saved = {name: getattr(change_feed, name) for name in stubs}
+    for name, stub in stubs.items():
+        setattr(change_feed, name, stub)
+    try:
+        yield
+    finally:
+        for name, real in saved.items():
+            setattr(change_feed, name, real)
