@@ -819,3 +819,5 @@ Accepted limitations:
 - **L10** Rows before #161 have no `result_paths`; rows before typed body outcomes may show a failed read without `error`.
 - **L11** A deleted user's rows are ownerless (`user_id` NULL) and replay against the ownerless slice; counted as `ownerless_queries`.
 - **L12** Small samples: the bootstrap interval shows the uncertainty, and `INSUFFICIENT_DATA` stops a 12-query verdict looking like a result.
+- **L13** `SEARCH_EVAL_DATA` may point outside `SEARCH_EVAL_DIR`; nothing checks it is git-ignored (same directory by convention; 0700/0600 still apply).
+- **L14** A truncated query holding a NUL or lone surrogate escapes `is_truncated` (#310 escaping grows it past 201 characters); implausible, not handled.
