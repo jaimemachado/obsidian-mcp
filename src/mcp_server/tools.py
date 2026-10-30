@@ -5051,6 +5051,14 @@ def _rewrite_failure_warning(
             f"so {len(failed_sources)} note(s) still link to the old path and "
             f"were left unrewritten: {preview}"
         )
+    if stopped == "db_failed":
+        return (
+            "partial success: the note was moved, but the index update for the "
+            "move failed, so the link rewrites were stopped to keep the moved "
+            "note's bytes as renamed (the next index pass pairs the move). "
+            f"{len(failed_sources)} note(s) still link to the old path and "
+            f"were left unrewritten: {preview}"
+        )
     return (
         "partial success: note moved, but link rewrites failed in "
         f"{len(failed_sources)} note(s): {preview}"
@@ -5931,6 +5939,17 @@ async def _move_note_locked(
         # The rewrites this call actually published, for the change feed: on a
         # partial completion only what was written is recorded (#351, D3).
         rewrite_events: list = []
+        if db_failed and planned_rewrites:
+            # #351 (Codex implementation review r1): the metadata transaction —
+            # and with it the `moved` event — rolled back, so the next pass must
+            # pair the move by hash. A rewrite of the moved note's own links
+            # would change that hash and turn the move into `deleted` +
+            # `created`. Stop before any rewrite; report every source unrewritten.
+            stopped = "db_failed"
+            for remaining in planned_rewrites:
+                failed_rewrite_sources.append(remaining[0])
+                drop(remaining[1])
+            planned_rewrites = []
         for position, planned in enumerate(planned_rewrites):
             write_path, write_target, original_bytes, new_content, n = planned
             # The moved note is the one source written through the destination
