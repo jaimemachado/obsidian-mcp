@@ -3,8 +3,8 @@ Makefile.local
 data/
 __pycache__/
 *.pyc
-.venv/
-venv/
+.venv
+venv
 .pytest_cache/
 .coverage
 coverage/
