@@ -160,12 +160,12 @@
 - [x] 7.6 `docs/architecture/schema-and-migrations.md`: a "033" section (backfill, per-scope `seq`, why there are no FKs (the user-deletion deadlock), markers, the three durable tables).
 - [x] 7.7 `docs/architecture/usage-attribution.md`: the event actor columns (no `actor_ref`, never for authorization) and `principal_ref` (equality only, never rendered).
 - [x] 7.8 `docs/architecture/vault-roots-and-tenancy.md`: event scoping, the root binding on tool appends (a same-user stale-root path, not a cross-tenant leak, closed anyway), per-scope seqs (no cross-tenant volume), the discard purge, the permanent-deletion purge, and what a label reveals.
-- [ ] 7.9 Copy the accepted-limitations list below into the archived spec's design notes when archiving.
+- [x] 7.9 Copy the accepted-limitations list below into the archived spec's design notes when archiving. — Done: design.md "Accepted limitations (L1–L14)" holds the full list.
 
 ## 8. Gates
 
-- [ ] 8.1 `openspec-verifier` subagent against this change. Iterate to zero blocking gaps.
-- [ ] 8.2 Adversarial Codex pass (mandatory: the indexer pass, the write tools and silently wrong answers are all in scope). Frame "wrong" as an event lost behind a cursor, a cross-tenant line, a forged line, a pass or tool made to fail, or a misattributed write. Triage per the workflow file, two rounds by default.
+- [x] 8.1 `openspec-verifier` subagent against this change. Iterate to zero blocking gaps. — Result: 0 blocking, 0 major, 10 minor, all folded in (e1e2f97).
+- [x] 8.2 Adversarial Codex pass (mandatory: the indexer pass, the write tools and silently wrong answers are all in scope). Frame "wrong" as an event lost behind a cursor, a cross-tenant line, a forged line, a pass or tool made to fail, or a misattributed write. Triage per the workflow file, two rounds by default. — Result: round 1 FAIL (3 fixed, 2 declined as L11/L12); round 2 FAIL → its one new MAJOR declined as L14, and the 3 round-1 fixes VERIFIED.
 - [ ] 8.3 End-to-end against the live server after deploy: call `get_changes`, `get_recent(order_by="content_changed", since=…)`, `list_notes(since=…, until=…)` and one `edit_note`, then `get_changes(by="me")`. Name the tools called in the report.
 
 ## Accepted limitations
@@ -183,3 +183,4 @@
 - L11: An `ev:` cursor is a plain per-scope seq, not a signed token; a lower cursor from elsewhere is an earlier position in the caller's own feed, and only one above `last_seq` is refused.
 - L12: Near the 1,000-character `MAX_READ_RESPONSE_CHARS` floor, one event line with a very long escaped path can exceed the cap; the first event is always rendered so `next_since` advances.
 - L13: A file-only tool's post-publication append waits for a pool connection outside `lock_timeout`, the same exposure as `_log_usage`; the tool's result is unaffected.
+- L14: In a scope with no indexed notes, a markdown publication whose bytes are not UTF-8 and whose tool-side event append also failed is not rediscovered by the pass: `_collect_feed_events` returns before the not-indexable candidates when `locked` and `to_upsert` are both empty (indexer.py ~4304), so no `created reason=not_indexable` and no `reset` is written until the first indexable note. Declined 2026-10-30: the input needs a fresh scope whose first note is unreadable and a simultaneous append failure; the cost is one feed line for a file no agent can read; the file itself is untouched.

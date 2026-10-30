@@ -795,14 +795,40 @@ Five findings; three fixed, two declined after triage.
    admitted so the cursor advances; the overrun is bounded by the path cap
    and its escaping.
 
-## Accepted limitations (continued)
+## Codex implementation review, round 2 (2026-10-30)
 
-- L11: An `ev:` cursor is a plain per-scope seq, not a signed token. A lower
-  cursor taken elsewhere is simply an earlier position in the caller's own
-  feed; only one above `last_seq` is refused (Codex r1, finding 4).
-- L12: With `MAX_READ_RESPONSE_CHARS` near its 1,000-character floor, one
-  event line with a very long escaped path can exceed it: the first event is
-  always rendered so `next_since` advances (Codex r1, finding 5).
-- L13: A file-only tool's post-publication append waits for a pool
-  connection outside `lock_timeout` — the same exposure as `_log_usage`; the
-  tool's result is already decided and unaffected (verifier item 9).
+Run on eeb607a. Verdict FAIL, on one new finding, which the owner's triage
+declined.
+
+1. **VERIFIED**: round-1 finding 1. Age retention now deletes only the
+   expired prefix, ending just before the oldest unexpired event.
+2. **VERIFIED**: round-1 finding 2. `move_note`'s link rewrites stop when
+   the metadata and event transaction fails.
+3. **VERIFIED**: round-1 finding 3. A provenance discard drops the
+   previous root's `note_event_gaps` rows.
+4. **Declined (L14), MAJOR as rated by the reviewer.** A non-UTF-8
+   markdown publication in a scope with no indexed notes, whose tool-side
+   append also failed, is not rediscovered: `_collect_feed_events` returns
+   before the not-indexable candidates when `locked` and `to_upsert` are
+   both empty. Triage: the input needs a fresh scope whose first note is
+   unreadable plus a simultaneous append failure. The cost is one feed line
+   for a file no agent can read, and the file itself is untouched.
+
+## Accepted limitations (L1–L14)
+
+Copied here from tasks.md at archive (task 7.9).
+
+- L1: Changes made before migration 033 have no events, and the first pass after a restore or a discard is a baseline (`reset`), not a history.
+- L2: Edits outside MCP (Obsidian, sync clients, git, a shell) are `human/sync`. The index cannot tell a person from a sync client, or one device from another.
+- L3: `created` means first seen at this path. A rename the hash pairing cannot prove (a duplicate hash, or rename plus edit) is `deleted` + `created`. A note that becomes indexable, or re-enters after quarantine, is `created`.
+- L4: A pass that observes a tool's publication in the milliseconds before the tool's own event commits records an extra `human/sync` event. That is a duplicate, never a loss.
+- L5: Several edits inside one tick are one `modified` event, and an edit reverted before the pass is none. The feed reports the states the index observed.
+- L6: A failed event append never loses the change, but it can lose the attribution. `move_note`'s event is in its metadata transaction, so a failure leaves the row at the old path, and the pass records the move. A file-only tool's failure leaves the row's old state, and the next pass records the change. In both cases the event is `human/sync` instead of the agent's label. A failed pass append leaves a durable `note_event_gaps` row, which surfaces as a `gap` line. Nothing about feed completeness is held only in process memory.
+- L7: Every row the index drops is a `deleted` line with its reason (`removed`, `not_indexable`, `quarantined`), so the feed never omits a note leaving the index. It does not distinguish successive states of a note that stays unindexable: one `created`/`deleted reason=not_indexable` line, then nothing until it becomes indexable again. `content_changed_at` is lost on a restore (`notes_metadata` is schema-only in backups) and comes back as mtime.
+- L8: Feed history (events, seq counters, watermarks) is durable and restored with backups, but a restore rolls `last_seq` back to the dump. A cursor taken after the dump is then above `last_seq` and is refused, and the agent restarts from a datetime `since`.
+- L9: A datetime `since` is approximate (`occurred_at` is a transaction's start time). Only an `ev:` cursor is exact.
+- L10: A `move_note` of a note that was never indexed and whose bytes the tool did not read may be followed by an unsuppressed `created` from the pass (no hash to match).
+- L11: An `ev:` cursor is a plain per-scope seq, not a signed token; a lower cursor from elsewhere is an earlier position in the caller's own feed, and only one above `last_seq` is refused.
+- L12: Near the 1,000-character `MAX_READ_RESPONSE_CHARS` floor, one event line with a very long escaped path can exceed the cap; the first event is always rendered so `next_since` advances.
+- L13: A file-only tool's post-publication append waits for a pool connection outside `lock_timeout`, the same exposure as `_log_usage`; the tool's result is unaffected.
+- L14: In a scope with no indexed notes, a markdown publication whose bytes are not UTF-8 and whose tool-side event append also failed is not rediscovered by the pass: `_collect_feed_events` returns before the not-indexable candidates when `locked` and `to_upsert` are both empty (indexer.py ~4304), so no `created reason=not_indexable` and no `reset` is written until the first indexable note. Declined 2026-10-30: the input needs a fresh scope whose first note is unreadable and a simultaneous append failure; the cost is one feed line for a file no agent can read; the file itself is untouched.
