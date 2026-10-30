@@ -685,6 +685,11 @@ provenance)` as its first line. The fixture test asserts both values (D7).
   whether the data directory itself is a symlink. Declined: the directory is
   the operator's own `0700` directory, and a planted symlink there means the
   operator account is already compromised.
+- **L16. `score` trusts the field types of a complete manifest.** A
+  hand-edited `complete` manifest whose fields have the wrong types (for
+  example `selection.limit_queries` as the string `"5"`) fails with exit 1,
+  not 64. The manifest is operator-owned state in a `0700` directory that
+  only the harness writes.
 
 ## Decisions taken during implementation
 
@@ -825,8 +830,8 @@ sweep for new surfaces.
 
 Round 3 verified the round-2 fixes and swept for nothing new. It confirmed
 the generation/manifest atomicity fix and the provenance/attachability fix.
-It found one wording regression: the hybrid membership was named
-`keyword_or_semantic` and defined as OR, while the required scenario treats
+It found one wording regression: the former hybrid membership name (an OR
+reading) was defined as OR, while the required scenario treats
 loss of only the semantic constituent as corpus loss. It was fixed in
 0c09439 by renaming the membership `keyword_and_semantic`, defined as both
 constituents, and verified by grep and `openspec validate --strict` without
@@ -856,3 +861,30 @@ a fourth round.
 6. **`load_export` repaired undecodable bytes with U+FFFD** (fixed in
    e320738). Lines are decoded strictly, and an undecodable line counts as
    malformed.
+
+## Codex implementation review, round 2 (FAIL; five round-1 fixes verified)
+
+Round 2 verified the round-1 fixes for the manual-owner filter, the
+manifest-wide file check, the OAuth principal, strict decoding and the
+Python temp files. The Make recipe's `mktemp` change was judged NOT_FIXED
+only for want of a regression test. Findings:
+
+1. **A generation was reserved only after the replay engine opened** (MAJOR,
+   fixed in 2ce4c5c). An early database failure left the name free, and two
+   concurrent runs passed the existence check. `runs/<generation>/` is now
+   reserved with an exclusive `mkdir` before the running manifest is
+   published; a taken name is exit 64; the directory and a `_manifest.json`
+   copy survive every failure.
+2. **A hand-edited manifest with a string `limit_queries` exits 1, not 64**
+   (MAJOR per the reviewer). Declined after triage and recorded as L16: the
+   manifest is operator-owned state in a `0700` directory that only the
+   harness writes, and type-validating every field buys an exit-code
+   distinction on an implausible input.
+3. **No integration test plants a symlink at the export's temp path**
+   (MINOR). Declined: the `mktemp` recipe is verified by reading and by the
+   pg assertion that no `*.tmp` file remains, and the symlink threat is the
+   one L15 already places outside the threat model (the operator's own
+   `0700` directory).
+4. **design.md still named the obsolete hybrid membership identifier**
+   (MINOR, fixed). The round-3 history now describes it without the
+   literal name, so `git grep` finds it nowhere in the repository.
