@@ -57,7 +57,7 @@ Refs #350. Read `proposal.md`, `design.md` (D1–D11) and `specs/` before starti
 - [x] 6.5 Adversarial Codex (mandatory: a chunking/indexing-path change and a new read surface that agents act on). Frame "wrong" as a silently missing or phantom task, a task under the wrong path or tenant, a forged row, an unbounded response, or a pass that a task value can fail. Two rounds by default, with triage per the workflow.
 - [ ] 6.6 After deploy: `make db-check` (or `docker exec obsidian-mcp alembic check`) clean. End-to-end against the live server: call `list_tasks()`, `list_tasks(status="done", folder=…)`, `list_tasks(due_by=<today>)` and follow one `next`, plus `get_vault_guide`. Record which tools were called and that the not-yet-scanned count reached 0.
 - [ ] 6.7 Post-deploy chore (operator): drop the Grep advice from the vault's guide note and point it at list_tasks.
-- [ ] 6.8 Archive (`openspec archive list-tasks -y`) and docs as the last commits of the feature branch, one PR, `Closes #350`.
+- [x] 6.8 Archive (`openspec archive list-tasks -y`) and docs as the last commits of the feature branch, one PR, `Closes #350`.
 
 ## Accepted limitations (record in the archived spec, do not re-fix when re-reported)
 

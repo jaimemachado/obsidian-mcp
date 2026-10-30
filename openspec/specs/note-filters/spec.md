@@ -134,9 +134,9 @@ Calls that include the new `tags` or `frontmatter` parameters SHALL record them 
 
 ### Requirement: Read-path owner scoping is total
 
-The shared filter helper SHALL treat `user_id=None` as a scoping value, not as the absence of one: it SHALL append `notes_metadata.user_id IS NULL` when `user_id` is None and `notes_metadata.user_id = :uid` when it is an integer. Every index-backed read tool — `keyword_search`, `semantic_search`, `list_notes`, `get_recent`, `get_tags`, `get_backlinks`, `get_links`, `get_neighborhood`, `find_related`, and `find_orphans` — SHALL scope its owner predicate by this same total mapping, so a caller with no user identifier can never read rows owned by a named user.
+The shared filter helper SHALL treat `user_id=None` as a scoping value, not as the absence of one: it SHALL append `notes_metadata.user_id IS NULL` when `user_id` is None and `notes_metadata.user_id = :uid` when it is an integer. Every index-backed read tool — `keyword_search`, `semantic_search`, `list_notes`, `get_recent`, `get_tags`, `get_backlinks`, `get_links`, `get_neighborhood`, `find_related`, `find_orphans`, and `list_tasks` — SHALL scope its owner predicate by this same total mapping, so a caller with no user identifier can never read rows owned by a named user.
 
-For the graph tools the mapping SHALL be closed over joins: any query that resolves `note_links.source_note_id` or `target_note_id` to a `notes_metadata` row SHALL require that row to be inside the caller's owned set as part of the join condition (not as a post-filter that would drop dangling-link rows), and neighborhood and orphan computations SHALL NOT let an edge whose other endpoint is outside the owned set influence membership, distance, or orphan status.
+For the graph tools the mapping SHALL be closed over joins: any query that resolves `note_links.source_note_id` or `target_note_id` to a `notes_metadata` row SHALL require that row to be inside the caller's owned set as part of the join condition (not as a post-filter that would drop dangling-link rows), `list_tasks` SHALL resolve `note_tasks.note_id` to its `notes_metadata` row under the same mapping as part of the join, and neighborhood and orphan computations SHALL NOT let an edge whose other endpoint is outside the owned set influence membership, distance, or orphan status.
 
 #### Scenario: Ownerless read on a mixed database returns only NULL-owned rows
 
@@ -164,4 +164,9 @@ For the graph tools the mapping SHALL be closed over joins: any query that resol
 
 - **WHEN** a read tool runs with `user_id=7`
 - **THEN** the query SHALL apply `user_id = 7` exactly as before
+
+#### Scenario: list_tasks does not list another owner's tasks
+
+- **WHEN** a named user's notes hold open tasks and `list_tasks` runs with no user identifier
+- **THEN** none of those tasks, paths or headings SHALL appear in the result, and neither SHALL they be counted in its header
 
