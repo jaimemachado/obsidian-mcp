@@ -552,7 +552,7 @@ docker compose -f docker-compose.simple.yml exec postgres \
 ```
 
 You should see the tables: `api_keys`, `notes_metadata`,
-`note_embeddings`, `note_links`, `oauth_clients`,
+`note_embeddings`, `note_links`, `note_tasks`, `oauth_clients`,
 `oauth_codes`, `oauth_tokens`, `transfer_tokens`, `usage_logs`,
 `users`, plus `alembic_version`, all owned by `obsidian_mcp`, and
 `obsidian_mcp` listed with no attributes beyond login (in particular,
@@ -756,6 +756,24 @@ deployment; on a compose-file deployment the equivalents are plain
   `docker compose -f docker-compose.simple.yml exec obsidian-mcp alembic check`
   should print "No new upgrade operations detected."
 
+  **Upgrading across migration 032 (task listing, #350).** 032 adds the
+  `note_tasks` table and two `notes_metadata` bits; it writes no row. The
+  extraction version moves to 4, so the first pass after the upgrade
+  re-derives every note once (the startup full-hash pass) and stores its
+  checkbox tasks for `list_tasks`. Nothing is re-embedded: version 4
+  shares version 3's embedding cleaner. Until that pass finishes,
+  `list_tasks` counts the notes not yet scanned in its header and
+  `move_note(rewrite_links=True)` returns `index_not_ready`. `list_tasks`
+  joins the `scan` concurrency class, so `CLASS_MAPPING_VERSION` moves to
+  3 and starts a new readiness epoch: `make concurrency-report` evidence
+  from before the upgrade does not carry over. **Rollback is
+  roll-forward:** a bare redeploy of the previous image re-extracts every
+  note and, having no version-4 cleaner, clears every note's embedding
+  certification; its embed pass then re-chunks every note and reuses every
+  stored vector (#281), so no provider calls are made, while
+  `semantic_search` marks those notes stale until it catches up. Rolling
+  forward again is one more re-derive. No new setting.
+
   **Upgrading across migration 031 (keyword ranking, #344).** 031
   rewrites every keyword vector so a note's title and frontmatter
   `aliases` rank above its body; ranking is right the moment the new
@@ -795,9 +813,9 @@ deployment; on a compose-file deployment the equivalents are plain
   container — `make deploy` and `make status` fail if a mount at
   `/app/backups` exists — and `.env` should be `0600` (`make init` sets it).
 
-  **What a dump contains.** Of the seventeen tables, five are a cache of the
+  **What a dump contains.** Of the eighteen tables, six are a cache of the
   vault plus settings — `notes_metadata`, `note_embeddings`, `note_links`,
-  `indexer_runs`, `indexer_state` — and their rows are the bulk of every
+  `note_tasks`, `indexer_runs`, `indexer_state` — and their rows are the bulk of every
   dump (one 1024-dimension vector per chunk). `make db-backup` dumps their
   *schema only* (`pg_dump --exclude-table-data=<table>` for each), so a
   restore followed by `alembic check` is clean and the first indexer pass

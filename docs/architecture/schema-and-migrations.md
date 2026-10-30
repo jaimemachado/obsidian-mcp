@@ -628,6 +628,37 @@ impostor-column refusals, the downgrade stripping every head and keeping
 every body lexeme, and the foreign-column downgrade. `alembic check` is clean
 after each.
 
+## 032: `note_tasks` and `tasks_truncated` (#350)
+
+032 creates one derived table and two per-note bits, and writes no row.
+
+- **`note_tasks`**: one row per checkbox list item, keyed by `note_id`
+  (`notes_metadata.id`, `ON DELETE CASCADE`) with **no path and no owner** —
+  both come from the join, so no move writer has a second column to keep in
+  step and no task can be listed under another tenant. `UNIQUE (note_id, line)`
+  (one checkbox per line; it also catches a double insert), CHECKs on `state`
+  (`open`/`done`/`cancelled`) and `priority`, `ix_note_tasks_note` and
+  `ix_note_tasks_state_due`, `tags varchar(128)[]` with `tags_cut`, the table
+  comment marker `task rows derived per note (032_note_tasks)`.
+- **`notes_metadata.tasks_truncated`** and **`tasks_failed`**, both `BOOLEAN
+  NOT NULL DEFAULT false` (metadata-only ADD), each with its own marker:
+  the per-note cap bit (`links_truncated`'s lifecycle) and the isolated
+  task-derivation failure bit (never a quarantine).
+- **No backfill in SQL**: the rows need the bodies. Extraction version 4 makes
+  the first pass after deploy re-derive every note once, without re-embedding.
+- **Reconcile or refuse**, 028's shape for the table (columns, PK, defaults,
+  CHECKs, UNIQUE, FK, index set, marker — complete, not minimal) and 022's for
+  the columns, every pre-existing unit verified before anything is created;
+  `downgrade()` drops only marked units. The schema gate covers fresh upgrade,
+  stamp-back re-run, the cascade, and an impostor of each unit. `alembic check`
+  sees the table, the columns and their comments through the ORM mirror
+  (`NoteTask`, `_NOTE_TASKS_TABLE_MARKER`, `_TASKS_TRUNCATED_COLUMN_MARKER`,
+  `_TASKS_FAILED_COLUMN_MARKER`); it does not compare CHECK predicates, which
+  the gate asserts through the catalogue.
+- `note_tasks` is **derived** for backups (#348): schema-only in `make
+  db-backup` and the Kubernetes backup Job.
+- `change-feed` (#351) owns 033.
+
 ## The session TimeZone is UTC
 
 Every DateTime column is `timestamptz` and the application reasons in UTC
@@ -903,7 +934,7 @@ the backup stops being a backup.
 
 ### Derived vs durable tables (#348)
 
-Seventeen tables, two kinds. **Five are a cache of the vault plus
+Eighteen tables, two kinds. **Six are a cache of the vault plus
 settings** and are dumped schema-only by `make db-backup` and the Kubernetes
 backup Job (`pg_dump --exclude-table-data=<table>` for each; `BACKUP_FULL=1`
 dumps their rows too):
@@ -912,6 +943,7 @@ dumps their rows too):
 | --- | --- |
 | `notes_metadata` | the index pass (full-hash at startup; keyword vectors included) |
 | `note_links` | the index pass per note, and the one-shot backfill when empty |
+| `note_tasks` | the index pass per note, beside the link rebuild (#350); restored empty together with `notes_metadata`, so the first pass rebuilds both |
 | `note_embeddings` | the embed pass, which embeds every note without a current vector |
 | `indexer_runs` | nothing — display history the panel lists, read for no decision |
 | `indexer_state` | startup *adopts* the current fingerprints when absent; the rotation cursor restarts at the first tenant |

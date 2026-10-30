@@ -2,8 +2,8 @@
 # dump, verify, keep it private, prune, then record it in backups_log.
 #   * umask 077. The dump is the full text of every note plus every
 #     credential hash.
-#   * The five derived index tables (notes_metadata, note_embeddings,
-#     note_links, indexer_runs, indexer_state) are dumped schema-only: they
+#   * The six derived index tables (notes_metadata, note_embeddings,
+#     note_links, note_tasks, indexer_runs, indexer_state) are dumped schema-only: they
 #     are a cache of the vault that the indexer rebuilds after a restore,
 #     and their rows are the bulk of every dump. BACKUP_FULL=1 dumps them
 #     too (a second, weekly CronJob if restore time matters). Keep the list
@@ -56,7 +56,7 @@ data:
     # pass rebuilds the rows from the vault.
     exclude=()
     if [ "${BACKUP_FULL:-0}" = 0 ]; then
-      for t in notes_metadata note_embeddings note_links indexer_runs indexer_state; do
+      for t in notes_metadata note_embeddings note_links note_tasks indexer_runs indexer_state; do
         exclude+=("--exclude-table-data=$t")
       done
     fi

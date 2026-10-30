@@ -259,12 +259,12 @@ looks the way it does.
 
 ## What's in the box
 
-The server exposes 25 MCP tools across five families, plus the auth
+The server exposes 26 MCP tools across five families, plus the auth
 and ops layer around them.
 
 Every tool is published with a `title` and MCP `ToolAnnotations`, all
-four hints set explicitly: `readOnlyHint` on the fifteen tools that only
-read (search, read, list, graph, `check_upload`), `destructiveHint` on
+four hints set explicitly: `readOnlyHint` on the sixteen tools that only
+read (search, read, list, graph, `list_tasks`, `check_upload`), `destructiveHint` on
 the eight that can replace or remove something (`edit_note`,
 `move_note`, `delete_note`, `set_frontmatter`, `write_file`,
 `delete_file`, `import_from_url`, and `request_upload`, whose link can
@@ -295,6 +295,15 @@ the wire, so none is cut off by a client's description limit.
 - `get_recent(folder?, limit=20)`, recently changed, with each
   modification time in UTC (`YYYY-MM-DD HH:MM UTC`)
 - `get_tags(limit=50)`, tag and count
+- `list_tasks(folder?, status="open", due_by?, scheduled_by?, tags?, limit=100, cursor?)`,
+  checkbox tasks (`- [ ]`, `- [x]`, `- [-]`, `- [/]`, …) across the vault
+  from the index, never reading a note: one line per task with its path
+  and line, Tasks-plugin dates (📅 ⏳ 🛫 ✅), priority, the task's own
+  `#tags`, its heading path and its text. Ordered by due date (undated
+  last), paged with a `next` cursor; `due_by` / `scheduled_by` mean "on
+  or before". Tasks-plugin query blocks are not evaluated. The header
+  always counts notes not yet scanned for tasks and notes whose tasks
+  could not be indexed, so an empty list is never a silent "nothing open"
 - `get_vault_guide()`, the Obsidian primer plus this vault's
   `CLAUDE.md`, served live
 
@@ -906,8 +915,31 @@ naming conventions, and YAML schema before it writes anything.
 ## Upgrading
 
 Pull, then `make deploy` (or rebuild your compose stack); migrations
-run on start. Read this first when upgrading across the keyword-ranking
-release (migration 031, #344):
+run on start. Across the task-listing release (migration 032, #350):
+
+- **One full re-derive pass after the upgrade, and no re-embedding.**
+  The extraction version moves to 4, so the first pass re-parses every
+  note once and stores its checkbox tasks for the new `list_tasks` tool
+  — the same cost as the earlier extraction-version bumps. Version 4
+  shares version 3's embedding cleaner, so nothing is re-embedded and no
+  provider call is made. Until that pass finishes, `list_tasks` reports
+  the notes it has not scanned yet in its header, and
+  `move_note(rewrite_links=True)` refuses with `index_not_ready` as it
+  does after every bump.
+- **A new concurrency-readiness epoch.** `list_tasks` joins the `scan`
+  class, so `CLASS_MAPPING_VERSION` moves to 3 and
+  `make concurrency-report` evidence gathered before the upgrade does not
+  carry over.
+- **Rollback is roll-forward.** A bare redeploy of the previous image
+  re-extracts every note once, and because it has no version-4 cleaner it
+  also clears every note's embedding certification; the embed pass then
+  re-chunks every note and reuses every stored vector (no provider calls),
+  with `semantic_search` marking those notes stale until it catches up.
+  Rolling forward again is one more re-derive pass.
+- No new setting.
+
+Read this first when upgrading across the keyword-ranking release
+(migration 031, #344):
 
 - **Keyword ranking changes at once; snippets need one rebuild.**
   Migration 031 rewrites every keyword vector in place so titles and
@@ -1632,7 +1664,7 @@ adds a writer wait or drops a usage row because of its observed pressure.
 │ MCP clients  │   HTTP + Bearer key   │   FastAPI app        │
 │  Claude Desk │ ────────────────────▶ │  ┌────────────────┐  │
 │  Claude Code │                       │  │  MCP server    │  │
-│  n8n agents  │                       │  │  (25 tools)    │  │
+│  n8n agents  │                       │  │  (26 tools)    │  │
 │  OpenWebUI   │                       │  └─────┬──────────┘  │
 └──────────────┘                       │        ▼             │
                                        │  ┌────────────────┐  │

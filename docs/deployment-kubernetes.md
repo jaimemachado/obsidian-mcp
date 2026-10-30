@@ -674,6 +674,17 @@ The procedure:
    `kubectl -n obsidian-mcp exec deploy/obsidian-mcp -- alembic check` should print
    "No new upgrade operations detected."
 
+**Across migration 032 (task listing, #350)** there is no operator step.
+The first pass after the rollout re-derives every note once at extraction
+version 4 and stores its checkbox tasks; nothing is re-embedded. Until it
+finishes, `list_tasks` counts the notes not yet scanned in its header and
+`move_note(rewrite_links=True)` returns `index_not_ready`. `list_tasks` joins
+the `scan` concurrency class (`CLASS_MAPPING_VERSION` 3), which starts a new
+readiness epoch for `make concurrency-report`. Rolling the image back is not a
+clean rollback: the previous image re-extracts every note and clears every
+embedding certification, then re-chunks every note with full vector reuse and
+no provider calls; treat rollback as roll-forward.
+
 If a migration fails, the pod stays in `Init:Error` and the old version is
 already stopped. Either fix forward, or restore the backup and roll the image
 back. Alembic downgrades are not a supported rollback path.
@@ -771,8 +782,8 @@ Two things hold state: the **vault** and the **database**.
   clients and grants, users, usage history and quotas. A dump contains every
   note's text and every credential hash, so treat it as sensitive.
 
-  The index is five tables — `notes_metadata`, `note_embeddings`,
-  `note_links`, `indexer_runs`, `indexer_state` — and their rows are the bulk
+  The index is six tables — `notes_metadata`, `note_embeddings`,
+  `note_links`, `note_tasks`, `indexer_runs`, `indexer_state` — and their rows are the bulk
   of every dump. The backup Job dumps them **schema-only** by default
   (`--exclude-table-data=<table>` for each; the DDL, the `halfvec` index and
   `alembic_version` stay in the dump, so a restore followed by `alembic
@@ -793,11 +804,12 @@ file. **If your CronJob lives elsewhere** (an infra repository, a CNPG
 ```
 pg_dump --no-owner \
   --exclude-table-data=notes_metadata --exclude-table-data=note_embeddings \
-  --exclude-table-data=note_links --exclude-table-data=indexer_runs \
-  --exclude-table-data=indexer_state --dbname="$url"
+  --exclude-table-data=note_links --exclude-table-data=note_tasks \
+  --exclude-table-data=indexer_runs --exclude-table-data=indexer_state \
+  --dbname="$url"
 ```
 
-and drop the five flags for the weekly full dump. That table is
+and drop the six flags for the weekly full dump. That table is
 where the panel's Health page reads the last backup's age, so a dump taken by
 any other means leaves the page warning. The backup volume is mounted only by
 the backup Job, never by the app container. The Job uses only

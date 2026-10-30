@@ -1,7 +1,7 @@
 """`make db-backup` dumps the derived index tables schema-only (#348).
 
-Five tables are a cache of the vault plus settings: the index pass rewrites
-`notes_metadata` and `note_links`, the embed pass refills `note_embeddings`,
+Six tables are a cache of the vault plus settings: the index pass rewrites
+`notes_metadata`, `note_links` and `note_tasks`, the embed pass refills `note_embeddings`,
 `indexer_runs` is display history and `indexer_state`'s fingerprints are
 re-adopted at startup when absent. Their rows are the bulk of every dump, so
 `pg_dump` carries `--exclude-table-data` for each of them unless
@@ -31,6 +31,7 @@ DERIVED = {
     "notes_metadata",
     "note_embeddings",
     "note_links",
+    "note_tasks",
     "indexer_runs",
     "indexer_state",
 }

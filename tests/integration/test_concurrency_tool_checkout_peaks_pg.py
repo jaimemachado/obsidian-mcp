@@ -201,6 +201,7 @@ CALLS = [
     ('get_neighborhood', 'get_neighborhood_impl', lambda s: (('a.md',), {})),
     ('find_related', 'find_related_impl', lambda s: (('a.md',), {})),
     ('find_orphans', 'find_orphans_impl', lambda s: ((), {})),
+    ('list_tasks', 'list_tasks_impl', lambda s: ((), {})),  # #350
     ('create_note', 'create_note_impl', lambda s: (('new.md', 'first\n'), {})),
     ('edit_note', 'edit_note_impl', lambda s: (('new.md', 'second\n'), {})),
     ('set_frontmatter', 'set_frontmatter_impl',

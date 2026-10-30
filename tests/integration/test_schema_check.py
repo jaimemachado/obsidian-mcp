@@ -60,7 +60,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "031"
+HEAD_REVISION = "032"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -6719,7 +6719,7 @@ def test_031_adds_the_excerpt_column_and_re_heads_every_vector():
                  "VALUES (3, NULL, 'n.md', 'never vectorised', 'h')")
 
         _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
-        assert alembic_version(url) == HEAD_REVISION == "031"
+        assert alembic_version(url) == HEAD_REVISION
         assert column_state_029(url, "notes_metadata", "body_excerpt") == (
             "text", False, None, BODY_EXCERPT_MARKER_031,
         )
@@ -6746,7 +6746,6 @@ def test_031_chains_from_030():
     config = Config()
     config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_current_head() == HEAD_REVISION == "031"
     assert script.get_revision("031").down_revision == "030"
 
 
@@ -6888,3 +6887,263 @@ def test_downgrade_031_leaves_a_column_it_did_not_create():
         assert alembic_version(url) == "030"
         assert column_state_029(url, "notes_metadata", "body_excerpt") is not None
         assert a_lexemes(url, 1) == []
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 032 — note_tasks, notes_metadata.tasks_truncated / tasks_failed (#350)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# One derived table keyed by note id (FK, ON DELETE CASCADE), no path and no
+# owner, plus two NOT NULL DEFAULT false bits. Writes no row. Reconcile or
+# refuse, then mark-gated downgrade.
+
+NOTE_TASKS_MARKER_032 = "task rows derived per note (032_note_tasks)"
+TASKS_TRUNCATED_MARKER_032 = "task-extraction truncation marker (032_note_tasks)"
+TASKS_FAILED_MARKER_032 = "task-derivation failure marker (032_note_tasks)"
+
+
+def refuse_032(url, *, must_mention):
+    _harness.run_alembic(url, "stamp", "031", dimensions=DIM)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "032 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    assert alembic_version(url) == "031", "nothing should have been recorded"
+    return combined
+
+
+def insert_task_032(url, note_id, line, **extra):
+    sql(
+        url,
+        "INSERT INTO note_tasks (note_id, line, status_char, state, text) "
+        "VALUES ($1, $2, ' ', 'open', 't')",
+        note_id,
+        line,
+    )
+
+
+def test_032_creates_the_table_and_both_columns_on_a_fresh_db():
+    with throwaway_db("schema_032_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION == "032"
+        assert fetchval(
+            url, "SELECT obj_description('public.note_tasks'::regclass, 'pg_class')"
+        ) == NOTE_TASKS_MARKER_032
+        assert fetchval(url, "SELECT count(*) FROM note_tasks") == 0
+        assert column_state_029(url, "notes_metadata", "tasks_truncated") == (
+            "boolean", True, "false", TASKS_TRUNCATED_MARKER_032,
+        )
+        assert column_state_029(url, "notes_metadata", "tasks_failed") == (
+            "boolean", True, "false", TASKS_FAILED_MARKER_032,
+        )
+        assert column_state_029(url, "note_tasks", "tags") == (
+            "character varying(128)[]", False, None, None,
+        )
+        constraints = {
+            r["conname"]: r["def"]
+            for r in fetch(
+                url,
+                "SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint "
+                "WHERE conrelid = 'public.note_tasks'::regclass",
+            )
+        }
+        assert constraints["uq_note_tasks_note_id_line"] == "UNIQUE (note_id, line)"
+        assert "ck_note_tasks_state" in constraints
+        assert "ck_note_tasks_priority" in constraints
+        assert any(
+            d == "FOREIGN KEY (note_id) REFERENCES notes_metadata(id) ON DELETE CASCADE"
+            for d in constraints.values()
+        ), constraints
+        indexes = {
+            r["relname"]
+            for r in fetch(
+                url,
+                "SELECT ic.relname FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+                "WHERE i.indrelid = 'public.note_tasks'::regclass",
+            )
+        }
+        assert {"ix_note_tasks_note", "ix_note_tasks_state_due"} <= indexes
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_032_chains_from_031():
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config()
+    config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    assert script.get_current_head() == HEAD_REVISION == "032"
+    assert script.get_revision("032").down_revision == "031"
+
+
+def test_032_backfills_nothing_and_every_row_reads_false():
+    with throwaway_db("schema_032_backfill", revision="031") as url:
+        insert_stat_note(url, 1, "a.md", (1, 2, 3, 4))
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(url, "SELECT count(*) FROM note_tasks") == 0
+        assert fetchval(
+            url,
+            "SELECT count(*) FROM notes_metadata "
+            "WHERE NOT tasks_truncated AND NOT tasks_failed",
+        ) == 1
+
+
+def test_032_constraints_hold_and_the_cascade_deletes_tasks():
+    with throwaway_db("schema_032_enforced") as url:
+        insert_stat_note(url, 1, "a.md", (1, 2, 3, 4))
+        insert_task_032(url, 1, 3)
+        insert_task_032(url, 1, 4)
+        with pytest.raises(asyncpg.UniqueViolationError):
+            insert_task_032(url, 1, 3)
+        with pytest.raises(asyncpg.CheckViolationError):
+            sql(url, "INSERT INTO note_tasks (note_id, line, status_char, state, text) "
+                     "VALUES (1, 9, ' ', 'pending', 't')")
+        with pytest.raises(asyncpg.CheckViolationError):
+            sql(url, "INSERT INTO note_tasks (note_id, line, status_char, state, text, priority) "
+                     "VALUES (1, 9, ' ', 'open', 't', 'urgent')")
+        with pytest.raises(asyncpg.ForeignKeyViolationError):
+            insert_task_032(url, 99, 1)
+        sql(url, "DELETE FROM notes_metadata WHERE id = 1")
+        assert fetchval(url, "SELECT count(*) FROM note_tasks") == 0
+
+
+def test_032_stamp_back_rerun_keeps_rows_and_bits():
+    with throwaway_db("schema_032_rerun") as url:
+        insert_stat_note(url, 1, "a.md", (1, 2, 3, 4))
+        insert_task_032(url, 1, 3)
+        sql(url, "UPDATE notes_metadata SET tasks_truncated = true, tasks_failed = true")
+        _harness.run_alembic(url, "stamp", "031", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(url, "SELECT count(*) FROM note_tasks") == 1
+        assert fetchval(
+            url, "SELECT tasks_truncated AND tasks_failed FROM notes_metadata"
+        ) is True
+        assert_alembic_check_clean(url, DIM)
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        (
+            "unmarked_table",
+            ["COMMENT ON TABLE note_tasks IS NULL"],
+            "note_tasks already exists but it does not carry 032's comment marker",
+        ),
+        (
+            "impostor_state_check",
+            [
+                "ALTER TABLE note_tasks DROP CONSTRAINT ck_note_tasks_state",
+                "ALTER TABLE note_tasks ADD CONSTRAINT ck_note_tasks_state CHECK (true)",
+            ],
+            "not one of 032's closed-set predicates",
+        ),
+        (
+            "missing_check",
+            ["ALTER TABLE note_tasks DROP CONSTRAINT ck_note_tasks_priority"],
+            "missing the closed-set CHECK ck_note_tasks_priority",
+        ),
+        (
+            "missing_unique",
+            ["ALTER TABLE note_tasks DROP CONSTRAINT uq_note_tasks_note_id_line"],
+            "missing the constraint UNIQUE (note_id, line)",
+        ),
+        (
+            "non_cascading_fk",
+            [
+                "ALTER TABLE note_tasks DROP CONSTRAINT note_tasks_note_id_fkey",
+                "ALTER TABLE note_tasks ADD CONSTRAINT note_tasks_note_id_fkey "
+                "FOREIGN KEY (note_id) REFERENCES notes_metadata(id)",
+            ],
+            "unexpected FOREIGN KEY constraint",
+        ),
+        (
+            "extra_index",
+            ["CREATE INDEX squat ON note_tasks (line)"],
+            "unexpected index 'squat'",
+        ),
+        (
+            "missing_index",
+            ["DROP INDEX ix_note_tasks_state_due"],
+            "missing index ix_note_tasks_state_due",
+        ),
+        (
+            "wrong_default",
+            ["ALTER TABLE note_tasks ALTER COLUMN tags_cut SET DEFAULT true"],
+            "tags_cut default",
+        ),
+        (
+            "wrong_column_type",
+            ["ALTER TABLE note_tasks ALTER COLUMN heading_path TYPE varchar(512)"],
+            "its columns are",
+        ),
+        (
+            "truncated_wrong_type",
+            [
+                "ALTER TABLE notes_metadata DROP COLUMN tasks_truncated",
+                "ALTER TABLE notes_metadata ADD COLUMN tasks_truncated smallint "
+                "NOT NULL DEFAULT 0",
+            ],
+            "notes_metadata.tasks_truncated is smallint, not boolean",
+        ),
+        (
+            "failed_unmarked",
+            ["COMMENT ON COLUMN notes_metadata.tasks_failed IS NULL"],
+            "notes_metadata.tasks_failed does not carry 032's comment marker",
+        ),
+        (
+            "failed_nullable",
+            ["ALTER TABLE notes_metadata ALTER COLUMN tasks_failed DROP NOT NULL"],
+            "notes_metadata.tasks_failed is nullable",
+        ),
+    ],
+)
+def test_032_refuses_a_unit_of_another_shape(label, ddl, fragment):
+    with throwaway_db(f"schema_032_foreign_{label}") as url:
+        insert_stat_note(url, 1, "a.md", (1, 2, 3, 4))
+        insert_task_032(url, 1, 3)
+        for statement in ddl:
+            sql(url, statement)
+        refuse_032(url, must_mention=[fragment, "Nothing has been changed"])
+        # A refusal changes nothing.
+        assert fetchval(url, "SELECT count(*) FROM note_tasks") == 1
+
+
+def test_032_refuses_a_pre_existing_table_before_creating_a_column():
+    """An impostor table is refused before either column is added."""
+    with throwaway_db("schema_032_impostor_first", revision="031") as url:
+        sql(url, "CREATE TABLE note_tasks (id serial PRIMARY KEY)")
+        refuse_032(url, must_mention=["note_tasks already exists but"])
+        assert column_state_029(url, "notes_metadata", "tasks_truncated") is None
+        assert column_state_029(url, "notes_metadata", "tasks_failed") is None
+
+
+def test_downgrade_032_drops_the_marked_units_and_upgrade_rebuilds_them():
+    with throwaway_db("schema_032_downgrade") as url:
+        insert_stat_note(url, 1, "a.md", (1, 2, 3, 4))
+        insert_task_032(url, 1, 3)
+        _harness.run_alembic(url, "downgrade", "031", dimensions=DIM)
+        assert alembic_version(url) == "031"
+        assert fetchval(url, "SELECT to_regclass('public.note_tasks')") is None
+        assert column_state_029(url, "notes_metadata", "tasks_truncated") is None
+        assert column_state_029(url, "notes_metadata", "tasks_failed") is None
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(url, "SELECT count(*) FROM note_tasks") == 0
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_downgrade_032_leaves_units_it_did_not_create():
+    with throwaway_db("schema_032_downgrade_foreign") as url:
+        sql(url, "COMMENT ON TABLE note_tasks IS 'somebody else'")
+        sql(url, "COMMENT ON COLUMN notes_metadata.tasks_failed IS 'somebody else'")
+        result = _harness.run_alembic(url, "downgrade", "031", dimensions=DIM)
+        combined = result.stdout + result.stderr
+        assert "032 downgrade: leaving note_tasks in place" in combined
+        assert "032 downgrade: leaving notes_metadata.tasks_failed" in combined
+        assert alembic_version(url) == "031"
+        assert fetchval(url, "SELECT to_regclass('public.note_tasks')") is not None
+        assert column_state_029(url, "notes_metadata", "tasks_failed") is not None
+        assert column_state_029(url, "notes_metadata", "tasks_truncated") is None
