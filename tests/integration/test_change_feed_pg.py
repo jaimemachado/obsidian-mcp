@@ -812,3 +812,79 @@ async def test_hash_parity_with_the_stored_row(vault, sessionmaker):
             "SELECT content_hash FROM notes_metadata WHERE file_path = 'parity.md'"
         ))).scalar_one()
     assert stored == canonical_note_hash(data) != hashlib.sha256(data).hexdigest()
+
+
+running_as_root = hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+async def test_move_note_keeps_the_stamp_and_a_requarantined_note_reenters_at_mtime(
+    vault, sessionmaker,
+):
+    await baseline(vault, sessionmaker)
+    (vault / "keep.md").write_text("content\n")
+    await index_once()
+    before = await stamp(sessionmaker, "keep.md")
+    assert "Moved" in await tools.move_note_impl("keep.md", "kept.md")
+    await index_once()
+    assert await stamp(sessionmaker, "kept.md") == before
+
+    (vault / "poisoned.md").write_text("v1\n")
+    await index_once()
+    (vault / "poisoned.md").write_text("v2\n")
+    await _poison.poison(sessionmaker, "upsert", "poisoned.md", "22001")
+    await index_once()
+    assert await stamp(sessionmaker, "poisoned.md") is None  # quarantined: no row
+    await _poison.cure(sessionmaker)
+    (vault / "poisoned.md").write_text("v3, healthy\n")
+    old = datetime.datetime(2021, 6, 1, tzinfo=UTC).timestamp()
+    os.utime(vault / "poisoned.md", (old, old))
+    await index_once()
+    # It re-enters as a new row, stamped with the file's mtime.
+    assert await stamp(sessionmaker, "poisoned.md") == datetime.datetime(2021, 6, 1, tzinfo=UTC)
+
+
+@pytest.mark.skipif(running_as_root, reason="root ignores directory modes")
+async def test_rows_under_an_unlistable_directory_emit_nothing(vault, sessionmaker):
+    await baseline(vault, sessionmaker)
+    sub = vault / "locked"
+    sub.mkdir()
+    (sub / "inner.md").write_text("inside\n")
+    await index_once()
+    count = len(await feed(sessionmaker))
+    os.chmod(sub, 0)
+    try:
+        await index_once()
+    finally:
+        os.chmod(sub, 0o755)
+    assert len(await feed(sessionmaker)) == count
+    assert await stamp(sessionmaker, "locked/inner.md") is not None
+
+
+async def test_an_invalid_utf8_tool_write_whose_event_failed_is_rediscovered(
+    vault, sessionmaker, monkeypatch,
+):
+    import base64
+
+    await baseline(vault, sessionmaker)
+    (vault / "A.md").write_text("valid\n")
+    await index_once()
+    real = change_feed.append_events
+
+    async def broken(*_a, **_k):
+        raise RuntimeError("feed down")
+
+    monkeypatch.setattr(change_feed, "append_events", broken)
+    for name, overwrite in (("A.md", True), ("B.md", False)):
+        out = await tools.write_file_impl(
+            name, base64.b64encode(b"\xff\xfe not utf-8").decode(), overwrite=overwrite)
+        assert "MCP-REFUSAL" not in out, out
+    monkeypatch.setattr(change_feed, "append_events", real)
+    # A restart: nothing about the lost events is held in process memory.
+    indexer._last_full_hash.clear()
+    await index_once()
+    await index_once()
+    events = [(e.kind, e.path, e.reason, e.source) for e in await note_events(sessionmaker)]
+    assert events[1:] == [
+        ("deleted", "A.md", "not_indexable", "index"),
+        ("created", "B.md", "not_indexable", "index"),
+    ], events
