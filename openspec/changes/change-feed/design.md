@@ -557,12 +557,12 @@ docstrings say that "what changed" is `order_by="content_changed"` with
 `(time DESC, file_path ASC)` without losing ties. With 501 rows at one
 instant and the 500-row maximum page, an exclusive `until` skips the 501st
 and no page can reach it. So both tools take an opaque `cursor`, the
-keyset `(time, file_path)` of the last row of the previous page. **The codec is the one `list-tasks` specifies**, so the implementer
-shares it rather than writing a second one. The cursor is versioned
+keyset `(time, file_path)` of the last row of the previous page. **The envelope and owner discriminator are list-tasks' own** (`_b64url`,
+`_task_owner_discriminator`), so there is one codec, not two. The cursor is versioned
 base64url JSON `{v, o: order_by, t: time with microseconds, p: file_path, f:
 digest of (folder, tags, frontmatter, since, until), w: owner
 discriminator}`, where `w` is the first 16 hex of SHA-256 over
-`owner:<user_id>` (`owner:-` for the NULL scope). A cursor whose `o`, `f` or
+`owner:<user_id>` (`owner:null` for the NULL scope, as list-tasks computes it). A cursor whose `o`, `f` or
 `w` does not match the call is refused (`invalid_argument`). One user's
 cursor is therefore refused for another user even under identical filters.
 No owner id is rendered: `w` is a one-way digest, and the cursor stays

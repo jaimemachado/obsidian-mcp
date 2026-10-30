@@ -125,9 +125,9 @@ regenerated deliberately.
   feed tables classified as durable for backups.
 - `vault-guide`: the guide names `get_changes` and the cursor convention in
   neutral framing.
-- `mcp-request-routing`: the tool-metadata requirements cover 26 tools, add
-  `get_changes` to the read-only set, and regenerate the listing fixture for
-  this change's schema additions.
+- `mcp-request-routing`: the tool-metadata requirements cover 27 tools, add
+  `get_changes` to the read-only set, append it to the additions fixture and
+  record the two amended filter-tool schemas in an amendments fixture.
 
 ## Impact
 
