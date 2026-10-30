@@ -21,8 +21,8 @@
 
 ## 2. Chunker (offline, `src/services/embeddings.py`)
 
-- [ ] 2.1 Make the scanner shareable: expose `_scan_headings` and the one-terminator body-start step from `src/services/vault.py` under public names, or import them as they are. Do not copy them. The heading-path chain uses `_path_chain_match`'s depth rule.
-- [ ] 2.2 `ChunkSpec` (frozen: `text`, `heading_path: tuple[str, ...]`, `section_ordinal: int`) and `chunk_note_bounded(body, *, chunk_size, overlap, max_chunks) -> tuple[list[ChunkSpec], bool]`, per design D1:
+- [x] 2.1 Make the scanner shareable: expose `_scan_headings` and the one-terminator body-start step from `src/services/vault.py` under public names, or import them as they are. Do not copy them. The heading-path chain uses `_path_chain_match`'s depth rule.
+- [x] 2.2 `ChunkSpec` (frozen: `text`, `heading_path: tuple[str, ...]`, `section_ordinal: int`) and `chunk_note_bounded(body, *, chunk_size, overlap, max_chunks) -> tuple[list[ChunkSpec], bool]`, per design D1:
   - one `scan_fences(body, context=BODY)` call;
   - own-text spans up to the next heading of any depth;
   - section 0 for the preamble;
@@ -32,9 +32,9 @@
   - components cut at 200 characters with `…`;
   - the zero-chunk fallback to `chunk_text_bounded(clean_for_embedding(body))` as section 0.
   - It runs under `asyncio.to_thread` at its call sites, as today.
-- [ ] 2.3 `CHUNKING_VERSION = 1`, with a comment: NULL means pre-034, and any change to sectioning, the prefix or `embedding_input` bumps it (embedding-providers requirement).
-- [ ] 2.4 Point the exclusion sweep's zero-chunk probe (`indexer.py`, around the `chunk_text_bounded` call near the sweep) at `chunk_note_bounded`, so "no chunks" means the same thing in both places.
-- [ ] 2.5 Tests (`tests/test_heading_chunks.py`), one per spec scenario:
+- [x] 2.3 `CHUNKING_VERSION = 1`, with a comment: NULL means pre-034, and any change to sectioning, the prefix or `embedding_input` bumps it (embedding-providers requirement).
+- [x] 2.4 Point the exclusion sweep's zero-chunk probe (`indexer.py`, around the `chunk_text_bounded` call near the sweep) at `chunk_note_bounded`, so "no chunks" means the same thing in both places.
+- [x] 2.5 Tests (`tests/test_heading_chunks.py`), one per spec scenario:
   - a `#` line inside backtick, tilde, longer-closer, indented and unterminated column-zero fences;
   - inline code holding a heading;
   - LF, CRLF and lone-CR bodies;
@@ -43,24 +43,24 @@
   - no headings: byte-equal to `chunk_text_bounded(clean_for_embedding(body))` on a corpus of fixtures;
   - duplicate sibling headings (distinct ordinals), a heading text containing `/`, a 300-character heading;
   - the cap across sections, and exactly at the cap.
-- [ ] 2.6 Parity property test: for generated and fixture notes, every chunk with ordinal N ≥ 1 satisfies `extract_section_parts(body, f"#{N}")` succeeding and the chunk text being a substring of that section body with the whole-body fence spans removed. Every chunk with ordinal 0 is a substring of the preamble or of the fallback body. The concatenation of section cleaned texts equals `clean_for_embedding(body)` minus heading lines.
+- [x] 2.6 Parity property test: for generated and fixture notes, every chunk with ordinal N ≥ 1 satisfies `extract_section_parts(body, f"#{N}")` succeeding and the chunk text being a substring of that section body with the whole-body fence spans removed. Every chunk with ordinal 0 is a substring of the preamble or of the fallback body. The concatenation of section cleaned texts equals `clean_for_embedding(body)` minus heading lines.
 
 ## 3. Prefix and reuse
 
-- [ ] 3.1 `EMBED_PREFIX_MAX_CHARS = 300`; `build_embed_prefix(title, heading_path, tags) -> str` per design D2 (80-character component cut, outer-heading `…` replacement, all-or-nothing tags line, whitespace collapsed); `embedding_input(prefix, chunk) -> str` as the single formatter.
-- [ ] 3.2 `embed_note`:
+- [x] 3.1 `EMBED_PREFIX_MAX_CHARS = 300`; `build_embed_prefix(title, heading_path, tags) -> str` per design D2 (80-character component cut, outer-heading `…` replacement, all-or-nothing tags line, whitespace collapsed); `embedding_input(prefix, chunk) -> str` as the single formatter.
+- [x] 3.2 `embed_note`:
   - build the specs and prefixes;
   - send `embedding_input(...)` texts with `kind="document"`;
   - insert rows with `chunk_text`, `heading_path`, `section_ordinal` and `embed_prefix`;
   - read title and tags from the loaded `NoteMetadata`.
-- [ ] 3.3 `_lookup_reusable_vectors`:
+- [x] 3.3 `_lookup_reusable_vectors`:
   - also read `embed_prefix` and the note's `embedded_chunking_version`;
   - return nothing unless the fingerprint is `MATCH` and the version equals `CHUNKING_VERSION`;
   - key on `(embed_prefix, chunk_text)`, skipping NULL prefixes.
-- [ ] 3.4 `_generation_matches`: `reused_rows` maps row id to `(chunk_text, embed_prefix)`, and the under-lock recheck compares both.
-- [ ] 3.5 `certify_embedded`: the conditional UPDATE also sets `embedded_chunking_version = CHUNKING_VERSION` and `embedded_input_digest = <sha256 of the canonical JSON of the ordered provider inputs>` (`[]` for empty or excluded notes, so every caller passes the inputs or the empty list). `expire_on` expires all three attributes. The legacy uncertified path (tests only) sets them too.
-- [ ] 3.5a Invalidation on prefix inputs (design D3a): every index-pass statement that writes `title` or `tags` with an unchanged `content_hash` (extraction-version re-upsert, re-derive, the id-preserving move branch) also sets `embedded_content_hash = NULL` in the same statement when either is `IS DISTINCT FROM` the new value. Add the full-hash backstop: for each certified note read under the current chunking version, recompute the input digest and clear certification in the pass transaction on a mismatch or NULL. Tests: a tag-grammar bump with identical cleaned text invalidates; unchanged title and tags do not; the backstop catches a hand-corrupted digest; no provider call is made by the backstop.
-- [ ] 3.6 Tests:
+- [x] 3.4 `_generation_matches`: `reused_rows` maps row id to `(chunk_text, embed_prefix)`, and the under-lock recheck compares both.
+- [x] 3.5 `certify_embedded`: the conditional UPDATE also sets `embedded_chunking_version = CHUNKING_VERSION` and `embedded_input_digest = <sha256 of the canonical JSON of the ordered provider inputs>` (`[]` for empty or excluded notes, so every caller passes the inputs or the empty list). `expire_on` expires all three attributes. The legacy uncertified path (tests only) sets them too.
+- [x] 3.5a Invalidation on prefix inputs (design D3a): every index-pass statement that writes `title` or `tags` with an unchanged `content_hash` (extraction-version re-upsert, re-derive, the id-preserving move branch) also sets `embedded_content_hash = NULL` in the same statement when either is `IS DISTINCT FROM` the new value. Add the full-hash backstop: for each certified note read under the current chunking version, recompute the input digest and clear certification in the pass transaction on a mismatch or NULL. Tests: a tag-grammar bump with identical cleaned text invalidates; unchanged title and tags do not; the backstop catches a hand-corrupted digest; no provider call is made by the backstop.
+- [x] 3.6 Tests:
   - prefix shape, caps, tags omitted when long, title-only for section 0;
   - reuse hits on an append;
   - an inserted heading reuses vectors and re-inserts rows with new ordinals;
@@ -71,18 +71,18 @@
 
 ## 4. Provider `kind` and the query instruction
 
-- [ ] 4.1 `src/config.py`: `embedding_query_instruction: str = ""` with validation (at most 1,000 characters; reject NUL and C0 controls other than `\n` and `\t`). Settings tests for the default, a valid multi-line value, too long, and NUL/CR.
-- [ ] 4.2 `EmbeddingKind = Literal["query", "document"]`. Protocol `embed_one(text, *, kind)` and `embed_batch(texts, *, kind)`. `get_embedding(text, *, kind)` and `get_embeddings_batch(texts, *, kind)` are required keywords that apply the instruction for `query` only, in this one place. `OllamaProvider` and `OpenAIProvider` accept and ignore `kind`.
-- [ ] 4.3 Call sites:
+- [x] 4.1 `src/config.py`: `embedding_query_instruction: str = ""` with validation (at most 1,000 characters; reject NUL and C0 controls other than `\n` and `\t`). Settings tests for the default, a valid multi-line value, too long, and NUL/CR.
+- [x] 4.2 `EmbeddingKind = Literal["query", "document"]`. Protocol `embed_one(text, *, kind)` and `embed_batch(texts, *, kind)`. `get_embedding(text, *, kind)` and `get_embeddings_batch(texts, *, kind)` are required keywords that apply the instruction for `query` only, in this one place. `OllamaProvider` and `OpenAIProvider` accept and ignore `kind`.
+- [x] 4.3 Call sites:
   - `semantic_search` → `query`;
   - `prewarm_search_caches` (`indexer.py`) → `query`;
   - `src/main.py` warm-up: route it through `get_embedding(..., kind="query")`;
   - `embed_note` → `document`.
   - Grep `src/` and `scripts/` for any other call.
-- [ ] 4.4 AST sweep test: every call to `get_embedding`, `get_embeddings_batch`, `embed_one` or `embed_batch` under `src/` and `scripts/` passes `kind=`.
-- [ ] 4.5 `src/services/index_state.py`: `retrieval_fingerprint()`, canonical JSON of the embedding fingerprint fields plus `chunking_version` and `query_instruction_sha256` (16 hex digits, or null). Assert in a test that `embedding_fingerprint()` is byte-identical with and without an instruction set.
-- [ ] 4.6 Startup logs `Embedding retrieval: <retrieval fingerprint>` once, after the embedding transport line, and never the instruction text. Test that the log carries the digest and not the text.
-- [ ] 4.7 Tests:
+- [x] 4.4 AST sweep test: every call to `get_embedding`, `get_embeddings_batch`, `embed_one` or `embed_batch` under `src/` and `scripts/` passes `kind=`.
+- [x] 4.5 `src/services/index_state.py`: `retrieval_fingerprint()`, canonical JSON of the embedding fingerprint fields plus `chunking_version` and `query_instruction_sha256` (16 hex digits, or null). Assert in a test that `embedding_fingerprint()` is byte-identical with and without an instruction set.
+- [x] 4.6 Startup logs `Embedding retrieval: <retrieval fingerprint>` once, after the embedding transport line, and never the instruction text. Test that the log carries the digest and not the text.
+- [x] 4.7 Tests:
   - the default input equals the query;
   - an instructed query input is instruction + query;
   - documents never carry it (a mocked provider records inputs from one `semantic_search` and one `embed_note`);
@@ -90,20 +90,20 @@
 
 ## 5. Indexer: backlog, ordering, budget
 
-- [ ] 5.1 One predicate helper for "vectors not current", `embedded_content_hash IS DISTINCT FROM content_hash OR embedded_chunking_version IS DISTINCT FROM :cv`, and one for "not re-chunked" (`embedded_chunking_version IS DISTINCT FROM :cv`, used by the response marker and the health state). A test greps `src/` for any `embedded_chunking_version <` or `>` comparison. Both are shared by `_embed_vault_pinned`'s two SQL branches, `_vectors_not_current` in `src/control_panel/routes.py`, and anything else that counts pending. The helper is defined once (SQL text plus SQLAlchemy expression, with a test that they agree on a fixture table).
-- [ ] 5.2 Backlog `ORDER BY`: content-stale first, then version-only, each `modified_at DESC`. The selected row carries a `version_only` flag.
-- [ ] 5.3 `EmbedBudget`: applied to version-only notes whatever `_active_scope_count`. Multi-scope passes keep applying it to both segments. At-least-one-note and note-boundary rules unchanged. The stop logs one WARNING per user per pass and is not a failure.
-- [ ] 5.4 Confirm the excluded branch and the `CERTIFIED_EMPTY` branch stamp the version through `certify_embedded`, and that the exclusion sweep's "certification-current" selection is unchanged (design D4: version-only rows are owned by the backlog).
-- [ ] 5.5 Confirm nothing in `indexer_health` keys on backlog size or pass duration, and add a test: a 10-pass simulated transition with a healthy provider leaves `/health` `ok`.
+- [x] 5.1 One predicate helper for "vectors not current", `embedded_content_hash IS DISTINCT FROM content_hash OR embedded_chunking_version IS DISTINCT FROM :cv`, and one for "not re-chunked" (`embedded_chunking_version IS DISTINCT FROM :cv`, used by the response marker and the health state). A test greps `src/` for any `embedded_chunking_version <` or `>` comparison. Both are shared by `_embed_vault_pinned`'s two SQL branches, `_vectors_not_current` in `src/control_panel/routes.py`, and anything else that counts pending. The helper is defined once (SQL text plus SQLAlchemy expression, with a test that they agree on a fixture table).
+- [x] 5.2 Backlog `ORDER BY`: content-stale first, then version-only, each `modified_at DESC`. The selected row carries a `version_only` flag.
+- [x] 5.3 `EmbedBudget`: applied to version-only notes whatever `_active_scope_count`. Multi-scope passes keep applying it to both segments. At-least-one-note and note-boundary rules unchanged. The stop logs one WARNING per user per pass and is not a failure.
+- [x] 5.4 Confirm the excluded branch and the `CERTIFIED_EMPTY` branch stamp the version through `certify_embedded`, and that the exclusion sweep's "certification-current" selection is unchanged (design D4: version-only rows are owned by the backlog).
+- [x] 5.5 Confirm nothing in `indexer_health` keys on backlog size or pass duration, and add a test: a 10-pass simulated transition with a healthy provider leaves `/health` `ok`.
 
 ## 6. Rendering and docstrings
 
-- [ ] 6.1 `semantic_search` (service) and `find_related_stmt` project `NoteEmbedding.heading_path` and `section_ordinal`, never `embed_prefix` or `embedding`. The result dict gains `section`, which is `None` when the row is stale or its path is NULL. Update the projection-identity tests (`test_perf_projection_identity_pg.py`) to the new column list.
-- [ ] 6.2 One renderer helper, `_section_locator(section) -> str`: ` · § <change_feed.quote(joined)> (#N)`, ` · § (top of note)`, or `""`; the 160-character path cut keeps the inner components behind `…/`. Use it in `semantic_search_impl` and `find_related_impl` on the result line, after `_degradation_suffix`.
-- [ ] 6.3 The services pass the uncut `chunk_text` (remove `semantic_search`'s `[:500]`). Add one helper, `_preview_line(text, limit=200)`: collapse each maximal `str.isspace()` run to one space, trim, escape the remaining C0/DEL/C1 as `\uXXXX`, then cut. Both renderers use it and keep their own ellipsis. Tests: 600 leading spaces then `answer`; U+001B and U+0085; a forged row.
-- [ ] 6.3a Transition marker: in both tools, run the vector query and an owner-scoped `SELECT count(*) FROM notes_metadata WHERE <owner> AND embedded_chunking_version IS DISTINCT FROM :cv` (the one predicate of task 5.1; never `<`) in one `REPEATABLE READ, READ ONLY` transaction. While the count is above zero, emit `index_transition: N notes not yet re-chunked; cross-generation ranking is approximate, re-run after the backlog drains` directly after the header, on every query-running path including empty results. Render tests: present, absent at 0, owner-scoped, on the empty path.
-- [ ] 6.4 Docstrings in `src/mcp_server/server.py` for `semantic_search` and `find_related`: the locator's two forms, its omission on stale and pre-034 rows, and the `read_note(path, section="#N")` follow-up, in peer wording. Check the tools-list fixtures (`tools_list_schema_additions.json` and any description pins) and update only what the description change requires.
-- [ ] 6.5 Render tests:
+- [x] 6.1 `semantic_search` (service) and `find_related_stmt` project `NoteEmbedding.heading_path` and `section_ordinal`, never `embed_prefix` or `embedding`. The result dict gains `section`, which is `None` when the row is stale or its path is NULL. Update the projection-identity tests (`test_perf_projection_identity_pg.py`) to the new column list.
+- [x] 6.2 One renderer helper, `_section_locator(section) -> str`: ` · § <change_feed.quote(joined)> (#N)`, ` · § (top of note)`, or `""`; the 160-character path cut keeps the inner components behind `…/`. Use it in `semantic_search_impl` and `find_related_impl` on the result line, after `_degradation_suffix`.
+- [x] 6.3 The services pass the uncut `chunk_text` (remove `semantic_search`'s `[:500]`). Add one helper, `_preview_line(text, limit=200)`: collapse each maximal `str.isspace()` run to one space, trim, escape the remaining C0/DEL/C1 as `\uXXXX`, then cut. Both renderers use it and keep their own ellipsis. Tests: 600 leading spaces then `answer`; U+001B and U+0085; a forged row.
+- [x] 6.3a Transition marker: in both tools, run the vector query and an owner-scoped `SELECT count(*) FROM notes_metadata WHERE <owner> AND embedded_chunking_version IS DISTINCT FROM :cv` (the one predicate of task 5.1; never `<`) in one `REPEATABLE READ, READ ONLY` transaction. While the count is above zero, emit `index_transition: N notes not yet re-chunked; cross-generation ranking is approximate, re-run after the backlog drains` directly after the header, on every query-running path including empty results. Render tests: present, absent at 0, owner-scoped, on the empty path.
+- [x] 6.4 Docstrings in `src/mcp_server/server.py` for `semantic_search` and `find_related`: the locator's two forms, its omission on stale and pre-034 rows, and the `read_note(path, section="#N")` follow-up, in peer wording. Check the tools-list fixtures (`tools_list_schema_additions.json` and any description pins) and update only what the description change requires.
+- [x] 6.5 Render tests:
   - both locator forms;
   - none for stale or NULL;
   - forgery: a heading containing `"`, `(#2)`, ` ` and control characters stays in one literal, and the only unquoted `(#N)` is the stored one;

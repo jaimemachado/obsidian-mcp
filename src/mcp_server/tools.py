@@ -67,7 +67,12 @@ from src.mcp_server.read_result import (
 from src.models.db import UsageLog
 from src.services import concurrency, rate_limits, refusals, security_events, timing
 from src.services.tool_outcomes import BodyOutcome, body_refusal as _body_refusal
-from src.services.embeddings import semantic_search
+from src.services.embeddings import (
+    rechunk_pending_count,
+    section_of,
+    semantic_search,
+    transition_line,
+)
 from src.services.filters import apply_note_filters
 from src.services.quotas import admit as _admit_quota, quota_refusal_message
 from src.services.fts import aliases_text, rehead_tsvector_sql
@@ -685,6 +690,70 @@ def _degradation_suffix(stale: bool, truncated: bool) -> str:
     if truncated:
         parts.append(" — embedding_truncated: true")
     return "".join(parts)
+
+
+# ── The section locator and the one-line preview (#355, design D6) ────────
+
+#: A joined heading path longer than this keeps its innermost components.
+_LOCATOR_PATH_MAX_CHARS = 160
+
+
+def _section_locator(section: dict | None) -> str:
+    """` · § "Parent/Child" (#7)`, ` · § (top of note)`, or `""`.
+
+    The path is one JSON string literal (`change_feed.quote`: C0/C1 controls,
+    DEL, U+2028/U+2029 escaped), so note text cannot close the quote and the
+    `(#N)` after it is server-authored. Over 160 characters, outer components
+    are dropped behind `…/` so the innermost heading is kept. `None` — a stale
+    row or a pre-034 row — renders nothing, i.e. exactly the pre-#355 line.
+    """
+    if not section:
+        return ""
+    ordinal = int(section.get("ordinal") or 0)
+    if ordinal <= 0:
+        return " · § (top of note)"
+    parts = [str(p) for p in section.get("path") or []]
+    joined = "/".join(parts)
+    if len(joined) > _LOCATOR_PATH_MAX_CHARS:
+        kept = parts[:]
+        while len(kept) > 1 and len("…/" + "/".join(kept)) > _LOCATOR_PATH_MAX_CHARS:
+            kept.pop(0)
+        joined = "…/" + "/".join(kept)
+        if len(joined) > _LOCATOR_PATH_MAX_CHARS:
+            joined = joined[: _LOCATOR_PATH_MAX_CHARS - 1] + "…"
+    return f" · § {change_feed.quote(joined)} (#{ordinal})"
+
+
+_CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f]")
+
+
+def _preview_line(text: str, limit: int = 200) -> str:
+    """A stored chunk as one preview line, from the **uncut** text (D6).
+
+    1. every maximal run of `str.isspace()` characters (CR, LF, tab, U+2028,
+       U+2029 included) becomes one space;
+    2. leading and trailing spaces are trimmed;
+    3. the remaining C0 controls, DEL and C1 controls are escaped as `\\uXXXX`;
+    4. the result is cut at `limit` characters.
+
+    Not `_one_line`, which escapes nothing. The caller appends its ellipsis.
+    """
+    spaced = "".join(" " if ch.isspace() else ch for ch in (text or ""))
+    collapsed = re.sub(" +", " ", spaced).strip(" ")
+    escaped = _CONTROL_RE.sub(lambda m: f"\\u{ord(m.group(0)):04x}", collapsed)
+    return escaped[:limit]
+
+
+def _with_transition(lines: list[str], pending: int) -> list[str]:
+    """`lines` with the `index_transition:` line directly after the header
+    (the first line), or unchanged at zero (#355, D4)."""
+    line = transition_line(pending)
+    if line is None:
+        return lines
+    header = lines[0]
+    if header.endswith("\n"):
+        return [header[:-1], line + "\n", *lines[1:]]
+    return [header, line, *lines[1:]]
 
 
 def _stale_source_line(path: str) -> str:
@@ -2785,6 +2854,10 @@ async def semantic_search_impl(
                 frontmatter=frontmatter,
                 user_id=uid,
             )
+            # Same `REPEATABLE READ, READ ONLY` transaction as the vector
+            # query, so the transition count describes the index this page
+            # was ranked against (#355, D4). Owner-scoped.
+            pending = await rechunk_pending_count(session, uid)
     except refusals.ProviderInputTooLarge as exc:
         # The provider refused the input against **its own** token limit,
         # which `MAX_SEARCH_QUERY_CHARS` cannot promise: 8,192 characters of a
@@ -2825,7 +2898,10 @@ async def semantic_search_impl(
             marker=_PROVIDER_INPUT_REJECTED_MARKER,
         )
     if not results:
-        return f"No semantic results for '{query}' (embeddings may still be building)"
+        return "\n".join(_with_transition(
+            [f"No semantic results for '{query}' (embeddings may still be building)"],
+            pending,
+        ))
     stale_count = sum(1 for r in results if r["stale"])
     truncated_count = sum(1 for r in results if r["embedding_truncated"])
     lines = [
@@ -2838,6 +2914,7 @@ async def semantic_search_impl(
             f"- **{r['title']}** (`{r['path']}`){tags_str} — "
             f"similarity: {r['similarity']:.3f}"
             f"{_degradation_suffix(r['stale'], r['embedding_truncated'])}"
+            f"{_section_locator(r.get('section'))}"
         )
         # `chunk` is `None` for a stale row — the service withholds it there,
         # so no caller can obtain the superseded text at all. The substitute is
@@ -2848,9 +2925,9 @@ async def semantic_search_impl(
         if r["chunk"] is None:
             lines.append(f"  > {_STALE_PREVIEW_NOTICE}")
         else:
-            lines.append(f"  > {r['chunk'][:200]}...")
+            lines.append(f"  > {_preview_line(r['chunk'], 200)}...")
     lines.extend(_degradation_footer(stale_count, truncated_count))
-    return "\n".join(lines)
+    return "\n".join(_with_transition(lines, pending))
 
 
 @_tracked("get_vault_guide", [])
@@ -4079,6 +4156,9 @@ def find_related_stmt(source_id: int, avg_embedding: list[float], user_id: int |
         select(
             NoteEmbedding.note_id,
             NoteEmbedding.chunk_text,
+            # The locator (#355, D6). Never `embed_prefix`, never the vector.
+            NoteEmbedding.heading_path,
+            NoteEmbedding.section_ordinal,
             NoteMetadata.file_path,
             NoteMetadata.title,
             NoteMetadata.tags,
@@ -4124,6 +4204,11 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
     timing.record_source_path(path)
 
     async with async_session() as session:
+        # One `REPEATABLE READ, READ ONLY` snapshot for the source read, the
+        # vector query and the transition count (#355, D4). First statement.
+        await session.execute(
+            text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        )
         # `db_ms` covers every database phase of this tool, the source-chunk
         # fetch included — it is accumulated, so the early returns below still
         # report the work they actually did.
@@ -4207,6 +4292,8 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
         # dedupe, so the nearest chunk per note and the presented order are
         # both full precision.
         rows = sorted(rows, key=lambda r: r.distance)
+        # The owner-scoped transition count, in the vector query's snapshot.
+        pending = await rechunk_pending_count(session, uid)
 
     if not rows:
         # A **true** zero-result: the source exists, it is embedded, the exact
@@ -4223,7 +4310,7 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
         empty = [f"No related notes for `{path}`"]
         if source_stale:
             empty.append(_stale_source_line(path))
-        return "\n".join(empty)
+        return "\n".join(_with_transition(empty, pending))
 
     # Dedupe by note_id, keeping the nearest chunk — ranked by the
     # full-precision cosine distance the database selected (#283: the scan
@@ -4251,6 +4338,8 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
                 # remedy depends on which tool the caller happened to reach
                 # for.
                 "chunk": None if stale else r.chunk_text,
+                # Withheld on a stale row, absent on a pre-034 one (D6).
+                "section": section_of(r, stale),
                 "stale": stale,
                 # From the durable column, never inferred from the number of
                 # chunk rows: a capped note holds exactly the cap.
@@ -4275,14 +4364,14 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
             f"- **{r['title']}** (`{r['path']}`){tags_str} — "
             f"sim: {1 - r['distance']:.3f}"
             f"{_degradation_suffix(r['stale'], r['embedding_truncated'])}"
+            f"{_section_locator(r.get('section'))}"
         )
         if r["chunk"] is None:
             lines.append(f"  > {_STALE_PREVIEW_NOTICE}")
         else:
-            snippet = r["chunk"].replace("\n", " ")[:200]
-            lines.append(f"  > {snippet}…")
+            lines.append(f"  > {_preview_line(r['chunk'], 200)}…")
     lines.extend(_degradation_footer(stale_count, truncated_count))
-    return "\n".join(lines)
+    return "\n".join(_with_transition(lines, pending))
 
 
 @_tracked("find_orphans", ["folder", "limit"])
