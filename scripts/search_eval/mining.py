@@ -135,9 +135,22 @@ def parse_export_lines(lines: Iterable[str]) -> LoadResult:
     return LoadResult(rows=rows, malformed=malformed)
 
 
+def _decoded_lines(path: Path):
+    """Each line decoded strictly; an undecodable line is yielded as None."""
+    with open(path, "rb") as fh:
+        for raw in fh:
+            try:
+                yield raw.decode("utf-8")
+            except UnicodeDecodeError:
+                yield None
+
+
 def load_export(path: Path) -> LoadResult:
-    with open(path, encoding="utf-8", errors="replace") as fh:
-        return parse_export_lines(fh)
+    """Read the export. A line that is not valid UTF-8 is malformed, never repaired."""
+    lines = list(_decoded_lines(path))
+    result = parse_export_lines(line for line in lines if line is not None)
+    result.malformed += sum(1 for line in lines if line is None)
+    return result
 
 
 # --------------------------------------------------------------------------

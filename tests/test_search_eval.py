@@ -64,6 +64,7 @@ from scripts.search_eval.metrics import (
 )
 from scripts.search_eval.mining import (
     ManualError,
+    load_export,
     derive_provenance,
     is_truncated,
     mine,
@@ -248,6 +249,17 @@ def test_malformed_export_lines_are_counted_not_raised():
              json.dumps({**good, "created_at": True}), json.dumps({**good, "params": "s"}), ""]
     loaded = parse_export_lines(lines)
     assert len(loaded.rows) == 1 and loaded.malformed == 5
+
+
+def test_an_undecodable_line_is_malformed_not_repaired(tmp_path):
+    good = json.dumps(srch(0, "q", ["A.md"])).encode()
+    bad = json.dumps(srch(1, "PLACEHOLDER", ["B.md"])).encode().replace(b"PLACEHOLDER", b"caf\xe9")
+    f = tmp_path / "export.jsonl"
+    f.write_bytes(good + b"\n" + bad + b"\n")
+    loaded = load_export(f)
+    assert loaded.malformed == 1
+    assert [r["params"]["query"] for r in loaded.rows] == ["q"]
+    assert "\ufffd" not in json.dumps(loaded.rows)
 
 
 def test_bad_shapes_are_excluded_with_a_reason():
