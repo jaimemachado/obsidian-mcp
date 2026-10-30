@@ -236,9 +236,13 @@
 
 ## 8. Gates and follow-up
 
-- [ ] 8.1 Codex spec review. Round 1 found seven issues. Round 2 verified six of the round-1 fixes; the seventh, atomicity, was not fixed, and round 2 raised two new MAJORs. All of these are folded into the design ("Codex spec review, round 1" / "round 2"). Before implementation, run round 3 as verification of the round-2 folds only. Do not sweep for new surfaces.
-- [ ] 8.2 After implementation, run the `openspec-verifier` subagent against the spec and `openspec validate search-eval-harness --strict`, and iterate until there are zero blocking gaps.
-- [ ] 8.3 Run adversarial Codex rounds on the implementation, focused on:
+- [x] 8.1 Codex spec review. Round 1 found seven issues. Round 2 verified six of the round-1 fixes; the seventh, atomicity, was not fixed, and round 2 raised two new MAJORs. All of these are folded into the design ("Codex spec review, round 1" / "round 2"). Before implementation, run round 3 as verification of the round-2 folds only. Do not sweep for new surfaces.
+
+  Done: three rounds; the round-3 wording regression was fixed in 0c09439.
+- [x] 8.2 After implementation, run the `openspec-verifier` subagent against the spec and `openspec validate search-eval-harness --strict`, and iterate until there are zero blocking gaps.
+
+  Done: one BLOCKER and one MAJOR, fixed at 97c6805.
+- [x] 8.3 Run adversarial Codex rounds on the implementation, focused on:
   - silently wrong judgments: mis-credited reads, cross-principal or cross-owner leakage, truncation;
   - corpus loss being masked as drift;
   - the metric formulas and their edge cases;
@@ -246,5 +250,7 @@
   - the report leaking query text or paths.
 
   Run two rounds by default, triaged per the workflow, and list the declined findings in design.md.
+
+  Done: round 1 FAIL, round 2 FAIL, round 3 PASS; declined findings are in design.md.
 - [ ] 8.4 Owner step: the first real run. Follow the DEPLOYMENT.md path with `USER_ID=<owner>`, against a restored `BACKUP_FULL=1` copy, with `ARMS="keyword semantic" BASELINE=keyword`. Post the attachable `report.json` on #356 (it carries no query text and no paths) as the incumbent baseline for #354, #355 and #367. Re-check the defaults against the observed yield, per L7a and E3: `--min-queries` 50, the 90-day export and the 120 s pairing window. A change to any default is its own small PR.
 - [ ] 8.5 After the gates pass, archive with `openspec archive search-eval-harness -y` as the last commit of the feature branch. The PR body says `Closes #356`.

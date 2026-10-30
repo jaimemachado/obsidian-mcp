@@ -888,3 +888,9 @@ only for want of a regression test. Findings:
 4. **design.md still named the obsolete hybrid membership identifier**
    (MINOR, fixed). The round-3 history now describes it without the
    literal name, so `git grep` finds it nowhere in the repository.
+
+## Codex implementation review, round 3 (verification only; PASS)
+
+Round 3 verified the four round-2 items (the atomic generation reservation,
+L16, the declined temp-symlink test and the removed obsolete identifier):
+four VERIFIED, no findings.
