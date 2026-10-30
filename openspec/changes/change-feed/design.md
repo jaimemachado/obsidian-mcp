@@ -703,3 +703,46 @@ All four go in README and `.env.example` (public-repo rule).
    MCP move is the latest event at both endpoints (D3).
 4. MAJOR: the note-filters cursor was not owner-bound. It now carries the
    owner discriminator `w`, with list-tasks' codec (D8).
+
+## Implementation notes (2026-10-29)
+
+Readings the implementation had to choose, recorded so the verifier and the
+adversarial pass judge them, not discover them:
+
+1. **Indexes.** `(user_id, path, seq)` and `(user_id, from_path, seq)` are
+   plain ascending b-trees (scanned backwards for `ORDER BY seq DESC`); the
+   `from_path` one is not partial. Same plans, and nothing Alembic compares
+   oddly. `note_events.id` is `bigserial` rather than `GENERATED ALWAYS AS
+   IDENTITY` (equivalent; never rendered or accepted). `note_event_scopes` has
+   a surrogate `id` primary key beside its `user_id` unique.
+2. **The principal CHECK** is `(principal_kind IS NULL) = (principal_ref IS
+   NULL)` plus "an `index` row has no actor, principal or tool". An `mcp` row
+   may lack a principal: `current_principal` is `None` for the exempt
+   in-process caller, and refusing to record that call would lose an event.
+   It renders `by agent via <tool>`.
+3. **Baseline.** The `reset` is written only when the empty-scope pass writes
+   rows, so an empty vault's every tick records nothing; a baseline `reset`
+   directly after a discard's own `reset` is dropped under the lock.
+4. **Not-indexable creations** are emitted only for a *content* reason
+   (bytes not UTF-8). A path not indexable by its *name* cannot be stored in
+   a `varchar(1024)` UTF-8 row either. A quarantined path with no row
+   produces no event (the "Poison restart" scenario's "none for the
+   quarantined note"); one with a row is `deleted reason=quarantined`.
+5. **A tool deletion carries `reason=removed`**, so the pass's own prune
+   (`removed`) is suppressed by the "same reason" rule.
+6. **The note cursor codec lives in `src/mcp_server/tools.py`** beside the
+   task codec, sharing its `_b64url` envelope and `_task_owner_discriminator`
+   (which hashes `owner:null` for the NULL scope, so the delta now says
+   `owner:null`); its payload keys are `{v, o, t, p, f, w}`. The bounds
+   parser, rendering and appends are in `src/services/change_feed.py`.
+7. **`get_changes` is a `scan`-class tool** (`CLASS_MAPPING_VERSION` 4): a
+   folder or `by` filter can walk up to the per-scope cap.
+8. **A root mismatch inside `move_note`'s transaction** writes no event and
+   still commits the metadata update (the move happened; the reassignment
+   check is about the feed only).
+9. **`gap` lines are `source='index'`** whoever's append consumed the gap
+   rows: they are the server's statement about completeness, never a caller's.
+10. **`delete_file` records nothing**: it refuses every `.md` path.
+11. **The NUL transfer-upload scenario** is pinned through the route's own
+    pieces (the streaming `CanonicalNoteHasher` and `record_tool_events` with
+    the minting attribution) rather than an HTTP redemption.

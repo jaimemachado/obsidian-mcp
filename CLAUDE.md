@@ -432,11 +432,41 @@ update it in the same change.** What stays here is the short list:
   even at zero; its cursor carries an owner discriminator and a filters
   digest, never an id. See [indexing and embeddings](docs/architecture/indexing-and-embeddings.md)
   and [vault tools](docs/architecture/vault-tools.md).
+- **The change feed is `note_events`, written at the moment the server
+  knows** (#351, migration 033). Tools write attributed events (actor label,
+  exact principal, tool) after their confirmed publication; the index pass
+  writes only what it discovers, unattributed (`human/sync`), as its
+  attempt's **final statement**, and suppresses its own line when the latest
+  MCP event at the path already says the same (same canonical hash, same
+  delete reason, or the same move latest at *both* endpoints). Every insert
+  goes through `change_feed.append_events`, which assigns a **per-scope
+  `seq` under the scope's two-key advisory lock held to commit** — so an
+  `ev:<seq>` cursor is exact (nothing committed later can sit at or below a
+  returned `next_since`) and reveals no other tenant's volume; the feed lock
+  is the last lock a transaction takes. **No foreign keys** on the three
+  feed tables (an FK to `users` reopens the permanent-deletion deadlock);
+  `delete_user` purges the scope explicitly, feed lock last. `move_note`'s
+  event is in its metadata transaction (all or nothing; a failure leaves the
+  move for the pass to record `human/sync`); file-only tools append after
+  publishing, bound to the root they ran under (re-checked under the lock,
+  `change_feed_root_changed`), and never change a tool's result. One
+  canonical note hash (`src/services/note_hash.py`) serves the indexer and
+  every event. A first pass over an empty scope is one `reset`, a provenance
+  discard purges the scope and appends `reset`, a pass itemises at most
+  `CHANGE_FEED_MAX_EVENTS_PER_PASS` and a failed pass append leaves a durable
+  `note_event_gaps` row (a `gap` line later) — the feed never fails a pass.
+  Retention (age, per-scope cap that always applies, newest kept, watermark
+  for `history_truncated`) runs in the tick's `finally`.
+  `notes_metadata.content_changed_at` moves **only** in the upsert, only on a
+  hash change (`now()`, not mtime); `get_recent` / `list_notes` gain
+  `since`/`until`/`order_by`/`cursor` with keyset paging, and a call using
+  none of them is byte-identical. See
+  [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
 - `MCP_SANDBOX_MODE=true` is a registry-eval-only switch: lifespan skips `_check_embedding_dim` and the indexer, and `APIKeyMiddleware` bypasses auth on `/mcp/*`. Lets Glama's sandbox build the image and validate MCP introspection without external deps. Never enable in production — tools register but cannot run.
 
 ## MCP tools
 
-26 tools, all registered in `src/mcp_server/server.py` and all wrapped by
+27 tools, all registered in `src/mcp_server/server.py` and all wrapped by
 `_tracked`, which resolves the caller's vault root *before* the tool body runs
 — that decorator is the whole enforcement of "this user has no vault"
 ([vault roots and tenancy](docs/architecture/vault-roots-and-tenancy.md)).
@@ -446,8 +476,9 @@ registration without them, on a description over 4,000 characters, and on a
 destructive set that drifts from the write bucket.
 
 **Search and read** — `keyword_search`, `semantic_search`, `read_note`,
-`list_notes`, `get_tags`, `get_recent`, `get_vault_guide`, and `list_tasks`
-(see **Tasks** below).
+`list_notes`, `get_tags`, `get_recent`, `get_vault_guide`, `get_changes`
+(the change feed, after an `ev:<seq>` cursor or a UTC date; `by` =
+`any | me | agents | human`), and `list_tasks` (see **Tasks** below).
 
 **Graph**
 - `get_backlinks(path, limit)` — notes that link TO `path` (resolved links only).
@@ -470,8 +501,10 @@ indexing.
 
 **Tasks** — `list_tasks(folder?, status="open", due_by?, scheduled_by?,
 tags?, limit=100, cursor?)`: checkbox tasks from `note_tasks`, never a file;
-registered last, so the first 25 `tools/list` entries keep the 5a391ca
-fixture's order (the rest are in `tools_list_schema_additions.json`).
+registered after the first 25 (then `get_changes`), so those keep the 5a391ca
+fixture's order (the rest are in `tools_list_schema_additions.json`; the two
+deliberately amended filter-tool schemas are in
+`tools_list_schema_amendments.json`).
 
 **Transfer** — `request_upload`, `check_upload`, `request_download`,
 `import_from_url`, plus the public `/transfer/*` routes. A capability pins

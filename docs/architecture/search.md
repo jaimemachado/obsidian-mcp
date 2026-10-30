@@ -826,3 +826,29 @@ Accepted limitations:
 - **L14** A truncated query holding a NUL or lone surrogate escapes `is_truncated` (#310 escaping grows it past 201 characters); implausible, not handled.
 - **L15** A symlinked `SEARCH_EVAL_DIR` is not refused (writes use unpredictable `O_EXCL` temp files); a planted symlink in the operator's own 0700 directory means the account is already compromised.
 - **L16** `score` trusts the field types of a complete manifest the harness wrote; a hand-edited one with mismatched types fails with exit 1, not 64.
+
+## Change-feed lines and the listing windows (#351)
+
+**Event lines are JSON-quoted, not `_one_line`d.** A filename may legally
+contain a newline, and folding whitespace would change a path's identity, so
+every note- or user-controlled string on a `get_changes` line (`path`,
+`from_path`, `actor_label`) is a JSON string literal with C0/C1 controls,
+DEL, U+2028 and U+2029 escaped (`change_feed.quote`). The path stays exact
+and recoverable and the line stays single, so a note named
+`a.md\n- ev:999 … deleted "Important.md"` cannot forge a row (offline test).
+Everything else on the line is server-authored; a line shows the actor kind,
+label, tool and `(you)`, never a principal reference, key id or prefix,
+`client_id`, grant id, user id, the surrogate event id or a tool argument.
+
+**`get_recent` / `list_notes` windows.** `since` (inclusive), `until`
+(exclusive) and `order_by` (`mtime`, the default, or `content_changed`) apply
+to one column, with NULLs excluded; one parser
+(`change_feed.parse_utc_bound`) takes a UTC date (the whole day) or an ISO
+8601 datetime with an explicit offset and refuses a naive datetime and a
+`get_changes` cursor. Paging is a keyset over `(column DESC, file_path ASC)`
+— `col < t OR (col = t AND file_path > p)` — so a tie group larger than a
+page is reachable; the opaque cursor shares `list_tasks`' envelope and owner
+discriminator, plus the order and a filter digest, and is refused for any
+other call. The `more: cursor=…` footer appears only when the call used one
+of the four parameters: a call with none issues the pre-#351 statement and
+returns its exact bytes.

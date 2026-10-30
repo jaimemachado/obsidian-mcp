@@ -966,3 +966,34 @@ vault, and a cursor survives a restore only if events and counters return
 together). `tests/test_backup_derived_tables.py` pins both lists against
 `src/models/db.py`; a new table fails it until classified. The restore
 runbook is in `DEPLOYMENT.md` (compose) and `docs/deployment-kubernetes.md`.
+
+## 033: `content_changed_at` and the change-feed tables (#351)
+
+033 adds `notes_metadata.content_changed_at` (nullable, backfilled with
+`COALESCE(modified_at, indexed_at)`, then `NOT NULL DEFAULT now()`, marked)
+and three marked tables: `note_events` (bigserial surrogate `id`, plain
+`user_id`, per-scope `seq` with `UNIQUE (user_id, seq) NULLS NOT DISTINCT`,
+the kind/source/reason/path/principal CHECKs), `note_event_scopes`
+(`user_id` unique `NULLS NOT DISTINCT`, `last_seq`, the retention watermark
+`pruned_through_seq` / `pruned_at`) and `note_event_gaps`.
+
+**No foreign key on any of them.** An FK from an event to `users` would take
+`FOR KEY SHARE` on the `users` row *after* the index pass holds
+`notes_metadata` row locks, while a permanent user deletion takes the `users`
+row first and then cascades into those rows — the cycle the indexer already
+documents (`ProvenanceLockUnavailable`). And an event must outlive its
+`notes_metadata` row. Cleanup is explicit: `delete_user` purges the scope
+under the feed lock taken last, and retention removes rows of user ids that
+no longer exist. Alembic compares neither CHECK predicates, `NULLS NOT
+DISTINCT` nor the absence of an FK, so the schema gate asserts all three
+through `pg_constraint`.
+
+The re-run reconciles rather than adopts: a pre-existing table is compared
+with a TEMP twin built from the very DDL the revision would run (columns,
+every constraint definition, index columns, the marker), and anything else is
+refused by name before anything is created; `downgrade()` drops only marked
+units. The three tables are **durable** for backups (above): history,
+sequence counters and watermarks cannot be rebuilt from the vault, and a
+cursor stays valid across a restore only if events and counters come back
+together (L8: a restore rolls `last_seq` back, so a later cursor is refused
+and the agent restarts from a date).

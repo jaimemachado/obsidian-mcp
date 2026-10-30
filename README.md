@@ -259,12 +259,12 @@ looks the way it does.
 
 ## What's in the box
 
-The server exposes 26 MCP tools across five families, plus the auth
+The server exposes 27 MCP tools across five families, plus the auth
 and ops layer around them.
 
 Every tool is published with a `title` and MCP `ToolAnnotations`, all
-four hints set explicitly: `readOnlyHint` on the sixteen tools that only
-read (search, read, list, graph, `list_tasks`, `check_upload`), `destructiveHint` on
+four hints set explicitly: `readOnlyHint` on the seventeen tools that only
+read (search, read, list, graph, `list_tasks`, `get_changes`, `check_upload`), `destructiveHint` on
 the eight that can replace or remove something (`edit_note`,
 `move_note`, `delete_note`, `set_frontmatter`, `write_file`,
 `delete_file`, `import_from_url`, and `request_upload`, whose link can
@@ -291,9 +291,26 @@ the wire, so none is cut off by a client's description limit.
   [Full-text search language(s)](#full-text-search-languages))
 - `semantic_search(query, folder?, tags?, frontmatter?, limit=15)`,
   vector similarity via pgvector, one preview chunk per note
-- `list_notes(folder?, limit=50)`, sorted by modified time
-- `get_recent(folder?, limit=20)`, recently changed, with each
-  modification time in UTC (`YYYY-MM-DD HH:MM UTC`)
+- `list_notes(folder?, limit=50, since?, until?, order_by?, cursor?)`,
+  sorted by modified time
+- `get_recent(folder?, limit=20, since?, until?, order_by?, cursor?)`,
+  recently changed, with each modification time in UTC
+  (`YYYY-MM-DD HH:MM UTC`). On both, `order_by="content_changed"` with
+  `since` lists notes whose *content* changed (a touch or a re-sync that
+  keeps the bytes does not count); `since` is inclusive and `until`
+  exclusive, each a UTC date (`YYYY-MM-DD`, the whole day) or an ISO 8601
+  datetime with an explicit offset. Any of the four switches to keyset
+  paging with a `more: cursor=…` footer; a call with none of them is
+  unchanged
+- `get_changes(since, folder?, kinds?, by="any", limit=50)`, the change
+  feed: one line per note created, modified, moved or deleted after a
+  cursor, oldest first, each attributed to the API key or OAuth client
+  that made it (`(you)` for your own credential) or `human/sync` for an
+  edit the index discovered (Obsidian, a sync client, git). It returns
+  `next_since`, an exact `ev:<n>` cursor an agent stores in its own notes
+  for the next session; `by` is `any | me | agents | human`. Deletions say
+  why (`removed`, `not_indexable`, `quarantined`); `gap` and `reset` lines
+  say when the view is incomplete
 - `get_tags(limit=50)`, tag and count
 - `list_tasks(folder?, status="open", due_by?, scheduled_by?, tags?, limit=100, cursor?)`,
   checkbox tasks (`- [ ]`, `- [x]`, `- [-]`, `- [/]`, …) across the vault
@@ -919,7 +936,31 @@ naming conventions, and YAML schema before it writes anything.
 ## Upgrading
 
 Pull, then `make deploy` (or rebuild your compose stack); migrations
-run on start. Across the task-listing release (migration 032, #350):
+run on start. Across the change-feed release (migration 033, #351):
+
+- **One migration, no re-derive.** 033 adds
+  `notes_metadata.content_changed_at` (backfilled from each note's
+  modification time) and three change-feed tables. Nothing is re-parsed
+  or re-embedded. The feed starts with the first pass after the upgrade;
+  nothing before 033 has events.
+- **The feed tables are durable.** `make db-backup` and the Kubernetes
+  backup Job dump their rows (history, cursors and retention watermarks
+  cannot be rebuilt from the vault). A restore rolls the feed back to the
+  dump, so a cursor taken after it is refused and the agent restarts from
+  a date.
+- **A new concurrency-readiness epoch.** `get_changes` joins the `scan`
+  class, so `CLASS_MAPPING_VERSION` moves to 4 and `make
+  concurrency-report` evidence gathered before the upgrade does not carry
+  over.
+- **Four new settings**, all with working defaults:
+  `CHANGE_FEED_RETENTION_DAYS`, `CHANGE_FEED_MAX_EVENTS_PER_SCOPE`,
+  `CHANGE_FEED_MAX_EVENTS_PER_PASS`, `CHANGE_FEED_LOCK_TIMEOUT_MS` (see
+  [Configuration](#configuration)).
+- **Rollback**: the previous image neither reads nor writes any of these
+  objects; `alembic downgrade 032` drops them and loses only the feed's
+  history.
+
+Across the task-listing release (migration 032, #350):
 
 - **One full re-derive pass after the upgrade, and no re-embedding.**
   The extraction version moves to 4, so the first pass re-parses every
@@ -1193,6 +1234,10 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `VAULT_PATH` | `/obsidian` | In-container vault mount |
 | `SECRET_KEY` | — | itsdangerous signer key |
 | `INDEX_INTERVAL_SECONDS` | `300` | Periodic reindex cadence |
+| `CHANGE_FEED_RETENTION_DAYS` | `90` | How long `get_changes` history is kept, in days (1–3650). `null` (or empty) disables the age limit; `0` is refused at startup. Pruned by the periodic tick, never during a pass; a cursor older than what survives reads `history_truncated: true`. |
+| `CHANGE_FEED_MAX_EVENTS_PER_SCOPE` | `100000` | The most change-feed events kept per user (minimum 1,000). Always applies, even with the age limit off, so the table stays bounded; a scope's newest event is never pruned. |
+| `CHANGE_FEED_MAX_EVENTS_PER_PASS` | `2000` | Events one index pass itemises per user (100–50,000); the rest become one `gap` line pointing at `get_recent(order_by="content_changed", since=…)`. |
+| `CHANGE_FEED_LOCK_TIMEOUT_MS` | `2000` | How long an event write waits for the user's feed lock (100–30,000). A timeout never fails a pass or a tool: a pass records a durable `gap`, a tool's change is recorded unattributed by the next pass. |
 | `INDEXER_DEGRADED_AFTER_FAILURES` | `3` | Consecutive failures of any indexer counter (a scope's index passes, its embed passes, its incomplete re-derives, or the tick's own user enumeration) at which `/health` reports `degraded` and one CRITICAL "manual intervention required" line is logged. |
 | `INDEXER_QUARANTINE_RETRIES_PER_TICK` | `5` | How many times one index pass may roll back and re-run a scope after quarantining a note the database refuses (a data-exception or program-limit error on its row, keyword vector, move or links). Beyond it the pass fails as an ordinary failure; the notes already found stay quarantined for the next tick. |
 | `MULTI_USER_MODE` | `false` | In-app login, per-user vaults. See [Multi-user mode](#multi-user-mode). |
@@ -1668,7 +1713,7 @@ adds a writer wait or drops a usage row because of its observed pressure.
 │ MCP clients  │   HTTP + Bearer key   │   FastAPI app        │
 │  Claude Desk │ ────────────────────▶ │  ┌────────────────┐  │
 │  Claude Code │                       │  │  MCP server    │  │
-│  n8n agents  │                       │  │  (26 tools)    │  │
+│  n8n agents  │                       │  │  (27 tools)    │  │
 │  OpenWebUI   │                       │  └─────┬──────────┘  │
 └──────────────┘                       │        ▼             │
                                        │  ┌────────────────┐  │
