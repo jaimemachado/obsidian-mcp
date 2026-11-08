@@ -30,6 +30,31 @@
   See "Filtered vector search" in [search.md](search.md) for why an older
   backend fails *silently* without it.
 
+### Reference deployment (2026-10-31)
+
+The reference deployment moved from Ollama `bge-m3` to Ollama
+`qwen3-embedding:0.6b` (1024 dimensions, so `EMBEDDING_DIMENSIONS` stayed
+1024) with
+`EMBEDDING_QUERY_INSTRUCTION="Instruct: Given a question, retrieve the notes that answer it\nQuery: "`
+— queries only; documents get no instruction, and the instruction is
+outside the stored fingerprint. The switch was the documented procedure:
+`.env` change, the refused start, `make reset-embeddings` (or the
+equivalent k8s job), then a full re-embed — ~4,200 notes in about 84
+minutes on an 8 GiB Quadro P4000 shared by Ollama and the reranker. The
+later `CHUNKING_VERSION` 2 re-chunk reused ~65% of the vectors.
+
+**No harness A/B was run for the switch** (owner-waived). What was
+observed, on one user's vault and not as a benchmark: strong
+cross-language recall between English and Russian queries and notes, and
+`hybrid_search` as the day-to-day default. The way to measure it on
+another vault is the search-evaluation recipe in `DEPLOYMENT.md`.
+
+`bge-m3` stays the code default and fully supported: the stored-fingerprint
+guard refuses to start a deployment whose model changed, so a changed
+default would break every existing install that never set
+`EMBEDDING_MODEL`. The mutable-tag limitation (L1, under "The settings
+fingerprints") applies to `qwen3-embedding:0.6b` exactly as to `bge-m3`.
+
 ### The embedding hop's transport (#185)
 
 Every chunk the indexer embeds and every `semantic_search` / `find_related`
@@ -125,6 +150,42 @@ verify=… plaintext_override=…` — scheme, host and port only, never the pat
 query or userinfo. `plaintext_override=True` means the override is what
 admitted this hop (plaintext to a non-loopback host).
 
+### The rerank hop (#367)
+
+The optional reranker is the **third outbound hop** (after the database and
+the embedding endpoint), and it reuses the embedding hop's policy rather than
+inventing one (design D1, D3, D8):
+
+- `RERANK_URL` (empty = absent) is judged by `classify_embedding_url` and the
+  same plaintext rule, with its **own** flag, `RERANK_ALLOW_PLAINTEXT`:
+  `EMBEDDING_ALLOW_PLAINTEXT` does not admit a plaintext reranker. A violation
+  refuses boot; the address class is not restricted (an internal reranker is
+  expected on a private or loopback host — the opposite of `import_from_url`'s
+  SSRF policy, because this URL is operator configuration, never caller
+  input). `MCP_SANDBOX_MODE` skips the URL policy.
+- The **trust anchor is shared**: an `https` reranker is verified against the
+  `EMBEDDING_CA_FILE` context when set, else certifi. Because that file is
+  refused while the embedding URL is plain `http`, a loopback-`http` Ollama
+  plus an `https` reranker under a private CA cannot share it; that reranker
+  needs a publicly trusted certificate (L10). The embedding rule is not
+  relaxed.
+- Every client comes from `transport_security.rerank_http_client`
+  (`trust_env=False`, no redirects, two pooled connections); the AST guard
+  covers `src/services/rerank.py`. `log_rerank_transport()` writes one
+  `Rerank transport: scheme=… host=… port=… verify=… plaintext_override=…`
+  line when `RERANK_URL` is set, and `internal_transport_plaintext`
+  `reason=rerank outcome=override` for a non-loopback `http` URL.
+- The startup probe (both document orders, 10 s) needs no database. **Its
+  failure never exits**: it disables reranking with one CRITICAL, the server
+  serves, and a background re-probe (60 s doubling to 10 min) re-enables it.
+  A reranker outage must not take down the vault; every `rerank=true` answer
+  states the absence, and `/health` reports `rerank: disabled` without
+  touching `status`. Under `MCP_SANDBOX_MODE` there is no probe, no
+  transport line and no re-probe; the state is `disabled` (`probe_skipped`)
+  with a URL, else `absent`.
+
+The query-time behaviour is in [search](search.md), "Reranking (#367)".
+
 ### One pooled client per provider, and Ollama batches (#281)
 
 **D14 — the shared client is built by the factory, never beside it.** Each
@@ -162,9 +223,12 @@ bullet under "Indexing decisions" below.
 
 ### Chunk-vector reuse (#281, D16)
 
-A stored vector is reused for a chunk whose text is **byte-identical** to a
-stored chunk of the same note, so an append or a metadata-only edit no longer
-re-embeds the whole note. A reused vector attached to text it was not computed
+A stored vector is reused for a chunk whose **provider input** is
+byte-identical to the one a stored chunk of the same note was embedded from —
+since #390, equal `embed_prefix` and `fmt[stored version](stored chunk_text)
+== fmt[current version](new chunk_text)` over the frozen
+`EMBEDDED_TEXT_FORMATTERS`, any version in that table being eligible — so an
+append or a metadata-only edit no longer re-embeds the whole note. A reused vector attached to text it was not computed
 from — or computed by another model — would be a silently wrong search result,
 so reuse is gated three ways, and a doubt anywhere re-embeds:
 
@@ -209,12 +273,259 @@ numeric noise, so a note mixing reused and fresh vectors is not bit-identical
 to a from-scratch embed. The vector is assumed to be a function of (model,
 text) alone; the fingerprint names the model.
 
+**The key is the exact embedded input (#355, amended by #390).** Reuse
+requires, in addition to the three gates above, that the note's
+`embedded_chunking_version` be a key of `EMBEDDED_TEXT_FORMATTERS` (NULL never
+is; at #355 this was "equal to `CHUNKING_VERSION`"), that the row's
+`embed_prefix` equal the new chunk's, and that the row's `chunk_text` under
+its stamped version's formatter equal the new chunk's text under the current
+one. A row with a NULL prefix (pre-034) is never a candidate, and the
+under-lock check compares the stored row's own `(chunk_text, embed_prefix)`
+pair, not the text alone.
+The locator (`heading_path`, `section_ordinal`) is not in the key: a reused
+vector is re-inserted with the new chunk's locator, so a heading inserted above
+a section re-embeds nothing and still records the shifted ordinals. See
+"Heading-aware chunks (#355)" below.
+
+## Heading-aware chunks (#355)
+
+**Sectioning.** `chunk_note_bounded` (`src/services/embeddings.py`) splits the
+frontmatter-stripped body `read_note` scans, with `vault._scan_headings`
+itself (imported, never copied: a heading inside fenced or inline code is not
+a boundary). Section *k* is heading *k*'s **own** text — one terminator past
+its `line_end` (the `_section_body_span` step) up to the next heading of **any**
+depth — and section 0 is the text before the first heading. `read_note(section=
+"#k")` returns a superset (the subsections too), so the guarantee is
+*containment*: every chunk with ordinal *k* is a substring of that section's
+body with the whole-body fence spans removed. Cleaning uses the spans of one
+`scan_fences(body, BODY)` call per note; windowing is `chunk_text_bounded` per
+section with **one cap counter across sections**, stopping one past
+`MAX_CHUNKS_PER_NOTE` so `chunks_truncated` keeps its meaning. Heading lines
+are not chunk text. The heading path is the enclosing chain (each step to a
+strictly shallower heading, `_path_chain_match`'s rule), components cut at 200
+characters with `…`. A change to the heading scan is now also a
+`CHUNKING_VERSION` bump.
+
+**The zero-chunk invariant.** A note with no headings is one group, chunked
+exactly like `chunk_text_bounded(clean_for_embedding(body), min_chars=m)`
+(since #390; #355's "byte-identical to the pre-change chunker" ended with the
+minimum and the word-boundary windows below). A note whose sections are all
+empty but whose cleaned body is not (headings only) is chunked as one group of
+the whole cleaned body at ordinal 0, so a note has zero chunks exactly when
+`chunk_text_bounded(clean_for_embedding(body))` gives it zero: `CERTIFIED_EMPTY`, #127's convergence exceptions
+and the exclusion sweep's probe (which now calls `chunk_note_bounded`) keep
+their meaning.
+
+**The prefix.** The provider input is `embedding_input(prefix, chunk)` =
+`prefix + "\n\n" + embedded_text(chunk)` (`embedded_text` is the identity at
+version 1 and collapses whitespace runs longer than 8 at version 2, #390);
+`prefix` is `build_embed_prefix(title, path,
+tags)`: `Title > H1 > … > Hk`, each component whitespace-collapsed and cut at
+80, outer headings replaced by one `…` until the breadcrumb fits
+`EMBED_PREFIX_MAX_CHARS` (300; the title and innermost heading always fit),
+then a `tags: a, b` line only if the whole prefix still fits. The row stores
+the prefix (`embed_prefix`) and the un-prefixed `chunk_text`.
+
+**The reranker is a second reader of that input (#402).** A `rerank=true`
+call rebuilds each fetched row's provider input from the stored columns —
+`embed_prefix + "\n\n" + EMBEDDED_TEXT_FORMATTERS[embedded_chunking_version](chunk_text)`,
+the reconstruction vector reuse relies on — and sends it as the rerank
+document (`rerank.embedding_document`). Only a stamp that is a key of the
+table reconstructs; a NULL or unknown stamp (a later version read after a
+rollback) sends the note's title alone. So a change to `build_embed_prefix`,
+the separator or a formatter is also a rerank-input change: it bumps
+`CHUNKING_VERSION` as before, and the eval-gate row applies to the reranker
+too. Because the stored prefix is what is sent, a title or tag edit is
+reflected only once the next pass has re-embedded the note; until then the
+row is stale (the upsert clears `embedded_content_hash`) and sends no stored
+text. See [search](search.md), "Reranking (#367)".
+
+**The certification covers the input (D3a).** `certify_embedded` stamps, in
+its one conditional UPDATE, `embedded_chunking_version = CHUNKING_VERSION` and
+`embedded_input_digest` (SHA-256 of the canonical JSON of the ordered provider
+inputs, `[]` for an empty or excluded note) on every certifying branch. The
+index upsert clears `embedded_content_hash` in the same statement when the
+stored `title` or `tags` are `IS DISTINCT FROM` the new ones (a re-derive, an
+extraction-version re-upsert, a frontmatter edit); both move paths already
+clear it unconditionally. As a backstop, every full-hash pass (which keeps
+every body for this) recomputes the digest of what the current code would send
+for each note certified under the current version — CPU only, no provider call
+— and clears certification on a NULL or differing digest, in the pass
+transaction under the generation lock.
+
+**The re-embed is a per-note backlog, outside the stored fingerprint.** A
+fingerprint change refuses startup and its reset empties semantic search, and
+clearing every `embedded_content_hash` would mark every result stale. So the
+chunking format is a per-note stamp instead. The embed backlog, the
+dashboard pending count and the progress endpoint share
+`embedded_chunking_version IS DISTINCT FROM CHUNKING_VERSION` (never `<` or
+`>`, so a rollback to a lower version re-selects notes stamped higher;
+`vectors_not_current_sql` / `_expr`). The `index_transition:` marker and
+`/health` use the narrower `legacy_vectors_sql` / `_expr`: the same version
+test **and** the note holds vector rows — a generation mix, not a note that
+simply has not been embedded yet (the harness's `legacy_chunked_notes` is the
+same definition). Each is paired SQL text and expression; a test checks they
+agree and greps `src/` for an ordered comparison. Staleness is unchanged (`embedded_content_hash IS DISTINCT FROM
+content_hash`), so a version-only note is fresh and keeps its preview. The
+model, and the space, are unchanged and stay in the refusing fingerprint; the
+mix still changes ranking (L1), so the vector tools declare it.
+
+**Ordering and the budget in every mode.** The backlog SELECT sorts
+content-stale notes first, then version-only ones (`version_only`), each
+`modified_at DESC`. `EmbedBudget.enter_version_only()` applies the budget to
+the version-only segment **whatever `_active_scope_count`**: in a single-scope
+pass it starts enforcement there with a fresh allowance (at-least-one-note and
+note-boundary rules unchanged) and `leave_version_only()` restores the
+unbudgeted state for the sweep; a multi-scope pass is budgeted across both
+segments as before. A stop is not a failure.
+
+**`/health` stays non-volumetric.** Each embed stage counts its scope's
+notes holding vectors of another generation at its end and stores the count
+in `indexer_health` (process memory). `/health` exposes only
+`indexer.rechunk: "in_progress" | "complete"`, process-wide — beside the
+"counts only, no path/error/user id" rule, this field carries **no number at
+all**, because the endpoint is unauthenticated and a count would be
+tenant-derived. "Not yet counted" is not "zero pending": after a process
+start the state reads `in_progress` until every known scope's embed stage
+has counted (production read `complete` over 4,206 pre-034 notes for the
+minutes before the first embed stage); a disabled indexer
+(`MCP_SANDBOX_MODE`) reads `complete`. It never affects `status` or the HTTP code, and no counter
+keys on backlog size or pass length. Exact per-owner counts live on the panel
+and in the owner-scoped `index_transition:` line.
+
+**No build overlap in the supported deployments (L2).** The repository's
+Kubernetes bundle is one replica with `strategy: Recreate`, migrating in an
+init container; compose `make deploy` stops the app first. Only a deployment
+modified outside the repository (rolling update, second replica) can have a
+033 build write after 034: such a note keeps legacy rows (NULL locator, never
+reused) until its next edit or the next full-hash backstop.
+
+**Accepted limitations (#355).**
+- **L1** — during the transition, legacy and heading-era vectors coexist, so
+  which notes fit a bounded page depends on re-embed progress; declared on
+  every vector response by `index_transition:` until the scope drains.
+- **L2** — see above.
+- **L3** — an edit not yet scanned leaves a fresh-looking row whose `#N` may
+  name another section; `read_note` returns the `heading` to check.
+- **L4** — a tag edit, or a title change, re-embeds the whole note (every
+  prefix changes), undoing #281's reuse for metadata edits.
+- **L5** — the `§` path quotes note-controlled heading text; it cannot forge
+  the ordinal, but its words are the author's.
+- **L6** — only ATX headings are boundaries, as in section addressing.
+- **L7** — `alembic downgrade 033` deletes heading-era vectors; those notes
+  are absent from semantic search until the old build re-embeds them.
+- **L8** — `EMBEDDING_QUERY_INSTRUCTION` is not checked against the model.
+- **L9** — searches during the re-embed may wait up to one batch on a shared
+  Ollama.
+- **L10** — heading components and the prefix are cut at fixed lengths,
+  marked `…`.
+- **L11** — the full-hash backstop holds every note body for the pass, once
+  per interval and at startup, the memory profile of a re-derive.
+
+### A minimum chunk length and word-boundary windows (#390, chunking version 2)
+
+Live, a four-word chunk ("in the Email Triage log") ranked first for a
+paraphrase query, and another row's preview was "lves". A chunk that short is
+mostly its own prefix, so its vector is the note's topic and outranks real
+passages; and the windowing cut fixed 2,048-character slices with no word
+boundary, leaving four-character tails. Both are fixed at chunking time.
+
+- **One length, `clen`.** Every rule — the minimum, a section's shortness, cut
+  admissibility, tail balancing, the harness's `under_min` — measures the
+  *collapsed length*: runs of the six ASCII whitespace characters (U+0009–
+  U+000D, U+0020) collapsed to one space, then stripped, in code points.
+  `embeddings.clen` and `embeddings.CLEN_SQL` are one pair; a PostgreSQL test
+  checks they agree. The stored `chunk_text` is the **raw** window,
+  unstripped, as single-window chunks always were (previews trim).
+- **The minimum is a constant.** `CHUNK_MIN_CHARS = 200` and
+  `CHUNK_BOUNDARY_LOOKBACK_CHARS = 200` live in `embeddings.py`: not
+  settings, not fingerprint fields, no validator. The effective minimum is
+  `m = min(200, W // 2)` with `W = CHUNK_SIZE × 4`, so every previously valid
+  `CHUNK_SIZE` (1 included, `m = 2`) still starts. Changing either constant is
+  a `CHUNKING_VERSION` bump.
+- **Grouping.** Over the unchanged `_note_sections`, a section is *short* when
+  its cleaned `clen` is non-zero and below `m`. A group opens at a non-empty
+  section and extends forward while short; a group still short at the end
+  joins the previous group; a sole short group stands alone only when the
+  whole cleaned note is short (L7), otherwise the note becomes one whole-body
+  group at ordinal 0 (the sixty-empty-headings-then-`x` outline). A group's
+  text is its **contiguous** raw span cleaned with the whole-body fence spans,
+  so a merged chunk keeps the inner heading lines and is still one substring
+  of the note; a one-section group is exactly #355's section text.
+- **Windows.** A window of `W` is cut at the last line start, else the last
+  word start, within `L = min(200, W // 10)` of its limit, and hard only when
+  that range holds none (L4). A cut is taken only when *admissible* (the
+  window before it reaches `m`); a window that is mostly whitespace extends
+  to the first admissible word start past the limit whose window keeps
+  `clen ≤ W`, else the first admissible position. When the text after a cut
+  falls below `m`, the last two windows are **re-balanced** over their span
+  `S`. A *valid split* leaves both **actual** slices at `clen ≥ m` (measured
+  after their own boundary whitespace is stripped — the implementation
+  review's `A×199 + space×1700 + "x " + B×199` stranded a 199 otherwise). The
+  cut is the valid split nearest the collapsed midpoint from the first
+  non-empty tier of: word starts within `W` raw on both sides; any position
+  within `W` raw on both sides (the hard cut clamped into `[end − W, a + W]`,
+  so `A×300 + space×1822 + B×175` gives 249/2048, not a 2,059-raw chunk); word
+  starts; positions. At `S ≤ 2m` the span is one window unless that exceeds
+  `W` raw and an in-bound valid split exists. With no valid split at all
+  (which needs `S ≤ 2m + 1`) the span is one window when `S ≤ W`; only at
+  `W ≤ 400` can `S > W` too, leaving the pure midpoint cut (L10). With overlap the next start
+  is `max(cut − overlap × 4, a + 1)`, and after a balance
+  `min(cut, max(cut − overlap × 4, end − W, a + 1))`, each snapped forward to
+  a word start **never past the cut**, so every non-heading cleaned character
+  is in some chunk (Codex r1 B2's skipped `B`s).
+- **The bound.** Every chunk has `clen ≤ W`; its raw length exceeds `W` only
+  by whitespace, when no valid in-bound split exists (L3), counted as
+  `raw_over_window`. The provider never receives those runs: `embedded_text`
+  collapses every run longer than 8 whitespace characters to one space
+  (stored text untouched), so a chunk within `W` raw keeps #355's `W + 302`,
+  and an over-window one exceeds it by at most `7r + 2` (`r` interior runs of
+  2–8, plus kept leading and trailing whitespace).
+- **The locator** is the deepest heading `N` whose `read_note(section="#N")`
+  body span (`vault._section_body_span`, imported) contains the chunk's raw
+  span, recovered through the cleaned-to-raw offset map; 0 when none does, and
+  0 for the whole-body groups. An unmerged chunk keeps its own section; a
+  short lead merged into its first child keeps the parent; merged siblings
+  take their common parent or 0 (L1). Containment and ordinal parity hold by
+  construction, and a property test asserts them, coverage and the bounds.
+- **Reuse across versions.** `EMBEDDED_TEXT_FORMATTERS = {1: identity,
+  2: collapse runs > 8}` is frozen per version, like `_EXTRACTION_CLEANERS`. A
+  stored vector is reused when its note's stamp is a key of the table (NULL
+  never is), its prefix equals the new chunk's, and `fmt[stamp](stored text)
+  == fmt[2](new text)` — the input it was built from equals the input that
+  would now be sent. A frozen entry is never edited; a formatter change adds
+  an entry; a prefix-builder or separator change clears the table to its own
+  entry; a golden test pins every entry. The under-lock re-check compares the
+  stored row's own `(chunk_text, embed_prefix)`. Every other version
+  comparison stays strict (the backstop's `= :cv`).
+- **The transition** is #355's, unchanged: the backlog (`IS DISTINCT FROM 2`),
+  the `index_transition:` marker, `/health` `rechunk: "in_progress"` and the
+  rollback rule. The embed stage's completion line now reads
+  `Embedding complete…: N notes, X chunks (S submitted, R reused)` — counts
+  only — where `S` is the provider work and `R = X − S`, both over the
+  certified notes of the pass.
+
+**Accepted limitations (#390).** L1 merged locators are coarser; L3 a chunk
+may exceed `W` raw by whitespace only; L4 an unbroken run (base64, a URL, CJK
+without spaces) is cut hard; L5 lengths are code points, not tokens; L6 the
+second transition repeats #355's L1; L7 a note whose whole cleaned text is
+below `m` keeps its one short chunk (`whole_short`); L8 a rollback to a
+version-1 build re-embeds every note stamped 2; L9 the live "lves" row was not
+traced to its note; L10 at `CHUNK_SIZE ≤ 100` single-character words around a
+tail's midpoint can leave one chunk below `m` (never at the default window).
+A note whose cleaned body is only NBSP (Unicode, not ASCII, whitespace) now
+yields one chunk where #355 yielded none.
+
 ## Indexing decisions
 
 - Embeddings: pluggable provider, `EmbeddingProvider` Protocol with two
   implementations (Ollama, OpenAI). Single `EMBEDDING_PROVIDER` env var
   picks the backend; `get_provider()` is a cached singleton. Default is
-  Ollama bge-m3 at 1024 dim, 512 token chunks, no overlap.
+  Ollama bge-m3 at 1024 dim, 512 token windows inside heading-aware
+  sections (#355), no overlap, each chunk embedded under a
+  `Title > Heading` context prefix. Every call declares `kind="query"` or
+  `kind="document"`; `EMBEDDING_QUERY_INSTRUCTION` is applied to queries
+  only, in `get_embedding` / `get_embeddings_batch`.
 - **Each embed pass ends with an exclusion reconciliation sweep** (#127). The
   backlog selects on `embedded_content_hash IS NULL OR != content_hash`, so it
   is driven entirely by *content* changes and an `EMBEDDING_EXCLUDE_PATTERNS`
@@ -261,10 +572,12 @@ text) alone; the fingerprint names the model.
   bytes through `set_frontmatter`. One shared token helper, `.nan` / `.inf` /
   `-.inf`, keys included — see [the section below](#non-finite-frontmatter-numbers-and-the-one-title-rule-154),
   which also names the one title rule every surface shares.
-- **The keyword vector is `A(title) || A(aliases) || D(body)` and stores its
-  excerpt** (#344, migration 031). One builder, `fts.index_tsvector_sql`,
-  produces the fragment for every writer — title parts for every config, then
-  aliases parts, then the pre-031 content parts byte for byte — and the same
+- **The keyword vector is `A(title) || A(aliases) || B(tags) || D(body)` and
+  stores its excerpt** (#344 and #391, migrations 031 and 035). One builder,
+  `fts.index_tsvector_sql`, produces the fragment for every writer — title
+  parts for every config, then aliases parts, then tags parts (the bullet
+  below), then the pre-031 content parts byte for byte; ranking is a
+  title-versus-tags-versus-body competition under `RANK_WEIGHTS` — and the same
   UPDATE writes `body_excerpt`, the first `KEYWORD_EXCERPT_CHARS` characters
   of exactly the prefix the successful attempt bound. The title is the row's
   (the shared `note_title` rule); the aliases are `fts.note_aliases` over the
@@ -291,6 +604,36 @@ text) alone; the fingerprint names the model.
   fingerprint it records still certifies configs only (weights are not
   configuration, and a `FINGERPRINT_VERSION` bump would invalidate the
   embedding fingerprint too). See [search](search.md#keyword-ranking-the-disjunctive-fill-and-the-snippet-344).
+- **Tags enter the vector at weight `B`, between the head and the body**
+  (#391, migration 035): `A(title) || A(aliases) || B(tags) || D(body)`.
+  The tags text is `fts.tags_text` over the list `vault.extract_tags`
+  returns — exactly what `notes_metadata.tags` stores — one line per tag
+  with a nested tag's `/`-segments appended (`ctx/phone ctx phone`), cut at
+  2,048 characters on a whole line (the head stays small against the 1 MiB
+  limit; the halving retreat shrinks only the body). Every builder takes a
+  required `tags_bind`, and every writer passes one: the **incremental
+  pass** binds `tags_text(entry["tags"])`, the same entry whose `tags`
+  column the upsert wrote in that transaction (bind name `tags_text`, so it
+  cannot collide with the `tags` column bind); the **indexer move-pair**
+  binds the entry parsed for the new path (`head_tags`); **`move_note`**
+  derives the tags from the destination read through `extract_tags(body,
+  frontmatter)` and, when that read or parse fails, falls back to the
+  caller's **own** row's stored `tags`, selected with the stored frontmatter
+  in the one owner-predicated statement (best-effort, self-healing at the
+  next content change, like the title fallback); the **rebuild** binds
+  `extract_tags` over the bytes it verified (off the loop). Only migration
+  031 builds without tags (`tags_bind=None`), so an upgrade from 030 runs
+  031's A-only re-head and then 035. **A tag edit rewrites the vector**: tags
+  come from the note's bytes, so a frontmatter or inline tag change changes
+  `content_hash`, the note enters `to_upsert`, and the tsvector UPDATE runs
+  for it in the same pass — no extraction-version bump. #355's rule (the
+  upsert clears `embedded_content_hash` when title or tags change) is
+  independent: it governs re-embedding, not the keyword vector. Migration
+  035 re-heads the stored vectors in SQL (see [schema and
+  migrations](schema-and-migrations.md#035-tags-in-the-keyword-vector-391));
+  both move paths' re-head replaces the tags part along with the title and
+  aliases (`head(title, aliases, tags) || ts_filter(v, '{d}')`). See
+  [search](search.md#tags-in-the-keyword-vector-391).
 - **The keyword vector attempts the full note and retreats per note** (#127).
   Both writers bound `content[:100000]`, so every term past that was invisible
   to `keyword_search` on a note the tool still reported. `write_tsvector_bounded`
@@ -1832,6 +2175,19 @@ fts_fingerprint()       -> {"configs":["english"],"v":1}
   changes every fingerprint, so the change that adds one must ship either a
   rewrite of the stored value or an instruction to reset.
 
+**What is deliberately not in the embedding fingerprint (#355, #367).**
+`EMBEDDING_QUERY_INSTRUCTION` — every stored vector is a document vector
+embedded without it, so changing it invalidates nothing and must not refuse or
+re-embed — and `CHUNKING_VERSION`, which is per note (see "Heading-aware
+chunks"). Both are in the **retrieval fingerprint**, `retrieval_fingerprint()`:
+the embedding fingerprint's fields plus `chunking_version` and
+`query_instruction_sha256` (16 hex digits, null when empty). It is never
+stored and never compared; startup logs it once (`Embedding retrieval: …`,
+the digest, never the text) and the search-evaluation harness records it per
+semantic arm, so two deployments that differ only in the instruction share a
+stored fingerprint and are labelled apart. A model switch still changes the
+stored fingerprint and takes the refuse-then-reset runbook.
+
 ### Comparison at startup: both fail closed
 
 `_check_embedding_fingerprint()` and `_check_fts_fingerprint()` in
@@ -1883,7 +2239,7 @@ short-circuit, so `MCP_SANDBOX_MODE` skips them like every other guard.
   artifact, and including them would demand a full vault re-embed for a move
   that changed nothing about the vectors. The consequence is that the
   fingerprint records the **configuration, not the artifact**: `bge-m3` is a
-  mutable Ollama tag, so `ollama pull` can replace the weights behind it and a
+  mutable Ollama tag (as is `qwen3-embedding:0.6b`), so `ollama pull` can replace the weights behind it and a
   second host can serve different weights under the same name. No value
   available to this process distinguishes those cases, and a probe would have
   to trust the endpoint it is checking. **The operator rule that stands in its

@@ -52,6 +52,7 @@ from src.oauth.grants import (
     revoke_grant_family,
     set_grant_family_scope,
 )
+from src.oauth import cimd
 from src.oauth.scope import (
     clamp_scope,
     client_can_write,
@@ -294,7 +295,7 @@ async def require_user_panel(
         target = request.url.path
         if request.url.query:
             target = f"{target}?{request.url.query}"
-        if settings.multi_user_mode:
+        if settings.multi_user_mode and not settings.oidc_enabled:
             user_count = (
                 await session.execute(select(func.count(User.id)))
             ).scalar() or 0
@@ -593,6 +594,14 @@ async def account_page(
     return templates.TemplateResponse(request, "account.html", _panel_context(request, user, {
         "active": "account",
         "min_password_length": MIN_PASSWORD_LENGTH,
+        # #416 D11: a read-only status line, only while OIDC is enabled. No
+        # self-service control — the binding is an administrator's act.
+        "oidc_enabled": bool(settings.oidc_enabled),
+        "oidc_linked": bool(
+            settings.oidc_enabled
+            and getattr(user, "oidc_subject", None) is not None
+            and getattr(user, "oidc_issuer", None) == settings.oidc_issuer
+        ),
     }))
 
 
@@ -777,9 +786,11 @@ def _vectors_not_current():
     """The one expression for "this note's stored vectors are not current".
 
     ``embedded_content_hash IS NULL OR embedded_content_hash IS DISTINCT FROM
-    content_hash`` — a note never embedded, a note whose certification was
-    invalidated (a move, a grammar bump), or a note edited since it was last
-    embedded.
+    content_hash OR embedded_chunking_version IS DISTINCT FROM
+    CHUNKING_VERSION`` — a note never embedded, a note whose certification was
+    invalidated (a move, a grammar bump, a changed title or tags), a note
+    edited since it was last embedded, or a note embedded under another
+    chunking version (#355).
 
     **`IS DISTINCT FROM`, not `!=`.** A NULL `embedded_content_hash` under `!=`
     yields NULL, which a `WHERE` reads as false, so every never-embedded note
@@ -801,12 +812,13 @@ def _vectors_not_current():
     come to disagree about what "pending" means, which is the failure this
     helper exists to make impossible (design D8).
     """
-    return or_(
-        NoteMetadata.embedded_content_hash.is_(None),
-        NoteMetadata.embedded_content_hash.is_distinct_from(
-            NoteMetadata.content_hash
-        ),
-    )
+    # Since #355 the predicate also counts a note embedded under another
+    # chunking version (`embedded_chunking_version IS DISTINCT FROM
+    # CHUNKING_VERSION`), and it lives beside `CHUNKING_VERSION` so the embed
+    # backlog's SQL and this expression are one definition.
+    from src.services.embeddings import vectors_not_current_expr
+
+    return vectors_not_current_expr()
 
 
 async def _graph_stats(session: AsyncSession, user_id: int | None) -> dict:
@@ -1666,9 +1678,15 @@ async def oauth_page(
             grants.append(view)
         grants.sort(key=lambda g: g["last_seen_at"], reverse=True)
 
+        metadata_url = getattr(c, "client_id_metadata_url", None)
         clients.append({
             "client_id": c.client_id,
             "client_name": c.client_name,
+            # A Client ID Metadata Document client (#357): its URL and host
+            # identify it; `client_name` is the document's self-description.
+            "kind": "cimd" if metadata_url else "dcr",
+            "metadata_url": metadata_url,
+            "metadata_host": cimd.host_for_log(metadata_url) if metadata_url else None,
             "created_at": c.created_at.isoformat(),
             # The registered scope caps everything this client's grants may
             # hold, so the panel must not offer an option above it (issue #67).

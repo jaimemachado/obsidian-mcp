@@ -18,7 +18,10 @@ that their migrations left nullable (`api_keys.is_active/created_at`,
 `ck_oauth_clients_auth_method_secret` that migration 010 creates was **absent
 on the live database** while `alembic_version` read 012 — `alembic check`
 cannot see that at all, and neither can a lookup by constraint name, which a
-same-named `CHECK (true)` would satisfy while enforcing nothing.
+same-named `CHECK (true)` would satisfy while enforcing nothing. (038, #420,
+later replaces that CHECK's definition to admit `private_key_jwt` with no
+secret, keeping 013's COMMENT marker so this downgrade still reads it; see
+[038](#038-private_key_jwt-columns-on-oauth_clients-420).)
 
 Migration `013_schema_reconciliation` fixes both and enforces the *complete*
 010 shape rather than just the missing piece, because how the live database
@@ -997,3 +1000,289 @@ sequence counters and watermarks cannot be rebuilt from the vault, and a
 cursor stays valid across a restore only if events and counters come back
 together (L8: a restore rolls `last_seq` back, so a later cursor is refused
 and the agent restarts from a date).
+
+## 034: the chunk locator, the prefix and the chunking version (#355)
+
+034 adds five nullable, marked columns with no default, **no backfill** and no
+index: `note_embeddings.heading_path text[]` (`{}` for section 0),
+`section_ordinal integer` (integer, because a 10 MiB note can hold more than
+32,767 headings) and `embed_prefix text` (≤ 300 characters, app-enforced), and
+`notes_metadata.embedded_chunking_version smallint` and
+`embedded_input_digest varchar(64)`. NULL is the truthful pre-034 value
+everywhere: a legacy chunk with no section, a note certified under the old
+chunker. The embed backlog re-selects such notes per note (see
+indexing-and-embeddings.md, "Heading-aware chunks"); the stored embedding
+fingerprint is untouched, so nothing refuses at startup.
+
+Two CHECKs, added `NOT VALID` then `VALIDATE`d so the scan of
+`note_embeddings` holds only `SHARE UPDATE EXCLUSIVE`:
+`ck_note_embeddings_heading_meta` (the three row columns all NULL, or all set
+with `section_ordinal >= 0` and `(section_ordinal = 0) = (cardinality(
+heading_path) = 0)`) and `ck_notes_metadata_embedded_chunking_version` (NULL
+or `>= 1`). Both are resolved through `pg_constraint` by definition, measured
+off a TEMP twin, and carry constraint markers (not compared by `alembic
+check`); the schema gate asserts them.
+
+**Reconcile or refuse.** On a re-run a same-named column must have the exact
+type, be nullable, carry no default and 034's marker, and a CHECK of 034's
+name must have 034's definition, be validated and be marked; anything else is
+refused by name before anything changes. `search_path` is pinned and
+asserted; `lock_timeout` / `statement_timeout` are set and `RESET`. Only table
+ownership is needed (`test_nonsuperuser_migrations_pg.py`).
+
+**The downgrade deletes and un-certifies.** In one transaction holding the
+generation lock (`pg_advisory_xact_lock(8029183045093649969)`, written
+literally): `embedded_content_hash = NULL` for every note holding a row with a
+non-NULL `embed_prefix`, delete those rows, then drop only the marked
+constraints and columns. The 033 build reuses a vector on exact `chunk_text`
+alone, so a vector of a prefixed input left behind would be reused as the bare
+chunk's. Those notes are absent from semantic search until the old build
+re-embeds them (L7). Both tables stay **derived** for backups (#348).
+
+## 035: tags in the keyword vector (#391)
+
+035 adds, alters and drops **no schema object**; `alembic check` stays clean.
+It is a data step on 031's model, in one transaction: `lock_timeout 10s`,
+`statement_timeout 15min`, `search_path` pinned and the qualified table
+asserted (all `RESET`), the generation lock (`pg_advisory_xact_lock(
+8029183045093649969)`, literal, pinned by `tests/test_migration_035_literals.py`)
+before the first row is read, and the configs from the stored
+`fts_fingerprint` (present → its `configs`; absent → the environment's;
+unreadable → refuse naming the key, nothing changed).
+
+**The rewrite.** Per row with a vector, in id order, `content_tsvector =
+head(title, aliases, tags) || ts_filter(content_tsvector, '{d}')` through the
+shared `rehead_tsvector_sql`, from the stored `title`, `aliases_text(
+frontmatter)` and `tags_text(tags)` — no file access. Two predicates in the
+UPDATE's own `WHERE`: `length(ts_filter(content_tsvector, '{b}')) = 0` (a row
+already carrying a tags part is skipped — `rehead` is not
+position-idempotent, so this is what makes a stamp-back re-run byte-equal)
+and `length(<tags part>) > 0` (a row whose tags produce no lexeme is already
+what the new builder writes, since an empty `B` part shifts nothing). 035
+composes no `to_tsvector(` itself: `fts.tags_tsvector_sql` gives the
+predicate's tags part. A D-only row (031 left it at the size limit) is
+re-headed byte-exactly; a headed tagged row keeps body positions shifted by
+the old head's length (#391 L1).
+
+**The size preflight, then all-or-nothing.** Before the first UPDATE, a
+read-only estimate per row the rewrite would change: `S(ts_filter(v, '{d}'))
++ S(head(title, aliases, tags))`, with `S(v)` = Σ over `unnest(v)` of the
+lexeme's bytes rounded up to even plus `2 + 2 × npos` when it has positions
+(`size_sql` in the migration). Measured on the gate: for a concatenation
+that crosses the limit, `S` equalled the size PostgreSQL reported (1,049,880
+both); the design measured four under on another case. `S` is within four
+bytes of PostgreSQL's count — not a strict upper bound — and the 64-byte
+margin absorbs that. Any estimate above 1,048,511 (the 1,048,575 limit less 64) aborts
+naming the count and every id, before anything is written. The rewrite has no
+savepoints: any row error, 54000 included, fails the migration naming the
+row id and SQLSTATE (never the path, the bound parameters or text — the
+driver error is not chained), with nothing committed. The operator's
+read-only pre-merge statement in `DEPLOYMENT.md` sums `S(a) + S(d) + S(b)`
+over the stored parts separately (never `S` of the merged vector, where a
+lexeme shared by title and body is stored once), strips U+0002/U+0003 from
+the tags as `tags_text` does, and additionally flags every candidate with no
+`A` lexeme (`d_only`), since such a row gains its whole head in 035. The gate
+runs that statement verbatim and asserts that every id 035's preflight
+rejects (a D-only row, a shared-lexeme row, a sentinel-tag row, Codex's position-saturation row) is flagged. The tags part is bounded per tag — each tag's full form and its `/`-expanded form parsed as separate documents — and the multi-config form combines the per-config parses with `UNION ALL` (a deduplicating `UNION` under-counts; an `english,simple` case pins it).
+
+**Downgrade** takes the generation lock and sets `ts_filter(content_tsvector,
+'{a,d}')` on every row carrying a `B` lexeme; a lexeme in both the tags and
+the body keeps its body positions.
+
+**Cost.** Measured on the gate container (PostgreSQL 16, local): 4,265
+synthetic rows of 1,800 words and three tags each — preflight ≈ 10 s,
+rewrite ≈ 27 s, the alembic run 28–41 s. Every rewritten row is a new tuple
+version (027's vacuum thresholds). Only table ownership is needed
+(`test_nonsuperuser_migrations_pg.py`).
+
+## 036: `oauth_clients.client_id_metadata_url` (#357)
+
+One nullable `VARCHAR(2048)` and one CHECK, `ck_oauth_clients_cimd_shape`.
+The URL is present exactly when `client_id LIKE 'cimd\_%'`, and such a row is
+`token_endpoint_auth_method = 'none'` with no secret hash. (038 widens the
+method to `none` or `private_key_jwt`, still with no secret.) There is no backfill:
+every existing row is a DCR registration and already satisfies it.
+`client_id` is **not** widened. The synthetic id is `cimd_` + 59 hex of an
+HMAC, so `oauth_codes.client_id`, `oauth_tokens.client_id` and both
+`actor_ref` columns keep `VARCHAR(64)`.
+
+**Re-runnable by reconciliation**, 025's rule. The column carries a comment
+marker mirrored in `src/models/db.py`
+(`_OAUTH_CLIENT_CIMD_URL_COLUMN_MARKER`), so `alembic check` compares it. A
+re-run adopts the column only when its type, nullability, default and marker
+are its own. It adopts the CHECK only when `pg_get_constraintdef` equals what
+PostgreSQL prints for 036's own definition, which it reads from a `NOT VALID`
+probe created and dropped in the same transaction. Otherwise it refuses and
+names the difference.
+
+**The downgrade refuses while any CIMD row exists**, naming the count. Dropping
+the column would leave rows no URL can reach, and deleting them would cascade
+their grants. Delete those clients in the panel first.
+`tests/integration/test_oauth_cimd_migration_pg.py` pins the refusal and the
+CHECK.
+
+## 037: OIDC account links on `users` (#416)
+
+Six nullable columns on `users`, in two triples, and five named constraints.
+No new table, no foreign key, no backfill.
+
+| column | type | meaning |
+| --- | --- | --- |
+| `oidc_issuer` | `VARCHAR(2048)` | issuer the subject is bound under (exact `iss`) |
+| `oidc_subject` | `VARCHAR(255)` | the bound `sub` |
+| `oidc_linked_at` | `TIMESTAMPTZ` | when the binding was made |
+| `oidc_expected_issuer` | `VARCHAR(2048)` | issuer a pending expectation was set under |
+| `oidc_expected_email` | `VARCHAR(254)` | the normalized expected email |
+| `oidc_expected_set_at` | `TIMESTAMPTZ` | when the admin set it (drives the 7-day expiry) |
+
+- `uq_users_oidc_identity UNIQUE (oidc_issuer, oidc_subject)` — one identity,
+  at most one user. NULLs are distinct, so unlinked rows never collide.
+- `uq_users_oidc_expected UNIQUE (oidc_expected_issuer, oidc_expected_email)`
+  — two users cannot wait for one address, so a match is never ambiguous.
+- `ck_users_oidc_bound_complete` / `ck_users_oidc_expected_complete` — each
+  triple is all NULL or all set.
+- `ck_users_oidc_not_both` — a row is never bound and pending at once.
+
+All five are declared on the ORM model, so `alembic check` stays clean. The
+email is stored already normalized, which is why a plain UNIQUE suffices: a
+`lower()` expression index would not autogenerate cleanly. The btree row
+bound (2,048 + 255 plus overhead) is under PostgreSQL's 2,704-byte index row
+limit; `OIDC_ISSUER` is validated to ≤ 2,048 characters and `sub` to ≤ 255.
+
+**Columns, not a `user_oidc_identities` table, because a table needs an FK to
+`users`**, and an FK to `users` is what reopened the permanent-deletion
+deadlock for the change-feed tables (033). On the row, deleting a user removes
+its link with no purge step, and the user-row lock every admin action already
+takes covers the link. #415 kept its mapping in the environment, so there was
+nothing to migrate: every existing row reads NULL in all six, meaning "not
+linked".
+
+**Marker-owned, reconcile or refuse** — 029's and 030's shape, applied to
+eleven objects:
+
+- Each column carries `OIDC account link (037_oidc_account_links)` as its
+  COMMENT, mirrored byte-identically as `_OIDC_LINK_COLUMN_MARKER` in
+  `src/models/db.py` and passed as `comment=`, so `alembic check` compares it
+  (a drift shows as a pending `alter_column(comment=…)`). The migration's
+  `COLUMN_MARKER` and the model constant must stay identical.
+- Each constraint carries `OIDC account link constraint
+  (037_oidc_account_links)`. Autogenerate does not compare constraint
+  comments, so the gate reads them from the catalogue.
+- **All eleven objects are checked before anything is touched.** A same-named
+  column is adopted only with the exact type, nullable, no default and the
+  marker; a same-named constraint only with the canonical
+  `pg_get_constraintdef` (measured off a scratch TEMP table, 013's device, so
+  it is the server's own normalization), `convalidated` and the marker.
+  Anything else is refused by name and nothing changes — **including the right
+  shape without a marker**: an unmarked object has unknown provenance, and
+  adopting it would let `downgrade()` drop something 037 did not create. A
+  relation squatting a constraint's name is refused too.
+- `downgrade()` decides each object on its own marker, constraints before
+  columns, and prints a skip line for each unmarked one. **It loses every
+  link**; the docstring says so.
+- `search_path` is pinned to `public` and asserted, `lock_timeout` /
+  `statement_timeout` are set, and all are `RESET` afterwards. Nothing needs
+  superuser; `test_nonsuperuser_migrations_pg.py` runs it as the owning role.
+
+**The gate.** `HEAD_REVISION` in `tests/integration/test_schema_check.py` is
+`"037"`. Its 037 cases: chains from 036 and is head; a fresh upgrade has the
+exact marked shape (per column: type, nullability, absent default,
+`col_description`; per constraint: `pg_get_constraintdef`, `convalidated`,
+`obj_description`); the upgrade from 036 leaves existing users unchanged with
+all six NULL; a stamp-back re-run over the marked shape changes nothing; the
+valid row shapes are admitted and every invalid one rejected (half-bound,
+half-pending, bound-and-pending, a duplicate identity, a duplicate
+expectation, setting an expectation on a bound row); impostor refusals for a
+column (wrong type, NOT NULL, a default, unmarked) and for a constraint (wrong
+definition, `NOT VALID`, unmarked), all eleven checked before any is created;
+a squatting index name refused; a partial marked set adopted and completed;
+downgrade drops marked objects and keeps users, skips unmarked ones, and a
+downgrade to 036 followed by a re-upgrade recreates the shape identically
+with `alembic check` clean.
+
+## 038: `private_key_jwt` columns on `oauth_clients` (#420)
+
+Four nullable columns and three CHECKs, so the synthetic CIMD row can pin how
+its client authenticates at `/token` and `/revoke` and which keys it
+authenticates against. There is no backfill, and every existing row reads NULL
+in all four.
+
+| column | type | meaning |
+| --- | --- | --- |
+| `jwks_uri` | `VARCHAR(2048)` | the document's pinned, same-origin JWKS URL |
+| `token_endpoint_auth_signing_alg` | `VARCHAR(16)` | the document's pinned alg, if it declared one |
+| `jwks_snapshot` | `JSONB` | the validated, normalised `{"keys": [...]}` that verification reads |
+| `jwks_fetched_at` | `TIMESTAMPTZ` | the snapshot's **origin** fetch time, which drives the 24 h stale refetch |
+
+**The method is the existing `token_endpoint_auth_method` column** (010,
+reconciled by 013). It already reads `none` on every CIMD row, which is exactly
+what an existing CIMD client is. A second method column would need a backfill
+and would be a second answer to the question `_client_authenticated` already
+asks of this one, and the two could disagree.
+
+**The CHECKs:**
+- `ck_oauth_clients_auth_method_secret` is **replaced**. Its `none` and
+  `client_secret_post` clauses are unchanged, and a third admits
+  `private_key_jwt` with no secret hash. The replacement keeps the
+  constraint's COMMENT. 013 marks this CHECK, and 013's downgrade reads that
+  marker, so dropping the marker here would silently change what a later
+  downgrade to 012 does.
+- `ck_oauth_clients_cimd_shape` (036) is **replaced**. A metadata URL exists
+  exactly when the id starts `cimd_`, and such a row has no secret and a
+  method in (`none`, `private_key_jwt`).
+- `ck_oauth_clients_private_key_jwt_shape` is **new**:
+  - `private_key_jwt` implies a CIMD row with `jwks_uri`, `jwks_snapshot` and
+    `jwks_fetched_at` all set;
+  - any other method implies all four new columns NULL;
+  - the alg is NULL or one of `RS256`, `PS256`, `ES256`.
+
+  A DCR row can never be `private_key_jwt`, and a `private_key_jwt` row
+  without keys cannot be represented. That is the database's half of "a
+  key-holding client never authenticates without its key".
+
+**Re-runnable by reconciliation**, 036's rule. These are the rules:
+- `search_path` is pinned to `public` and asserted, `lock_timeout` /
+  `statement_timeout` are set, and all are `RESET` at the end.
+- Each column carries a comment marker (`created by
+  038_oauth_cimd_private_key_jwt: …`), mirrored byte-identically by the
+  `_OAUTH_CLIENT_PKJWT_*_MARKER` constants in `src/models/db.py`, so
+  `alembic check` compares it. Every column is judged before any is added. A
+  column is adopted only with the exact type, nullable, no default and its
+  marker. Anything else is refused by name, and nothing changes.
+- A replaced CHECK is handled by its current definition:
+  - 038's definition is kept;
+  - its predecessor's definition (left by a stamp-back) is replaced;
+  - an absent CHECK is created;
+  - anything else is refused.
+
+  Definitions are compared with what this server prints for a `NOT VALID`
+  probe constraint created and dropped in the same transaction, never with a
+  hand-written rendering.
+- The new CHECK is adopted only when it has 038's definition, is validated,
+  and carries `CONSTRAINT_MARKER`.
+
+**The downgrade refuses while any `private_key_jwt` row exists**, naming the
+count. Dropping the columns would leave grants whose client can no longer
+authenticate. Delete those clients in the panel first; their grants go with
+them. Otherwise the downgrade drops the new CHECK and the four columns and
+restores 036's exact two CHECK definitions, carrying their comments. 036's own
+downgrade then still refuses while any CIMD row exists. Nothing needs
+superuser: table ownership suffices, and `test_nonsuperuser_migrations_pg.py`
+runs it as the owning role.
+
+**The gate.** `HEAD_REVISION` in `tests/integration/test_schema_check.py` is
+now `"038"`. Its 038 cases:
+- 038 chains from 037 and is head;
+- the `private_key_jwt` shapes on a fresh database;
+- an absent `ck_oauth_clients_private_key_jwt_shape` is recreated (#53's
+  test);
+- 013's marker survives the upgrade and the downgrade.
+
+Every existing `none` / `client_secret_post` enforcement case is kept.
+`tests/integration/test_oauth_cimd_pkjwt_migration_pg.py` covers the rest:
+- the upgrade over DCR and `none` CIMD rows leaves them unchanged and valid;
+- a re-run reconciles, and a predecessor definition left by a stamp-back is
+  replaced;
+- foreign or unmarked columns and constraints of our names are refused;
+- the CHECK matrix;
+- the downgrade refusing with a `private_key_jwt` row present.

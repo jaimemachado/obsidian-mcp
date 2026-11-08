@@ -48,6 +48,10 @@ def _kind(sql: str) -> str:
     u = sql.lstrip().upper()
     if u.startswith("SET"):
         return "set"
+    if "EMBEDDED_CHUNKING_VERSION" in u and " AS DISTANCE" not in u:
+        # (#402: the rerank=true overfetch also projects the stamp.)
+        # The #355 transition count, after the snippets.
+        return "rechunk"
     if "NOTE_EMBEDDINGS" in u:
         return "semantic"
     if "TS_HEADLINE" in u:
@@ -66,6 +70,9 @@ class _Result:
 
     def fetchall(self):
         return self._rows
+
+    def scalar(self):
+        return self._rows[0] if self._rows else 0
 
 
 class _Session:
@@ -127,7 +134,7 @@ def _offline(monkeypatch):
     monkeypatch.setattr("src.services.search.combined_tsquery", lambda _q: "tsq")
     monkeypatch.setattr(settings, "fts_configs", ["simple"], raising=False)
 
-    async def _embed(_text):
+    async def _embed(_text, **_kw):
         return [1.0, 0.0, 0.0]
 
     monkeypatch.setattr(embeddings, "get_embedding", _embed)
@@ -153,7 +160,7 @@ def test_the_statement_sequence_with_an_exact_rerun(monkeypatch):
     )
     seen_before_embedding = []
 
-    async def _embed(_text):
+    async def _embed(_text, **_kw):
         seen_before_embedding.append(list(session.log))
         return [1.0, 0.0, 0.0]
 
@@ -188,7 +195,7 @@ def test_no_restore_without_an_exact_rerun_and_no_hnsw_when_keyword_only(monkeyp
     _search(session)
     assert not any("enable_indexscan" in sql for _, sql in session.log)
 
-    async def _down(_text):
+    async def _down(_text, **_kw):
         raise RuntimeError("provider down")
 
     monkeypatch.setattr(embeddings, "get_embedding", _down)
@@ -278,7 +285,7 @@ def test_limit_is_clamped_to_1_and_50(monkeypatch):
 def test_an_embedding_failure_degrades_to_the_keyword_arm(monkeypatch, caplog, exc, code):
     monkeypatch.setattr(settings, "keyword_snippet_rows", 0, raising=False)
 
-    async def _fail(_text):
+    async def _fail(_text, **_kw):
         raise exc
 
     monkeypatch.setattr(embeddings, "get_embedding", _fail)
@@ -310,7 +317,7 @@ ZERO_TOKENS = (
 def test_degraded_and_empty_says_keyword_only(monkeypatch):
     monkeypatch.setattr(settings, "keyword_snippet_rows", 20, raising=False)
 
-    async def _fail(_text):
+    async def _fail(_text, **_kw):
         raise RuntimeError("down")
 
     monkeypatch.setattr(embeddings, "get_embedding", _fail)
@@ -325,7 +332,7 @@ def test_degraded_and_empty_says_keyword_only(monkeypatch):
     assert text.splitlines()[1] == tools.HYBRID_KEYWORD_ONLY_FOOTER
     assert paths == []
     # Both arms ran and found nothing: the same tokens, at zero.
-    async def _embed(_text):
+    async def _embed(_text, **_kw):
         return [1.0, 0.0, 0.0]
 
     monkeypatch.setattr(embeddings, "get_embedding", _embed)
@@ -343,7 +350,7 @@ def test_provider_down_returns_the_keyword_arm_marked(monkeypatch):
     the usage row and the D7 keys recorded."""
     monkeypatch.setattr(settings, "keyword_snippet_rows", 0, raising=False)
 
-    async def _fail(_text):
+    async def _fail(_text, **_kw):
         raise ConnectionError("down")
 
     monkeypatch.setattr(embeddings, "get_embedding", _fail)
@@ -366,7 +373,7 @@ def test_provider_down_returns_the_keyword_arm_marked(monkeypatch):
 
 
 def test_the_query_cap_is_pre_body(monkeypatch):
-    async def _never(_text):  # pragma: no cover - reaching this fails
+    async def _never(_text, **_kw):  # pragma: no cover - reaching this fails
         raise AssertionError("an embedding was requested for a refused query")
 
     class _NoSession:
@@ -557,7 +564,7 @@ def _field_literal(line: str, key: str) -> str:
 CONTROLS = "".join(chr(c) for c in (1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 14, 15))
 
 
-def _worst_case(monkeypatch, *, keyword_only: bool):
+def _worst_case(monkeypatch, *, keyword_only: bool, split: bool = False):
     monkeypatch.setattr(settings, "max_read_response_chars", 1000, raising=False)
     monkeypatch.setattr(settings, "hybrid_rrf_k", 1000, raising=False)
     monkeypatch.setattr(settings, "keyword_snippet_rows", 20, raising=False)
@@ -566,7 +573,7 @@ def _worst_case(monkeypatch, *, keyword_only: bool):
     path = ("\x01\"\\" * 400)[:1020] + ".md"
     tags = [f"t{i}" for i in range(1000)]
     if keyword_only:
-        async def _fail(_text):
+        async def _fail(_text, **_kw):
             raise refusals.ProviderInputTooLarge("too large")
 
         monkeypatch.setattr(embeddings, "get_embedding", _fail)
@@ -575,15 +582,24 @@ def _worst_case(monkeypatch, *, keyword_only: bool):
     semantic = [sem_row(1, path, title=title, tags=tags, chunk="x" * 500)] + [
         sem_row(100 + i, f"s{i}.md") for i in range(49)]
     session = _Session(ranked=[keyword], semantic=[semantic],
-                       snippet=[[snip(1, hl="a \x02b\x03")] + [snip(10 + i) for i in range(19)]])
+                       snippet=[[snip(1, hl="a \x02b\x03", title=False, body=not split)]
+                                + [snip(10 + i) for i in range(19)]]
+                       # A split row gets a computed head (V5), so its keyword
+                       # preview exists and `preview omitted` is asserted.
+                       + ([[SimpleNamespace(_mapping={"id": 1, "head": "opening words"})]]
+                          if split else []))
     result = _search(session, query, limit=50)
     assert result.rows[0].path == path
+    if split:
+        # No part and no pair matched: the longest value (#391, D4).
+        assert result.rows[0].matched_in == ["title+tags+body"]
     return query, title, path, result
 
 
+@pytest.mark.parametrize("split", [False, True])
 @pytest.mark.parametrize("keyword_only", [False, True])
-def test_the_worst_case_at_the_minimum_cap(monkeypatch, keyword_only):
-    query, title, path, result = _worst_case(monkeypatch, keyword_only=keyword_only)
+def test_the_worst_case_at_the_minimum_cap(monkeypatch, keyword_only, split):
+    query, title, path, result = _worst_case(monkeypatch, keyword_only=keyword_only, split=split)
     text, paths = _render(query, result)
     assert len(text) <= 1000, len(text)
     lines = text.splitlines()
@@ -602,6 +618,8 @@ def test_the_worst_case_at_the_minimum_cap(monkeypatch, keyword_only):
     for label in ("title_cut", "path_cut", "tags omitted", "preview omitted", "abbreviated"):
         assert label in row, label
     assert '"tags":[]' in row
+    if split:
+        assert "matched_in: title+tags+body" in row
     if keyword_only:
         assert "arms: keyword-only (semantic unavailable: provider_input_rejected)" in header
         assert tools.HYBRID_KEYWORD_ONLY_FOOTER in lines
@@ -670,21 +688,29 @@ def test_query_cut():
 
 
 def test_the_fixed_bounds():
-    """The constants the floor arithmetic (D7) rests on: header ≤ 400,
-    abbreviated structure ≤ 340, both footers ≤ 75, and 985 ≤ 1,000."""
+    """The constants the floor arithmetic (D7) rests on: header ≤ 405 (400
+    before the #389 `confidence` token), abbreviated structure ≤ 345 (340
+    before #391: the longest `matched_in` is now `title+tags+body`), both
+    footers ≤ 75, and 995 ≤ 1,000. The low-plus-`any` header is pinned in
+    `tests/test_search_confidence.py`."""
     worst_rows = [
         HybridRow(path=f"{i}.md", title="", tags=[], score=2 / 1050, keyword_rank=50,
                   semantic_rank=50, match="any", similarity=-0.123, stale=True,
-                  embedding_truncated=True, no_excerpt=True, matched_in=["title", "body"])
+                  embedding_truncated=True, no_excerpt=True, matched_in=["title+tags+body"])
         for i in range(50)
     ]
+    # The longest rendered `matched_in` of the eleven values (#391, D4).
+    longest = max(["title", "tags", "body", "title,tags", "title,body", "tags,body",
+                   "title,tags,body", "title+tags", "title+body", "tags+body",
+                   "title+tags+body"], key=len)
+    assert len(longest) == len("title+tags+body") == len("title,tags,body")
     result = HybridResult(
         rows=worst_rows, arms="keyword_only", semantic_unavailable="provider_input_rejected",
         rrf_k=1000, keyword_rows=50, keyword_all=50, keyword_any=50, semantic_rows=50,
         semantic_chunks=50, overlap=50, snippet_cap=49)
     q_lit, query_cut = tools._hybrid_query_echo("\x01" * 8192)
     header = tools._hybrid_header(q_lit, query_cut, result, worst_rows, 50)
-    assert len(header) <= tools.HYBRID_HEADER_MAX == 400, len(header)
+    assert len(header) <= tools.HYBRID_HEADER_MAX == 405, len(header)
     # The structure of the cut form, which the floor arithmetic adds 45 + 45
     # to; the omitted form trades both values (≥ 80 rendered) for two labels
     # (31 characters), so it is always the shorter line.
@@ -692,14 +718,15 @@ def test_the_fixed_bounds():
     structure = tools._hybrid_row_line(
         worst_rows[0], 1000, title="", path="", tags=[], preview=("none", ""),
         labels=cut_labels)
-    assert len(structure) <= tools.HYBRID_ROW_STRUCTURE_MAX == 340, len(structure)
+    assert len(structure) <= tools.HYBRID_ROW_STRUCTURE_MAX == 345, len(structure)
+    print(f"\n[hybrid bound] rerank=false abbreviated structure: {len(structure)}")
     omitted = tools._hybrid_row_line(
         worst_rows[0], 1000, title="", path="", tags=[], preview=("none", ""),
         labels=cut_labels[:4] + ["title omitted", "path omitted", "abbreviated"])
     assert len(omitted) < len(structure) + 80
     assert len(tools.HYBRID_KEYWORD_ONLY_FOOTER) <= tools.HYBRID_FOOTER_MAX == 75
     assert max(len(tools._hybrid_cap_footer(n)) for n in range(1, 51)) <= 75
-    assert 400 + 340 + 45 + 45 + 75 + 75 + 5 == 985 <= 1000
+    assert 405 + 345 + 45 + 45 + 75 + 75 + 5 == 995 <= 1000
 
 
 # ── telemetry from rendered rows ────────────────────────────────────────────
@@ -805,4 +832,94 @@ def test_the_rrf_k_default_and_range():
 
 def test_the_tool_takes_no_k_argument():
     props = server.mcp._tool_manager.get_tool("hybrid_search").parameters["properties"]
-    assert set(props) == {"query", "limit", "folder", "tags", "frontmatter"}
+    assert set(props) == {"query", "limit", "folder", "tags", "frontmatter", "rerank"}
+
+
+# ── #355: the transition line, the locator and the one-line preview ─────────
+
+
+def test_the_worst_case_at_the_minimum_cap_with_a_transition_and_a_locator(monkeypatch):
+    """The transition line only appears with both arms (no keyword-only
+    footer), and the abbreviation can continue into the omitted forms, so the
+    1,000-character floor still holds with the longest line and a locator."""
+    query, title, path, result = _worst_case(monkeypatch, keyword_only=False)
+    result.rechunk_pending = 9_999_999_999
+    result.rows[0].section = {"path": ["H" * 200] * 6, "ordinal": 99999}
+    text, paths = _render(query, result)
+    assert len(text) <= 1000, len(text)
+    lines = text.splitlines()
+    assert lines[1].startswith("index_transition: 9999999999 notes not yet re-chunked")
+    row = next(line for line in lines if line.startswith("- {"))
+    assert "section omitted" in row and "abbreviated" in row
+    assert paths == [path]
+
+
+def test_hybrid_carries_the_transition_line_and_the_locator(monkeypatch):
+    rows = [
+        _row("a.md", keyword_rank=None, semantic_rank=1, similarity=0.9, chunk="c",
+             section={"path": ["Plan", "Risks"], "ordinal": 7}),
+        _row("b.md", keyword_rank=2, semantic_rank=2, similarity=0.8, chunk="c",
+             section={"path": [], "ordinal": 0}),
+        _row("c.md"),
+    ]
+    text, _ = _render("q", _result(rows, rechunk_pending=3))
+    lines = text.splitlines()
+    assert lines[1] == embeddings.transition_line(3)
+    assert sum(1 for line in lines if line.startswith("index_transition:")) == 1
+    by_path = {_split_row(line)[0]["path"]: _split_row(line)[1]
+               for line in lines if line.startswith("- {")}
+    assert by_path["a.md"].endswith(' — § "Plan/Risks" (#7)')
+    assert by_path["b.md"].endswith(" — § (top of note)")
+    assert "§" not in by_path["c.md"]
+    empty, _ = _render("q", _result([], rechunk_pending=2))
+    assert empty.splitlines()[1] == embeddings.transition_line(2)
+    assert "index_transition" not in _render("q", _result(rows))[0]
+
+
+@pytest.mark.parametrize("query", ["a\nindex_transition: 0 notes", "a\x1b b"])
+def test_a_hostile_hybrid_query_cannot_displace_the_marker(query):
+    text, _ = _render(query, _result([_row("a.md")], rechunk_pending=5))
+    lines = text.splitlines()
+    assert lines[1] == embeddings.transition_line(5)
+    assert sum(1 for line in lines if line.startswith("index_transition:")) == 1
+
+
+def test_the_service_reads_the_owner_scoped_count_only_with_both_arms(monkeypatch):
+    seen = []
+
+    async def count(_session, uid):
+        seen.append(uid)
+        return 4
+
+    monkeypatch.setattr(embeddings, "rechunk_pending_count", count)
+    monkeypatch.setattr(settings, "keyword_snippet_rows", 0, raising=False)
+    session = _Session(ranked=[[kw_row(1, "a.md")]], semantic=[[sem_row(2, "b.md")]])
+    result = _search(session, user_id=7)
+    assert seen == [7] and result.rechunk_pending == 4
+
+    async def _down(_text, **_kw):
+        raise RuntimeError("provider down")
+
+    monkeypatch.setattr(embeddings, "get_embedding", _down)
+    seen.clear()
+    result = _search(_Session(ranked=[[kw_row(1, "a.md")]]), user_id=7)
+    assert seen == [] and result.rechunk_pending == 0
+
+
+def test_hybrid_embeds_the_query_as_a_query(monkeypatch):
+    kinds = []
+
+    async def _embed(_text, *, kind):
+        kinds.append(kind)
+        return [1.0, 0.0, 0.0]
+
+    monkeypatch.setattr(embeddings, "get_embedding", _embed)
+    _search(_Session(ranked=[[kw_row(1, "a.md")]], semantic=[[sem_row(2, "b.md")]]))
+    assert kinds == ["query"]
+
+
+def test_the_hybrid_chunk_preview_is_one_line_from_the_uncut_chunk():
+    row = _row("a.md", keyword_rank=None, semantic_rank=1, similarity=0.9,
+               chunk=" " * 600 + "answer\nmore")
+    obj, _ = _split_row(_render("q", _result([row]))[0].splitlines()[1])
+    assert obj["preview_kind"] == "chunk" and obj["preview"] == "answer more"

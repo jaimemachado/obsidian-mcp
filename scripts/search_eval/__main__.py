@@ -85,6 +85,26 @@ def _cmd_score(args) -> int:
     return result.exit_code
 
 
+def _cmd_confidence(args) -> int:
+    from scripts.search_eval.confidence import run_confidence
+
+    result = run_confidence(Path(args.data), args.threshold)
+    sys.stdout.write(result.table)
+    return EXIT_OK
+
+
+def _cmd_gate(args) -> int:
+    from scripts.search_eval.gate import run_gate
+
+    result = run_gate(
+        report_path=Path(args.report), arm=args.arm, metrics=args.metrics,
+        slices=args.slices, min_ci_lower=args.min_ci_lower, out=Path(args.out),
+        baseline_report_path=Path(args.baseline_report) if args.baseline_report else None,
+    )
+    sys.stdout.write(result.table)
+    return result.exit_code
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(prog="python -m scripts.search_eval",
                      description="Search evaluation harness (#356).")
@@ -110,7 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--data", required=True)
     p.add_argument("--arm", action="extend", nargs="+", required=True)
     p.add_argument("--generation", default=None, help="generation id (default: a UTC stamp)")
-    p.add_argument("--depth", type=int, default=20)
+    p.add_argument("--depth", type=int, default=50)
     p.add_argument("--limit-queries", type=int, default=None)
     p.add_argument("--database-url", default=None,
                    help="the restored copy (default: $SEARCH_EVAL_DATABASE_URL)")
@@ -126,6 +146,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-queries", type=int, default=50)
     p.add_argument("--seed", type=int, default=0)
     p.set_defaults(func=_cmd_score)
+
+    p = sub.add_parser("confidence",
+                       help="tabulate SEARCH_LOW_CONFIDENCE_SIMILARITY calibration evidence (#389)")
+    p.add_argument("--data", required=True, help="the data directory `mine` wrote")
+    p.add_argument("--threshold", type=_positive_float, required=True,
+                   help="the candidate threshold T, in (0, 1]")
+    p.set_defaults(func=_cmd_confidence)
+
+    p = sub.add_parser("gate", help="PASS/FAIL per metric x slice from a scored report")
+    p.add_argument("--report", required=True, help="the scored report.json")
+    p.add_argument("--arm", required=True, help="the candidate arm's label in the report")
+    p.add_argument("--metrics", required=True, help="comma-separated, e.g. recall@10,ndcg@10")
+    p.add_argument("--slices", required=True, help="comma-separated, e.g. overall,class:identifier")
+    p.add_argument("--min-ci-lower", type=float, required=True,
+                   help="a cell FAILs when its CI95 lower bound is below this")
+    p.add_argument("--out", required=True, help="the Markdown table, for the PR body")
+    p.add_argument("--baseline-report", default=None,
+                   help="the staging generation's report, required for a runfile: baseline")
+    p.set_defaults(func=_cmd_gate)
     return parser
 
 

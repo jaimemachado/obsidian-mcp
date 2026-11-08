@@ -5,8 +5,11 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import ConfigDict
 
+from src.auth.session import current_principal
 from src.config import settings
+from src.mcp_server.auth import current_permission
 from src.mcp_server.read_result import ReadNoteResult
+from src.mcp_server.tool_permissions import visible
 from src.mcp_server.tools import (
     check_upload_impl,
     create_note_impl,
@@ -165,7 +168,38 @@ SERVER_INSTRUCTIONS = (
 )
 
 
-mcp = FastMCP(
+class _ScopedFastMCP(FastMCP):
+    """`FastMCP` whose `tools/list` follows the authorization presented (#358).
+
+    The override seam is the **public** `list_tools()`: SDK 1.30 registers it
+    as the `tools/list` handler in `FastMCP._setup_handlers`, and SDK 2.x's
+    `MCPServer._handle_list_tools` awaits `self.list_tools()` — so the 2.x
+    migration (#365) changes only the base class. That migration must keep the
+    2026-07-28 `cacheScope` of `tools/list` `"private"` (the list varies by
+    credential; 2.x's default) and, if it ever paginates, page the filtered
+    list.
+
+    The rule (`tool_permissions.visible`) reads only this request's
+    `current_principal` and `current_permission` — the value `_require_write`
+    reads — so the result depends on the presented credential and nothing
+    else: no earlier request, no cache. Called in-process with no principal
+    (tests, stdio, `MCP_SANDBOX_MODE`) it returns the full list. The return
+    type is unchanged (`list[MCPTool]`); the SDK's cursor handling is untouched
+    (the complete list, no `nextCursor`). This hides tools, it does not guard
+    them: a hidden tool called by name is refused by `_tracked`'s write gate
+    exactly as before. Never touch `self._mcp_server._tool_cache` from here.
+    """
+
+    async def list_tools(self):
+        tools = await super().list_tools()
+        return visible(
+            tools,
+            principal=current_principal.get(),
+            permission=current_permission.get(),
+        )
+
+
+mcp = _ScopedFastMCP(
     "obsidian-vault",
     instructions=SERVER_INSTRUCTIONS,
     stateless_http=True,
@@ -209,19 +243,23 @@ async def keyword_search(
     `"exact phrase"` (adjacent words), `budget OR forecast` (either), `-draft`
     (exclude; honoured in the `any` block too). A note's title and frontmatter
     `aliases` are indexed above its body, so a query that is a note's title
-    ranks that note first.
+    ranks that note first. A note's tags (frontmatter and inline `#tags`; a
+    nested `#a/b` also as `a` and `b`) are indexed below its title and
+    aliases and above its body.
 
     Each result carries `rank` (a relative score: a body-only match scores in
     the thousandths, a title match near 1, and an `any` row is scored against
     the fallback query, so ranks compare only within one block of one page),
-    `match`, `matched_in` (`title` — title or aliases — and/or
-    `body`, or `title+body` when the terms are split between them), `terms`
-    (`k/n`: how many of the query's terms the note contains), and a second
-    line: `snippet:` — the matching body text with the matches in `«»` — or
-    `head:` — the note's opening words when the body alone does not match
-    or the match is beyond the stored excerpt. Snippets are computed for the
-    first rows of the page (the header says `snippets: first N` when the page
-    is longer). The header always carries the `all`/`any` counts and how many
+    `match`, `matched_in` (the parts that alone match: `title` — title or
+    aliases — `tags`, `body`, comma-joined; or, when the terms are split
+    between parts, the first of `title+tags`, `title+body`, `tags+body`,
+    `title+tags+body` that matches), `terms` (`k/n`: how many of the query's
+    terms the note contains), and a second line: `snippet:` — the matching
+    body text with the matches in `«»` — or `head:` — the note's opening
+    words when the body alone does not match or the match is beyond the
+    stored excerpt (a note with no body has no second line). Snippets are
+    computed for the first rows of the page (the header says
+    `snippets: first N` when the page is longer). The header always carries the `all`/`any` counts and how many
     rows have no stored excerpt yet (notes indexed before this version; the
     footer names the one-time rebuild). Call `read_note` on a result's path
     for the full note.
@@ -401,6 +439,7 @@ async def semantic_search(
     folder: str | None = None,
     tags: list[str] | None = None,
     frontmatter: dict | None = None,
+    rerank: bool = False,
 ) -> str:
     """Vector similarity search over the vault's chunk embeddings. Use this for conceptual
     or paraphrased queries — anywhere exact word matching would miss the point.
@@ -430,12 +469,34 @@ async def semantic_search(
     note is a match against its head; its tail is not reachable by semantic
     search at all, though `keyword_search` still covers the whole note.
 
+    **Section locator.** A fresh row names the section it matched on its
+    result line: `§ "<heading path>" (#N)` for a heading's section, or
+    `§ (top of note)` for text before the first heading.
+    `read_note(path, section="#N")` reads exactly that section. The quoted
+    path is note text; the `(#N)` after it is the server's. The locator is
+    omitted on stale rows and on rows not yet re-embedded since heading-aware
+    chunking. While any of your notes is not yet re-chunked, the line after
+    the header reads `index_transition: N notes not yet re-chunked; …`:
+    ranking across the two generations is approximate, so re-run once it is
+    gone. Previews are one line.
+
     **The bound on the staleness signal, stated so it is not over-read:** it
     reports what the index has *committed*. An edit that the indexer has not
     yet scanned is not marked, so a note edited in the last few minutes may
     come back unmarked with a superseded preview. The guarantee is "no result
     presents text the index knows to be superseded", not "no result is ever
     out of date".
+
+    `rerank=true` asks the deployment's reranker to reorder the candidates
+    this call already fetched; it can add up to the configured timeout. Its
+    rows are one-line quoted objects followed by server fields (with
+    `rerank_score` when reranked). The header says `reranked: true` or
+    `reranked: false (<reason>)`, and an unreranked page keeps the unreranked
+    order; `reranked: false (not_configured)` means this deployment has no
+    reranker.
+
+    The header also carries `confidence: ok` or `confidence: low` (the
+    closest match is under the deployment's threshold; `ok` when none is set).
 
     Args:
         query: Natural language description of what you're looking for.
@@ -445,9 +506,12 @@ async def semantic_search(
             (e.g. ["product"]).
         frontmatter: Optional dict of frontmatter key/value pairs; strict type matching —
             string "0" does not match integer 0 (e.g. {"status": "active"}).
+        rerank: Reorder the fetched candidates with the deployment's reranker
+            (default false).
     """
     return await semantic_search_impl(
-        query, limit=limit, folder=folder, tags=tags, frontmatter=frontmatter
+        query, limit=limit, folder=folder, tags=tags, frontmatter=frontmatter,
+        rerank=rerank,
     )
 
 
@@ -679,6 +743,17 @@ async def find_related(path: str, limit: int = 10) -> str:
 
     **The bound on the staleness signal:** it reports what the index has
     committed, so an edit the indexer has not yet scanned is not marked.
+
+    **Section locator.** A fresh row names the section it matched on its
+    result line: `§ "<heading path>" (#N)` for a heading's section, or
+    `§ (top of note)` for text before the first heading.
+    `read_note(path, section="#N")` reads exactly that section. The quoted
+    path is note text; the `(#N)` after it is the server's. The locator is
+    omitted on stale rows and on rows not yet re-embedded since heading-aware
+    chunking. While any of your notes is not yet re-chunked, the line after
+    the header reads `index_transition: N notes not yet re-chunked; …`:
+    ranking across the two generations is approximate, so re-run once it is
+    gone. Previews are one line.
 
     Args:
         path: Vault-relative path to the source note.
@@ -1361,6 +1436,7 @@ async def hybrid_search(
     folder: str | None = None,
     tags: list[str] | None = None,
     frontmatter: dict | None = None,
+    rerank: bool = False,
 ) -> str:
     """Keyword and semantic search fused into one ranking, for a query that is not clearly an identifier or a paraphrase.
 
@@ -1387,7 +1463,10 @@ async def hybrid_search(
     that make the score). `preview_kind` is `snippet` (a keyword highlight in
     `«»`), `head`, `chunk` (semantic), `stale_notice` or `none`, from the arm
     that ranked the note better. `stale: true` and `embedding_truncated: true`
-    mean what they mean in `semantic_search`. A long response drops whole rows
+    mean what they mean in `semantic_search`, and so do the semantic arm's
+    `§ "<heading path>" (#N)` / `§ (top of note)` field (read the section
+    with `read_note(path, section="#N")`) and the `index_transition:` line
+    under the header. A long response drops whole rows
     from the end and says how many; a first row that does not fit is cut and
     labelled. Call `read_note` on a path for the full note.
 
@@ -1397,6 +1476,21 @@ async def hybrid_search(
     keyword arm alone, in keyword order, and `semantic_search` will fail the
     same way until the provider recovers.
 
+    `rerank=true` asks the deployment's reranker to reorder the candidates
+    this call already fetched; it can add up to the configured timeout. Its
+    rows are one-line quoted objects followed by server fields (with
+    `rerank_score` after them when reranked). The header says
+    `reranked: true` or `reranked: false (<reason>)`, and an unreranked page
+    keeps the unreranked order; `reranked: false (not_configured)` means
+    this deployment has no reranker.
+
+    Every page's header also says `confidence: ok` or `confidence: low`:
+    `low` means no note matched all the keyword terms and the closest
+    semantic candidate is under this deployment's similarity threshold (a
+    line then suggests `keyword_search` or `get_neighborhood`), and `ok` is
+    also what a deployment that set no threshold says, so it is not a
+    quality claim.
+
     Args:
         query: What you are looking for — words, a phrase or a question.
         limit: Maximum number of results (default 10, at most 50).
@@ -1404,9 +1498,12 @@ async def hybrid_search(
         tags: Optional list of tag names; only notes carrying ALL listed tags match.
         frontmatter: Optional dict of frontmatter key/value pairs; strict type matching —
             string "0" does not match integer 0 (e.g. {"status": "active"}).
+        rerank: Reorder the first 50 fused candidates with the deployment's
+            reranker (default false).
     """
     return await hybrid_search_impl(
-        query, limit=limit, folder=folder, tags=tags, frontmatter=frontmatter
+        query, limit=limit, folder=folder, tags=tags, frontmatter=frontmatter,
+        rerank=rerank,
     )
 
 

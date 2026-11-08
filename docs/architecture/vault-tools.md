@@ -64,7 +64,9 @@ treat annotations as untrusted unless the server is trusted.
   provider round trip — stays closed-world although the embedding provider
   may be a remote API (L5): the provider is deployment infrastructure under the
   operator's control, configured once in `.env`, not an open-world dependency
-  the agent chooses per call — the tool's domain of interaction is the vault;
+  the agent chooses per call — the tool's domain of interaction is the vault.
+  The optional reranker behind both tools' `rerank=true` (#367) is treated
+  the same way, so their annotations do not change;
 - idempotent = read-only. `delete_*` and `set_frontmatter` arguably qualify,
   but a wrong `true` lets a client re-run a write silently while a wrong
   `false` costs one confirmation, so the hint is set in the safe direction.
@@ -126,6 +128,96 @@ the statement (`edit_note`, `move_note`, `set_frontmatter`, and the otherwise
 untouched `create_note` and `delete_note`) now say so; and "`expected_hash` is
 optional" is a default, because `WRITE_PRECONDITION_REQUIRED=true` refuses an
 omitted hash with `precondition_required`.
+
+### Who sees which tools (#358)
+
+`tools/list` follows the authorization presented on the request, which the MCP
+2026-07-28 tools page permits in so many words: the set "**MUST NOT** vary
+per-connection or as a side effect of other requests on the connection. The
+set **MAY** vary by the authorization presented on the request — for example,
+returning only the tools the caller's granted scopes permit".
+
+| Request | `tools/list` |
+| --- | --- |
+| OAuth grant whose scope lacks `readwrite` | **19** — the full list minus the nine write-required tools |
+| OAuth grant with `readwrite`, API key (`read` or `readwrite`) | 28, byte-identical to before |
+| `MCP_SANDBOX_MODE`, stdio, in-process (no principal) | 28 |
+| No credential | never reaches the handler: the middleware answers 401 |
+
+Read-only **API keys** keep the full list by owner decision (2026-10-31): a
+key's permission is set and shown by its owner in the panel, and keeping it
+full leaves every script and registry byte-identical (L1).
+
+**One registry, two consumers.** `WRITE_REQUIRED_TOOLS` in
+`src/mcp_server/tool_permissions.py` is a `frozenset` literal: `create_note`,
+`edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file`,
+`delete_file`, `import_from_url`, `request_upload`. It drives
+
+- **the gate**: `_tracked` calls `_require_write()` for a member at the *body
+  boundary* — after every admission gate (rate buckets, vault root, argument
+  caps, concurrency, quota), exactly where the body would start — and returns
+  its refusal without running the body. Tokens and the quota slot are spent as
+  before, because the body used to refuse as its first act; the marker, the
+  `tool_write_refused` event and the outcome are `_require_write`'s own. The
+  in-body `_require_write()` calls and `_mint_preflight(need_write=True)` stay
+  as defence in depth;
+- **the list**: `_ScopedFastMCP.list_tools()` (`server.py`) drops the members
+  for a filtered principal, reading `current_principal` and the same
+  `current_permission` `_require_write` reads.
+
+A first draft stamped the hidden set on the `_tracked` wrapper; Codex's spec
+review showed that was metadata enforcement never consumed, agreeing with the
+refusals only because a test said so. The registry is the enforcement source
+now, and it must equal the write bucket plus `request_upload` (whose write
+charge is taken at `PUT /transfer/upload` redemption) and the destructive set
+plus `create_note`. `check_upload` and `request_download` stay listed: neither
+refuses a read-only caller.
+
+**The one behaviour difference at call time (L5).** `write_file` and
+`delete_file` refused some calls before their in-body permission check:
+`expected_hash` syntax (`malformed_precondition`, both tools) and, for
+`write_file(overwrite=false)` with a well-formed hash, `no_incumbent`. For a
+read-only caller **any** such pre-permission refusal is now
+`permission_denied`; a `readwrite` caller's refusals are unchanged (owner
+decision, 2026-10-31, after the verifier and adversarial Codex both found the
+`no_incumbent` case). The safer order — nothing about the
+arguments is disclosed to a caller who may not write.
+
+**The seam survives SDK 2.x.** The override is the public `list_tools()`, which
+1.30's `FastMCP._setup_handlers` registers as the handler and 2.x's
+`MCPServer._handle_list_tools` awaits. `tool_permissions.py` imports nothing
+from `mcp`, directly or transitively, even when invoked (a clean-subprocess
+test). For #365: the 2026-07-28 `cacheScope` of `tools/list` must stay
+`"private"` (2.x's default) because the list varies by credential, and any
+future pagination must page the filtered list. Today the result is complete,
+with no `nextCursor`, and a `cursor` is ignored.
+
+**The 1.30 tool cache.** The SDK keeps one process-wide `_tool_cache`, which a
+plain-list `tools/list` result clears and refills — so after a filtered list it
+holds 19 entries. Every cache miss refreshes under the *calling* request's
+credential, so a `readwrite` call still finds and output-validates its tool; a
+read-only call of a hidden tool after a filtered list logs the SDK's "not
+listed, no validation will be performed" WARNING and skips output validation
+of a refusal that would have passed it (L3). The code never touches the cache.
+
+**Not filtered**: `instructions` (L2 — a read-only grant reads a lead naming
+`create_note`/`edit_note`), descriptions, schemas, annotations. No
+`notifications/tools/list_changed` and `listChanged: false`: the list depends
+on the credential, not on time, so after a panel scope change a client sees the
+new list when it next lists (reconnect; L4). `tools/list` writes no usage row.
+No setting.
+
+**Fixtures.** `tests/fixtures/tools_list_full_v1.json` is the complete
+pre-change `tools/list` result for an API key — every field of all 28 tools —
+captured over HTTP before the code changed; the full list is asserted
+byte-identical to it (canonical JSON) for a `read` key, a `readwrite` key and a
+`readwrite` grant. It is also the 1.0 freeze fixture: a change that alters the
+published surface regenerates it deliberately and says so in its spec.
+`tests/fixtures/tools_list_readonly_oauth.json` pins the 19 names in order.
+`tests/test_issue_358_scoped_tools_list.py` also races, through one barrier,
+a read-only list, an API-key list, a `readwrite` list and two hidden-tool calls
+(50 rounds per cache ordering, plus an injected suspension), each checked
+against its own credential.
 
 ## Write tools
 Returned body refusals carry a pure `BodyOutcome` and an authoritative final
@@ -385,7 +477,7 @@ Neither subsumes the other and neither was removed. A matching `expected_hash` d
 
 ### The precedence ladder, and why the order is the design
 
-1. **syntax** — a non-canonical hash is `malformed_precondition`, decided **at the tool's entry: before path resolution, before `_leaf_state_error`, before any read**, in every tool and every mode. `_precondition_syntax_error` is therefore a *separate* helper from the comparison, and a pure function of the argument. It wins over not-found, over a symlinked leaf and over the size cap — a caller told "not found" for a call whose argument was never valid fixes the wrong thing.
+1. **syntax** — a non-canonical hash is `malformed_precondition` (for a *read-only* caller of a write tool the body-boundary permission gate answers first, #358 L5), decided **at the tool's entry: before path resolution, before `_leaf_state_error`, before any read**, in every tool and every mode. `_precondition_syntax_error` is therefore a *separate* helper from the comparison, and a pure function of the argument. It wins over not-found, over a symlinked leaf and over the size cap — a caller told "not found" for a call whose argument was never valid fixes the wrong thing.
 2. **no incumbent** — a tool or mode that can never bind incumbent bytes (`create_note`, `write_file(overwrite=False)`, an overwrite of a path with no file at it) is `no_incumbent`.
 3. **unavailable** — an incumbent larger than the cap this tool may read is `precondition_unavailable`, naming the cap. "I could not check" and "I checked and it differs" are different facts; answering the first with the second sends the caller after a hash it can never obtain.
 4. **required** — an enforceable call supplying no hash while `WRITE_PRECONDITION_REQUIRED` is on is `precondition_required`. Over-cap **outranks** it, for the same reason.
@@ -556,7 +648,7 @@ There are **byte** caps, a **character** cap, a **transport** cap and a process-
 
 - `MAX_FILE_READ_BYTES` / `MAX_FILE_WRITE_BYTES` bound what the **server** reads into or writes out of memory. They refuse the operation.
 - `MAX_READ_RESPONSE_CHARS` (default 40,000 ≈ 10K tokens) bounds what `read_note` / `read_file` **return to the caller**, whose context the result consumes. It truncates rather than refusing. For `read_note` the budget is **per field, not per response**: `content` gets the cap, the heading `outline` gets its own equal budget, and the metadata fields share a third — so a truncated whole-note read can carry several capped components, which is why the description tells the agent to read one section with `section=` rather than page a large note.
-- `hybrid_search` (#354) is bounded by `MAX_READ_RESPONSE_CHARS` **as a whole response, on rendered length** (after JSON-literal escaping, where a control character costs six): the header (≤ 400), the keyword-only footer and the cap footer (each ≤ 75) are reserved, rows are dropped **whole** from the end with the omitted count stated, and a first row that does not fit is abbreviated in a fixed, labelled order (tags, preview, then a 40–45-rendered-character cut of title and path) so the page always makes progress; at the 1,000-character floor the worst case is 985. No cut splits an escape. See [search](search.md), "Hybrid search (#354)".
+- `hybrid_search` (#354) is bounded by `MAX_READ_RESPONSE_CHARS` **as a whole response, on rendered length** (after JSON-literal escaping, where a control character costs six): the header (≤ 405 since #389), the keyword-only footer and the cap footer (each ≤ 75) are reserved, rows are dropped **whole** from the end with the omitted count stated, and a first row that does not fit is abbreviated in a fixed, labelled order (tags, preview, then a 40–45-rendered-character cut of title and path) so the page always makes progress; at the 1,000-character floor the floor sum is 995 (#389's header and #391's longest `matched_in`). No cut splits an escape. See [search](search.md), "Hybrid search (#354)".
 - The MCP streamable-HTTP **request body limit** bounds what the transport accepts at all, before any tool runs. It is derived, not configured: `max(2 × MAX_FILE_WRITE_BYTES, 6 × MAX_NOTE_BYTES) + 1 MiB` (61 MiB with the defaults), passed to `FastMCP(max_request_body_size=)` from `Settings.mcp_max_request_body_bytes`. The SDK's own default is 4 MiB, which would silently reject writes far below our documented 25 MB cap. The formula guarantees — for a *canonical* envelope, i.e. JSON-RPC framing plus non-content arguments under 1 MiB — that a base64 `write_file` at the cap (base64 is `4·⌈n/3⌉ ≤ 2n + 2`) and any note write up to `MAX_NOTE_BYTES` (JSON escaping expands a byte at most 6×) always reach the tool, which then decides. Unsupported shapes are bounded by the transport with a bare HTTP 413 and no tool error: text-mode `write_file` whose escaping exceeds the limit (send base64 — always safe), an envelope over 1 MiB, and arguments that are large but discarded.
 - The **body-memory budget** (#322) is the process-wide counterpart of that per-request limit: it bounds the *sum* of request bodies in flight across all `/mcp` requests, before the app reads a byte. Each authenticated POST reserves its declared `Content-Length` (the full per-request limit when unknown) against a budget derived from the container's memory (cgroup limit × 0.5 ÷ 8: 128 MiB of raw body on 2 GiB, one maximum write plus everything else), waits up to 15 s if it does not fit, and is otherwise answered with a transport 429 `code: body_memory`. It does not change the per-request limit, and startup refuses a container too small to admit one maximum body. See [rate limits](rate-limits.md).
 
@@ -636,6 +728,18 @@ The ordinal exists because **path-style cannot disambiguate duplicate siblings**
 Ambiguity stays an error that names the resolving ordinals; it never silently picks the first match (that is how an agent edits the wrong section and reports success).
 
 Helpers: `_resolve_section_index` (selector → index), `_section_body_span` (index → body span), `extract_section_parts` (heading line and body **separately** — what `read_note` returns as its `heading` and `content` fields), `extract_section` (the same two concatenated, for callers that want one string), `replace_section` (body only, for writes), `outline_sections` (depth/text/size/ordinal per section).
+
+**The chunker is a consumer of `_scan_headings` (#355).** `embed_note`
+splits a note at the headings this scanner finds, over the same
+frontmatter-stripped body, and records each chunk's ordinal so
+`semantic_search` / `find_related` can print `§ "…" (#N)` and the agent can
+call `read_note(path, section="#N")`. The guarantee is **containment**: a
+chunk with ordinal N is a substring of section N's body (as `read_note`
+returns it) with the whole-body fence spans removed — the chunk covers only
+heading N's own text, while the section also holds its subsections. **A change
+to the heading scan (or to `_section_body_span`'s body-start step) is now also
+a `CHUNKING_VERSION` bump** in `src/services/embeddings.py`, or every stored
+ordinal silently names the wrong section.
 
 **Selector parity is about resolution on writes this tool admits, not about
 admission.** Two shapes read fine by section and refuse every section write —

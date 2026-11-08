@@ -34,6 +34,7 @@ import contextlib
 import datetime
 import itertools
 import os
+import random
 
 import asyncpg
 import pytest
@@ -60,7 +61,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "033"
+HEAD_REVISION = "038"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -71,11 +72,26 @@ MARKER = "created by 013_schema_reconciliation"
 # made explicit, parentheses added — not our guess at it. The migration derives
 # the same string at runtime instead of hard-coding it; this constant is the
 # pin that tells us if either side moves.
-CANONICAL_CONSTRAINTDEF = (
+#
+# This is the definition at any revision from 010 to 037. Migration 038 (#420)
+# replaces it with `CANONICAL_CONSTRAINTDEF`, which keeps both clauses and adds
+# a third, so every case that downgrades to 012 asserts this one and every case
+# at head asserts the successor.
+CANONICAL_CONSTRAINTDEF_010 = (
     "CHECK (((((token_endpoint_auth_method)::text = 'none'::text) "
     "AND (client_secret_hash IS NULL)) "
     "OR (((token_endpoint_auth_method)::text = 'client_secret_post'::text) "
     "AND (client_secret_hash IS NOT NULL))))"
+)
+
+# 038's definition at head, measured the same way.
+CANONICAL_CONSTRAINTDEF = (
+    "CHECK (((((token_endpoint_auth_method)::text = 'none'::text) "
+    "AND (client_secret_hash IS NULL)) "
+    "OR (((token_endpoint_auth_method)::text = 'client_secret_post'::text) "
+    "AND (client_secret_hash IS NOT NULL)) "
+    "OR (((token_endpoint_auth_method)::text = 'private_key_jwt'::text) "
+    "AND (client_secret_hash IS NULL))))"
 )
 
 # The rest of the 010 shape, likewise as PostgreSQL 16 prints it. `alembic
@@ -558,7 +574,7 @@ def test_wrong_column_type_is_reconciled():
         assert constraint_row(url) is not None, (
             "downgrade dropped a constraint 013 did not create"
         )
-        assert constraint_row(url)[1] == CANONICAL_CONSTRAINTDEF
+        assert constraint_row(url)[1] == CANONICAL_CONSTRAINTDEF_010
 
 
 def test_impostor_constraint_does_not_block_the_type_repair():
@@ -697,7 +713,7 @@ def test_downgrade_keeps_a_constraint_013_did_not_create():
         assert alembic_version(url) == "012"
         row = constraint_row(url)
         assert row is not None, "downgrade dropped 010's constraint"
-        assert row[1] == CANONICAL_CONSTRAINTDEF
+        assert row[1] == CANONICAL_CONSTRAINTDEF_010
         # Documented asymmetry: NOT NULL stays. Relaxing it would re-create the
         # very drift 013 exists to remove, and the models still declare it.
         assert all(not_null_flags(url).values())
@@ -7195,7 +7211,7 @@ def test_033_chains_from_032():
     config = Config()
     config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_current_head() == HEAD_REVISION == "033"
+    assert script.get_current_head() == HEAD_REVISION
     assert script.get_revision("033").down_revision == "032"
 
 
@@ -7352,3 +7368,1387 @@ def test_downgrade_033_leaves_units_it_did_not_create():
         assert "033 downgrade: leaving note_event_gaps in place" in combined
         assert fetchval(url, "SELECT to_regclass('public.note_event_gaps')") is not None
         assert fetchval(url, "SELECT to_regclass('public.note_events')") is None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 034 — heading-aware chunks: locator, prefix, chunking version (#355)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Five nullable, marked columns with no default and no backfill, and two
+# CHECKs added NOT VALID then validated. Alembic compares the types,
+# nullability and comments; the CHECK definitions, their validation and
+# markers, the absence of a backfill and the downgrade's delete-and-uncertify
+# are asserted here.
+
+COLUMNS_034 = {
+    ("note_embeddings", "heading_path"): ("text[]", "chunk section locator (034_heading_chunks)"),
+    ("note_embeddings", "section_ordinal"): ("integer", "chunk section locator (034_heading_chunks)"),
+    ("note_embeddings", "embed_prefix"): ("text", "embedded context prefix (034_heading_chunks)"),
+    ("notes_metadata", "embedded_chunking_version"): (
+        "smallint", "chunking version of the stored vectors (034_heading_chunks)",
+    ),
+    ("notes_metadata", "embedded_input_digest"): (
+        "character varying(64)", "digest of the embedded provider inputs (034_heading_chunks)",
+    ),
+}
+CHECKS_034 = {
+    "ck_note_embeddings_heading_meta": (
+        "note_embeddings", "all-or-none chunk locator (034_heading_chunks)",
+    ),
+    "ck_notes_metadata_embedded_chunking_version": (
+        "notes_metadata", "chunking version floor (034_heading_chunks)",
+    ),
+}
+VECTOR_034 = "[" + ",".join(["0.1"] * DIM) + "]"
+
+
+def checks_034(url):
+    return {
+        r["conname"]: (r["def"], r["convalidated"], r["comment"])
+        for r in fetch(
+            url,
+            "SELECT conname, pg_get_constraintdef(oid) AS def, convalidated, "
+            "       obj_description(oid, 'pg_constraint') AS comment "
+            "FROM pg_constraint WHERE contype = 'c' AND conname = ANY($1::text[])",
+            list(CHECKS_034),
+        )
+    }
+
+
+def assert_034_shape(url):
+    for (table, column), (coltype, marker) in COLUMNS_034.items():
+        assert column_state_029(url, table, column) == (coltype, False, None, marker), (
+            table, column,
+        )
+    checks = checks_034(url)
+    assert set(checks) == set(CHECKS_034)
+    for name, (_table, marker) in CHECKS_034.items():
+        definition, validated, comment = checks[name]
+        assert validated is True, name
+        assert comment == marker, name
+    heading = checks["ck_note_embeddings_heading_meta"][0]
+    for fragment in ("heading_path IS NULL", "section_ordinal >= 0", "cardinality(heading_path)"):
+        assert fragment in heading, heading
+    assert "embedded_chunking_version >= 1" in checks[
+        "ck_notes_metadata_embedded_chunking_version"
+    ][0]
+
+
+def insert_embedding_034(url, row_id, note_id, chunk, *, prefix=None, path=None, ordinal=None):
+    if prefix is None:
+        sql(
+            url,
+            "INSERT INTO note_embeddings (id, note_id, chunk_index, chunk_text, embedding) "
+            f"VALUES ($1, $2, 0, $3, '{VECTOR_034}')",
+            row_id, note_id, chunk,
+        )
+    else:
+        sql(
+            url,
+            "INSERT INTO note_embeddings (id, note_id, chunk_index, chunk_text, embedding, "
+            " heading_path, section_ordinal, embed_prefix) "
+            f"VALUES ($1, $2, 0, $3, '{VECTOR_034}', $4, $5, $6)",
+            row_id, note_id, chunk, path, ordinal, prefix,
+        )
+
+
+def refuse_034(url, *, must_mention):
+    _harness.run_alembic(url, "stamp", "033", dimensions=DIM)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "034 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    assert alembic_version(url) == "033", "nothing should have been recorded"
+    return combined
+
+
+def test_034_chains_from_033():
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config()
+    config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    assert script.get_revision("034").down_revision == "033"
+
+
+def test_034_fresh_shape_is_marked_validated_and_clean():
+    with throwaway_db("schema_034_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+        assert_034_shape(url)
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_034_from_033_with_rows_backfills_nothing_and_leaves_vectors_alone():
+    with throwaway_db("schema_034_chain", revision="033") as url:
+        insert_stat_note(url, 1, "a.md", (1, 2, 3, 4))
+        insert_stat_note(url, 2, "b.md", (None, None, None, None))
+        sql(url, "UPDATE notes_metadata SET embedded_content_hash = content_hash")
+        insert_embedding_034(url, 10, 1, "alpha")
+        insert_embedding_034(url, 11, 2, "beta")
+        before = fetch(url, "SELECT id, chunk_text, embedding::text AS v FROM note_embeddings ORDER BY id")
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(
+            url,
+            "SELECT count(*) FROM note_embeddings WHERE heading_path IS NOT NULL "
+            "OR section_ordinal IS NOT NULL OR embed_prefix IS NOT NULL",
+        ) == 0
+        assert fetchval(
+            url,
+            "SELECT count(*) FROM notes_metadata WHERE embedded_chunking_version IS NOT NULL "
+            "OR embedded_input_digest IS NOT NULL",
+        ) == 0
+        assert fetchval(
+            url, "SELECT count(*) FROM notes_metadata WHERE embedded_content_hash = content_hash"
+        ) == 2, "the upgrade must not un-certify anything"
+        after = fetch(url, "SELECT id, chunk_text, embedding::text AS v FROM note_embeddings ORDER BY id")
+        assert [tuple(r) for r in after] == [tuple(r) for r in before]
+        assert_034_shape(url)
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_034_checks_are_enforced():
+    with throwaway_db("schema_034_enforced") as url:
+        insert_stat_note(url, 1, "a.md", (1, 2, 3, 4))
+        insert_embedding_034(url, 1, 1, "legacy")
+        insert_embedding_034(url, 2, 1, "top", prefix="T", path=[], ordinal=0)
+        insert_embedding_034(url, 3, 1, "sec", prefix="T > A", path=["A"], ordinal=1)
+        for i, (prefix, path, ordinal) in enumerate(
+            [
+                ("T", None, 0),            # partial
+                (None, ["A"], 1),          # partial
+                ("T", ["A"], -1),          # negative ordinal
+                ("T", ["A"], 0),           # ordinal 0 with a path
+                ("T", [], 2),              # ordinal >= 1 with no path
+            ],
+            start=10,
+        ):
+            with pytest.raises(asyncpg.CheckViolationError):
+                sql(
+                    url,
+                    "INSERT INTO note_embeddings (id, note_id, chunk_index, chunk_text, "
+                    " embedding, heading_path, section_ordinal, embed_prefix) "
+                    f"VALUES ($1, 1, 0, 'x', '{VECTOR_034}', $2, $3, $4)",
+                    i, path, ordinal, prefix,
+                )
+        sql(url, "UPDATE notes_metadata SET embedded_chunking_version = 1")
+        with pytest.raises(asyncpg.CheckViolationError):
+            sql(url, "UPDATE notes_metadata SET embedded_chunking_version = 0")
+
+
+def test_034_stamp_back_rerun_keeps_rows():
+    with throwaway_db("schema_034_rerun") as url:
+        insert_stat_note(url, 1, "a.md", (1, 2, 3, 4))
+        insert_embedding_034(url, 1, 1, "sec", prefix="T > A", path=["A"], ordinal=1)
+        sql(url, "UPDATE notes_metadata SET embedded_chunking_version = 1, "
+                 "embedded_input_digest = $1", "d" * 64)
+        _harness.run_alembic(url, "stamp", "033", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(url, "SELECT embed_prefix FROM note_embeddings") == "T > A"
+        assert fetchval(url, "SELECT embedded_input_digest FROM notes_metadata") == "d" * 64
+        assert_034_shape(url)
+        assert_alembic_check_clean(url, DIM)
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        (
+            "prefix_wrong_type",
+            ["ALTER TABLE note_embeddings ALTER COLUMN embed_prefix TYPE varchar(300)"],
+            "note_embeddings.embed_prefix is character varying(300), not text",
+        ),
+        (
+            "ordinal_wrong_type",
+            ["ALTER TABLE note_embeddings DROP CONSTRAINT ck_note_embeddings_heading_meta",
+             "ALTER TABLE note_embeddings ALTER COLUMN section_ordinal TYPE smallint"],
+            "note_embeddings.section_ordinal is smallint, not integer",
+        ),
+        (
+            "path_unmarked",
+            ["COMMENT ON COLUMN note_embeddings.heading_path IS NULL"],
+            "note_embeddings.heading_path does not carry 034's comment marker",
+        ),
+        (
+            "version_defaulted",
+            ["ALTER TABLE notes_metadata ALTER COLUMN embedded_chunking_version SET DEFAULT 1"],
+            "notes_metadata.embedded_chunking_version has a server default",
+        ),
+        (
+            "digest_not_null",
+            ["UPDATE notes_metadata SET embedded_input_digest = 'x'",
+             "ALTER TABLE notes_metadata ALTER COLUMN embedded_input_digest SET NOT NULL"],
+            "notes_metadata.embedded_input_digest is NOT NULL",
+        ),
+        (
+            "heading_check_impostor",
+            ["ALTER TABLE note_embeddings DROP CONSTRAINT ck_note_embeddings_heading_meta",
+             "ALTER TABLE note_embeddings ADD CONSTRAINT ck_note_embeddings_heading_meta CHECK (true)"],
+            "a CHECK named ck_note_embeddings_heading_meta already exists",
+        ),
+        (
+            "version_check_impostor",
+            ["ALTER TABLE notes_metadata DROP CONSTRAINT ck_notes_metadata_embedded_chunking_version",
+             "ALTER TABLE notes_metadata ADD CONSTRAINT ck_notes_metadata_embedded_chunking_version "
+             "CHECK (embedded_chunking_version IS NULL OR embedded_chunking_version >= 0)"],
+            "a CHECK named ck_notes_metadata_embedded_chunking_version already exists",
+        ),
+        (
+            "heading_check_unmarked",
+            ["COMMENT ON CONSTRAINT ck_note_embeddings_heading_meta ON note_embeddings IS NULL"],
+            "does not carry 034's constraint marker",
+        ),
+    ],
+)
+def test_034_refuses_a_unit_of_another_shape(label, ddl, fragment):
+    with throwaway_db(f"schema_034_foreign_{label}") as url:
+        for statement in ddl:
+            sql(url, statement)
+        refuse_034(url, must_mention=[fragment, "Nothing has been changed"])
+
+
+def test_034_refuses_an_impostor_column_before_033_head():
+    """An impostor that predates 034 on a 033 database is refused too."""
+    with throwaway_db("schema_034_foreign_pre", revision="033") as url:
+        sql(url, "ALTER TABLE notes_metadata ADD COLUMN embedded_chunking_version integer")
+        result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+        assert result.returncode != 0
+        combined = result.stdout + result.stderr
+        assert "notes_metadata.embedded_chunking_version is integer, not smallint" in combined
+        assert alembic_version(url) == "033"
+        assert column_state_029(url, "note_embeddings", "embed_prefix") is None
+
+
+def test_downgrade_034_deletes_prefixed_rows_and_uncertifies_their_notes():
+    with throwaway_db("schema_034_downgrade") as url:
+        insert_stat_note(url, 1, "legacy.md", (1, 2, 3, 4))
+        insert_stat_note(url, 2, "mixed.md", (1, 2, 3, 4))
+        insert_stat_note(url, 3, "new.md", (1, 2, 3, 4))
+        sql(url, "UPDATE notes_metadata SET embedded_content_hash = content_hash")
+        insert_embedding_034(url, 1, 1, "legacy only")
+        insert_embedding_034(url, 2, 2, "legacy half")
+        insert_embedding_034(url, 3, 2, "new half", prefix="t > A", path=["A"], ordinal=1)
+        insert_embedding_034(url, 4, 3, "top", prefix="t", path=[], ordinal=0)
+        _harness.run_alembic(url, "downgrade", "033", dimensions=DIM)
+        assert alembic_version(url) == "033"
+        assert [r["id"] for r in fetch(url, "SELECT id FROM note_embeddings ORDER BY id")] == [1, 2]
+        certified = {
+            r["id"]: r["c"]
+            for r in fetch(
+                url,
+                "SELECT id, embedded_content_hash IS NOT DISTINCT FROM content_hash AS c "
+                "FROM notes_metadata",
+            )
+        }
+        assert certified == {1: True, 2: False, 3: False}
+        for table, column in COLUMNS_034:
+            assert column_state_029(url, table, column) is None, (table, column)
+        assert checks_034(url) == {}
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert_034_shape(url)
+        assert fetchval(
+            url, "SELECT count(*) FROM note_embeddings WHERE embed_prefix IS NOT NULL"
+        ) == 0
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_downgrade_034_leaves_units_it_did_not_create():
+    with throwaway_db("schema_034_downgrade_foreign") as url:
+        sql(url, "COMMENT ON COLUMN notes_metadata.embedded_input_digest IS 'somebody else'")
+        result = _harness.run_alembic(url, "downgrade", "033", dimensions=DIM)
+        assert "034 downgrade: leaving notes_metadata.embedded_input_digest" in (
+            result.stdout + result.stderr
+        )
+        assert alembic_version(url) == "033"
+        assert column_state_029(url, "notes_metadata", "embedded_input_digest") is not None
+        assert column_state_029(url, "notes_metadata", "embedded_chunking_version") is None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 035 — tags in the keyword vector (#391)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# No schema object. A data step under the generation lock and the stored
+# fingerprint's configs: a read-only size preflight, then an all-or-nothing
+# re-head adding `B(tags)` to every vector that has no tags part yet and
+# whose tags produce a lexeme. Downgrade strips every `B` lexeme.
+
+SIZE_LIMIT_035 = 1048575
+PREFLIGHT_MAX_035 = 1048511
+
+
+def _fts():
+    from src.services import fts
+
+    return fts
+
+
+def insert_tagged_note(url, note_id, path, title, frontmatter, tags, body, *,
+                       headed=True, cfg="english"):
+    """A row as 034 left it: `A(title) || A(aliases) || D(body)` (031's head)
+    or, `headed=False`, a D-only vector (a row 031 left at the size limit)."""
+    import json as _json
+
+    aliases = _fts().aliases_text(frontmatter)
+    head = (f"setweight(to_tsvector('{cfg}', $3::text), 'A') || "
+            f"setweight(to_tsvector('{cfg}', $7), 'A') || ") if headed else ""
+    args = [note_id, path, title, _json.dumps(frontmatter), tags, body]
+    if headed:
+        args.append(aliases)
+    sql(
+        url,
+        "INSERT INTO notes_metadata (id, user_id, file_path, title, frontmatter, tags, "
+        " content_hash, content_tsvector) "
+        f"VALUES ($1, NULL, $2, $3::text, $4::jsonb, $5::varchar[], 'h', "
+        f"        {head}to_tsvector('{cfg}', $6))",
+        *args,
+    )
+
+
+def expected_tagged(url, title, frontmatter, tags, body, cfg="english"):
+    """What the incremental writer builds for the same inputs."""
+    return fetchval(
+        url,
+        f"SELECT (setweight(to_tsvector('{cfg}', $1), 'A') || "
+        f"        setweight(to_tsvector('{cfg}', $2), 'A') || "
+        f"        setweight(to_tsvector('{cfg}', $3), 'B') || "
+        f"        to_tsvector('{cfg}', $4))::text",
+        title, _fts().aliases_text(frontmatter), _fts().tags_text(tags), body,
+    )
+
+
+def part_lexemes(url, note_id, weights):
+    return fetchval(
+        url,
+        f"SELECT tsvector_to_array(ts_filter(content_tsvector, '{weights}')) "
+        "FROM notes_metadata WHERE id = $1",
+        note_id,
+    )
+
+
+def all_vectors(url):
+    return {
+        r["id"]: r["v"]
+        for r in fetch(url, "SELECT id, content_tsvector::text AS v FROM notes_metadata")
+    }
+
+
+def refuse_035(url, *, must_mention):
+    before = all_vectors(url)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "035 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    assert alembic_version(url) == "034", "nothing should have been recorded"
+    assert all_vectors(url) == before, "nothing should have been written"
+    return combined
+
+
+def near_limit_words(n):
+    """`n` distinct eight-character words: `S` = 12 bytes each (8 + 2 + 2)."""
+    return " ".join(f"w{i:07d}" for i in range(n))
+
+
+def size_of(url, vector_sql, *args):
+    """`S(v)` (migration 035's `size_sql`) of a SQL vector expression."""
+    import importlib.util
+
+    path = next((_harness.ROOT / "alembic" / "versions").glob("035_*.py"))
+    spec = importlib.util.spec_from_file_location("migration_035_gate", path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return fetchval(url, f"SELECT {m.size_sql(vector_sql)}", *args)
+
+
+def operator_statement():
+    """The read-only pre-merge statement, verbatim from `DEPLOYMENT.md`."""
+    import re
+    import textwrap
+
+    text_ = (_harness.ROOT / "DEPLOYMENT.md").read_text(encoding="utf-8")
+    section = text_[text_.index("## Upgrading across migration 035"):]
+    block = re.search(r"```sql\n(.*?)\n\s*```", section, re.S).group(1)
+    return textwrap.dedent(block)
+
+
+def test_035_chains_from_034():
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config()
+    config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    assert script.get_revision("035").down_revision == "034"
+
+
+def test_036_chains_from_035():
+    """Migration 036 (#357): the CIMD column and its shape CHECK."""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config()
+    config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    assert script.get_revision("036").down_revision == "035"
+
+
+def test_035_adds_the_tags_part_to_tagged_rows_only():
+    with throwaway_db("schema_035_fresh", revision="034") as url:
+        body = "the siding complaint went in"
+        insert_tagged_note(url, 1, "t.md", "Neighborhood board", {"aliases": ["board"]},
+                           ["hoa", "ctx/phone"], body)
+        insert_tagged_note(url, 2, "u.md", "Untagged", {}, [], "plain words")
+        insert_tagged_note(url, 3, "s.md", "Stop", {}, ["the"], "stop tagged")
+        sql(url, "INSERT INTO notes_metadata (id, user_id, file_path, title, tags, content_hash) "
+                 "VALUES (4, NULL, 'n.md', 'never vectorised', '{hoa}', 'h')")
+        before = all_vectors(url)
+        before_d = part_lexemes(url, 1, "{d}")
+
+        result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert "1 re-headed, 0 already tagged, 2 without tag lexemes" in result.stdout + result.stderr
+        assert set(part_lexemes(url, 1, "{b}")) == {"hoa", "ctx/phone", "ctx", "phone"}
+        assert set(part_lexemes(url, 1, "{a}")) == {"neighborhood", "board"}
+        assert part_lexemes(url, 1, "{d}") == before_d
+        # Phrase search and relative positions within the body survive.
+        assert fetchval(url, "SELECT content_tsvector @@ phraseto_tsquery('english', $1) "
+                             "FROM notes_metadata WHERE id = 1", body) is True
+        after = all_vectors(url)
+        assert after[2] == before[2] and after[3] == before[3] and after[4] is None
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_035_re_heads_a_d_only_row_byte_exactly():
+    with throwaway_db("schema_035_d_only", revision="034") as url:
+        fm = {"aliases": "Q3 retro, retrospective"}
+        insert_tagged_note(url, 1, "q.md", "Quarterly Review", fm, ["hoa", "a/b"],
+                           "plain body text about the period", headed=False)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert all_vectors(url)[1] == expected_tagged(
+            url, "Quarterly Review", fm, ["hoa", "a/b"], "plain body text about the period")
+
+
+def test_035_stamp_back_rerun_is_byte_idempotent():
+    with throwaway_db("schema_035_rerun", revision="034") as url:
+        insert_tagged_note(url, 1, "a.md", "Alpha", {}, ["hoa"], "body words")
+        insert_tagged_note(url, 2, "b.md", "Beta", {}, ["x/y"], "more body", headed=False)
+        insert_tagged_note(url, 3, "c.md", "Gamma", {}, [], "untagged body")
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        first = all_vectors(url)
+        _harness.run_alembic(url, "stamp", "034", dimensions=DIM)
+        result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert "0 re-headed, 2 already tagged, 1 without tag lexemes" in result.stdout + result.stderr
+        assert all_vectors(url) == first
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_035_builds_the_tags_part_under_the_stored_fingerprints_configs():
+    with throwaway_db("schema_035_configs", revision="034") as url:
+        sql(url, "INSERT INTO indexer_state (key, value, updated_at) "
+                 "VALUES ('fts_fingerprint', '{\"configs\":[\"simple\"],\"v\":1}', now())")
+        insert_tagged_note(url, 1, "r.md", "Notes", {}, ["Running"], "runs fast", cfg="simple")
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert part_lexemes(url, 1, "{b}") == ["running"]  # simple, not 'run'
+
+
+def test_035_uses_the_environment_when_no_fingerprint_is_stored():
+    with throwaway_db("schema_035_absent", revision="034") as url:
+        insert_tagged_note(url, 1, "r.md", "Notes", {}, ["Running"], "runs fast")
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert part_lexemes(url, 1, "{b}") == ["run"]  # english stem
+
+
+@pytest.mark.parametrize("value", ["not json", '{"configs": ["english"], "v": 99}', '{"v": 1}'])
+def test_035_refuses_an_unreadable_fingerprint(value):
+    with throwaway_db("schema_035_unreadable", revision="034") as url:
+        sql(url, "INSERT INTO indexer_state (key, value, updated_at) VALUES ('fts_fingerprint', $1, now())", value)
+        insert_tagged_note(url, 1, "r.md", "Notes", {}, ["hoa"], "body")
+        refuse_035(url, must_mention=["fts_fingerprint", "Nothing has been changed"])
+
+
+def test_035_size_formula_tracks_postgresqls_own_count():
+    """`S` against the size PostgreSQL reports when a concatenation crosses
+    the limit (`string is too long for tsvector (N bytes, …)`): within the
+    64-byte margin, and the estimate is what 035 compares."""
+    import re
+
+    with throwaway_db("schema_035_size_formula", revision="034") as url:
+        words = near_limit_words(87_370)
+        tags = " ".join(f"{i:02d}" + "t" * 30 for i in range(40))
+        estimate = (
+            size_of(url, "to_tsvector('english', $1)", words)
+            + size_of(url, "setweight(to_tsvector('english', $1), 'B')", tags)
+        )
+        with pytest.raises(asyncpg.ProgramLimitExceededError) as raised:
+            fetchval(url, "SELECT length(to_tsvector('english', $1) || "
+                          "setweight(to_tsvector('english', $2), 'B'))", words, tags)
+        reported = int(re.search(r"\((\d+) bytes", str(raised.value)).group(1))
+        print(f"\n[035 size formula] S = {estimate}, PostgreSQL reported {reported}")
+        # Within four bytes, absorbed by the 64-byte margin — not an upper bound.
+        assert abs(reported - estimate) <= 4
+        # A storable vector's own S is below the limit.
+        assert size_of(url, "to_tsvector('english', $1)", words) == 12 * 87_370 < SIZE_LIMIT_035
+
+
+def test_035_preflight_aborts_on_a_near_limit_row_before_writing():
+    with throwaway_db("schema_035_preflight", revision="034") as url:
+        insert_tagged_note(url, 1, "ok.md", "Fine Note", {}, ["hoa"], "body one")
+        insert_tagged_note(url, 2, "big.md", "Big Note", {}, ["hoa"], near_limit_words(87_377))
+        stored = size_of(url, "(SELECT content_tsvector FROM notes_metadata WHERE id = 2)")
+        assert PREFLIGHT_MAX_035 < stored < SIZE_LIMIT_035
+        combined = refuse_035(url, must_mention=[
+            "035 size preflight: 1 tagged keyword vector(s)", "id(s) 2.",
+            "Nothing has been changed", "034",
+        ])
+        assert "big.md" not in combined and "w0000001" not in combined
+        # The remedy: shorten the note, let it be rewritten, deploy again.
+        sql(url, "UPDATE notes_metadata SET content_tsvector = "
+                 "setweight(to_tsvector('english', 'Big Note'), 'A') || "
+                 "to_tsvector('english', 'shortened') WHERE id = 2")
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert part_lexemes(url, 1, "{b}") == ["hoa"] and part_lexemes(url, 2, "{b}") == ["hoa"]
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_the_operator_statement_flags_a_d_only_row_the_stored_estimate_passes():
+    """Codex r2: a D-only row whose `S(v) + S(tags part)` is within the margin
+    but whose post-035 size `S(D) + S(A + B)` is not. The `DEPLOYMENT.md`
+    statement flags it (`d_only`), and 035 aborts naming the same id."""
+    with throwaway_db("schema_035_operator", revision="034") as url:
+        insert_tagged_note(url, 1, "ok.md", "Fine Note", {}, ["budget"], "body one")
+        insert_tagged_note(url, 7, "q.md", "Quarterly Review", {}, ["hoa"],
+                           near_limit_words(87_374), headed=False)
+        row = fetch(url, operator_statement())[0]
+        assert row["tagged_rows"] == 2
+        assert row["flagged"] == 1 and list(row["ids"]) == [7] and row["d_only"] == 1
+        # The stored-vector estimate alone would have passed it.
+        assert row["largest"] <= PREFLIGHT_MAX_035
+        refuse_035(url, must_mention=["id(s) 7.", "Nothing has been changed"])
+
+
+def test_the_operator_statement_passes_an_ordinary_database():
+    with throwaway_db("schema_035_operator_ok", revision="034") as url:
+        insert_tagged_note(url, 1, "a.md", "Alpha", {}, ["hoa", "x/y"], "body words")
+        insert_tagged_note(url, 2, "b.md", "Beta", {}, [], "untagged")
+        row = fetch(url, operator_statement())[0]
+        assert (row["tagged_rows"], row["flagged"], row["ids"], row["d_only"]) == (1, 0, None, 0)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+
+
+def test_035_a_54000_row_fails_the_whole_rewrite_with_the_preflight_bypassed():
+    """The rewrite's backstop: a real 54000 (the preflight bypassed by calling
+    035's `rewrite` directly, in one transaction) fails naming the id and the
+    SQLSTATE, and nothing is committed."""
+    import importlib.util
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    with throwaway_db("schema_035_54000", revision="034") as url:
+        insert_tagged_note(url, 1, "ok.md", "Fine Note", {}, ["hoa"], "body one")
+        insert_tagged_note(url, 2, "big.md", "Big Note", {},
+                           [f"{i:02d}" + "t" * 30 for i in range(12)], near_limit_words(87_377))
+        before = all_vectors(url)
+        path = next((_harness.ROOT / "alembic" / "versions").glob("035_*.py"))
+        spec = importlib.util.spec_from_file_location("migration_035_bypass", path)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+
+        async def attempt():
+            engine = create_async_engine(url)
+            try:
+                async with engine.connect() as conn:
+                    def _go(sync_conn):
+                        _total, rows = m._candidates(sync_conn)
+                        work = [m._binds(r, ["english"]) for r in rows]
+                        return m.rewrite(sync_conn, ["english"], work)
+
+                    try:
+                        await conn.run_sync(_go)
+                    finally:
+                        await conn.rollback()
+            finally:
+                await engine.dispose()
+
+        with pytest.raises(m.RowFailure) as raised:
+            asyncio.run(attempt())
+        message = str(raised.value)
+        assert "id=2" in message and "SQLSTATE 54000" in message and "034" in message
+        assert "big.md" not in message and "tttt" not in message
+        assert alembic_version(url) == "034"
+        assert all_vectors(url) == before
+
+
+def test_035_any_other_row_error_fails_the_whole_migration():
+    with throwaway_db("schema_035_row_error", revision="034") as url:
+        insert_tagged_note(url, 1, "a.md", "Alpha", {}, ["hoa"], "body one")
+        insert_tagged_note(url, 2, "b.md", "Beta", {}, ["hoa"], "body two")
+        sql(url, """
+            CREATE OR REPLACE FUNCTION refuse_beta() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+              IF NEW.id = 2 THEN
+                RAISE EXCEPTION 'synthetic failure' USING ERRCODE = 'P0001';
+              END IF;
+              RETURN NEW;
+            END $$
+        """)
+        sql(url, "CREATE TRIGGER refuse_beta BEFORE UPDATE ON notes_metadata "
+                 "FOR EACH ROW EXECUTE FUNCTION refuse_beta()")
+        refuse_035(url, must_mention=["035 failed during the rewrite at notes_metadata id=2",
+                                      "SQLSTATE P0001", "still at revision 034"])
+        sql(url, "DROP TRIGGER refuse_beta ON notes_metadata")
+
+
+def test_downgrade_035_strips_the_tags_part_and_keeps_the_rest():
+    with throwaway_db("schema_035_downgrade", revision="034") as url:
+        insert_tagged_note(url, 1, "a.md", "Alpha Note", {"aliases": ["nick"]}, ["hoa"],
+                           "the hoa siding complaint")
+        before_d = part_lexemes(url, 1, "{d}")
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert_alembic_check_clean(url, DIM)
+        assert "hoa" in part_lexemes(url, 1, "{b}")
+        result = _harness.run_alembic(url, "downgrade", "034", dimensions=DIM)
+        assert "stripped the weight-B tags part from 1 keyword vector(s)" in (
+            result.stdout + result.stderr)
+        assert alembic_version(url) == "034"
+        assert fetchval(url, "SELECT count(*) FROM notes_metadata "
+                             "WHERE length(ts_filter(content_tsvector, '{b}')) > 0") == 0
+        assert set(part_lexemes(url, 1, "{a}")) == {"alpha", "note", "nick"}
+        assert part_lexemes(url, 1, "{d}") == before_d
+        # `hoa` was in the tags and the body: it keeps its body position.
+        assert fetchval(url, "SELECT content_tsvector @@ phraseto_tsquery('english', "
+                             "'hoa siding complaint') FROM notes_metadata WHERE id = 1") is True
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert "hoa" in part_lexemes(url, 1, "{b}")
+        assert_alembic_check_clean(url, DIM)
+
+
+def preflight_rejected_ids(url) -> set[int]:
+    """The ids 035's preflight names (it must refuse)."""
+    import re
+
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0 and "035 size preflight" in combined, combined[-2000:]
+    listed = re.search(r"id\(s\) ([0-9, ]+)\. Nothing", combined).group(1)
+    assert alembic_version(url) == "034"
+    return {int(x) for x in listed.split(", ")}
+
+
+def test_every_row_the_preflight_rejects_is_flagged_by_the_operator_statement():
+    """Verifier V1 and Codex r1 C1: the documented statement never passes a
+    row 035's preflight rejects — a D-only row, a headed row whose title and
+    body share lexemes (stored once in the merged vector, counted per part by
+    the preflight), and a row whose tag hides a word behind U+0002 (`the\\x02a`
+    is stop words to a naive parse and `thea` to `tags_text`)."""
+    with throwaway_db("schema_035_operator_cover", revision="034") as url:
+        insert_tagged_note(url, 1, "ok.md", "Fine Note", {}, ["budget"], "body one")
+        # D-only (Codex r2).
+        insert_tagged_note(url, 7, "q.md", "Quarterly Review", {}, ["hoa"],
+                           near_limit_words(87_374), headed=False)
+        # Shared lexemes: 200 aliases that are also body words.
+        shared = [f"w{i:07d}" for i in range(200)]
+        insert_tagged_note(url, 8, "s.md", "Shared", {"aliases": shared}, ["hoa"],
+                           near_limit_words(87_176))
+        merged = size_of(url, "(SELECT content_tsvector FROM notes_metadata WHERE id = 8)")
+        assert merged + 10 <= PREFLIGHT_MAX_035, "a merged-vector estimate would pass it"
+        # The sentinel tag.
+        insert_tagged_note(url, 9, "x.md", "Big Note", {}, ["the\x02a"], near_limit_words(87_377))
+        # Codex impl r2: 128 nested tags then 66 distinct 999-byte stop-word
+        # tags. `tags_text` keeps only the 128 nested lines (2,047 chars); a
+        # single concatenated document saturates positions after the
+        # stop-word tail and under-counts the expanded segments.
+        rng = random.Random(391)
+        stop_tags: set[str] = set()
+        while len(stop_tags) < 66:
+            stop_tags.add(" ".join(rng.choice(("and", "the")) for _ in range(250)))
+        codex_tags = sorted([f"{i:05d}/x" for i in range(128)] + sorted(stop_tags))
+        assert len(_fts().tags_text(codex_tags)) == 2047
+        assert all(len(t.encode()) == 999 for t in stop_tags)
+        insert_tagged_note(url, 10, "c.md", "Big Note", {}, codex_tags, near_limit_words(87_139))
+
+        per_row = operator_statement().split("SELECT count(*)")[0] + "SELECT id, bytes FROM est"
+        operator_bytes = {r["id"]: r["bytes"] for r in fetch(url, per_row)}
+        preflight_bytes = size_of(
+            url, "(SELECT ts_filter(content_tsvector, '{d}') FROM notes_metadata WHERE id = 10)"
+        ) + size_of(
+            url,
+            "setweight(to_tsvector('english', $1), 'A') || setweight(to_tsvector('english', $2), 'A')"
+            " || setweight(to_tsvector('english', $3), 'B')",
+            "Big Note", "", _fts().tags_text(codex_tags),
+        )
+        print(f"\n[operator vs preflight, Codex r2 row] {operator_bytes[10]} vs {preflight_bytes}")
+        assert operator_bytes[10] >= preflight_bytes > PREFLIGHT_MAX_035
+
+        flagged = set(fetch(url, operator_statement())[0]["ids"] or [])
+        rejected = preflight_rejected_ids(url)
+        assert rejected == {7, 8, 9, 10}, rejected
+        # The implication over every seeded row: rejected ⇒ flagged.
+        for row_id in (1, 7, 8, 9, 10):
+            assert row_id not in rejected or row_id in flagged, row_id
+        assert 1 not in flagged
+
+
+def test_035_preflight_names_every_rejected_row():
+    """Codex r1 C2: fifty-one rows over the margin, all fifty-one ids named."""
+    with throwaway_db("schema_035_preflight_51", revision="034") as url:
+        sql(
+            url,
+            "INSERT INTO notes_metadata (id, user_id, file_path, title, frontmatter, tags, "
+            " content_hash, content_tsvector) "
+            "SELECT g, NULL, 'n' || g || '.md', 'Big Note', '{}'::jsonb, '{hoa}', 'h', "
+            "       setweight(to_tsvector('english', 'Big Note'), 'A') || to_tsvector('english', $1) "
+            "FROM generate_series(1, 51) g",
+            near_limit_words(87_377),
+        )
+        combined = refuse_035(url, must_mention=["035 size preflight: 51 tagged keyword vector(s)"])
+        assert "id(s) " + ", ".join(str(i) for i in range(1, 52)) + ". Nothing" in combined
+        assert "…" not in combined
+
+
+def test_035_a_headed_row_with_an_empty_body_and_a_tag_in_its_title():
+    """V8: a headed row with no body gains `B` byte-exactly (A + B only); a
+    row whose tag word is also its title word carries `A` and `B` positions on
+    one lexeme, and the stamp-back re-run skips it."""
+    with throwaway_db("schema_035_edges", revision="034") as url:
+        insert_tagged_note(url, 1, "e.md", "Alpha", {}, ["hoa"], "")
+        insert_tagged_note(url, 2, "h.md", "Hoa board", {}, ["hoa"], "the minutes")
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert all_vectors(url)[1] == expected_tagged(url, "Alpha", {}, ["hoa"], "")
+        assert part_lexemes(url, 1, "{d}") == []
+        weights = fetchval(
+            url,
+            "SELECT weights FROM unnest((SELECT content_tsvector FROM notes_metadata "
+            "WHERE id = 2)) WHERE lexeme = 'hoa'",
+        )
+        assert set(weights) == {"A", "B"}, weights
+        first = all_vectors(url)
+        _harness.run_alembic(url, "stamp", "034", dimensions=DIM)
+        result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert "0 re-headed, 2 already tagged" in result.stdout + result.stderr
+        assert all_vectors(url) == first
+
+
+def operator_statement_multi():
+    """The multi-config (`english,simple`) statement, verbatim from
+    `DEPLOYMENT.md` — the second SQL block of the 035 note."""
+    import re
+    import textwrap
+
+    text_ = (_harness.ROOT / "DEPLOYMENT.md").read_text(encoding="utf-8")
+    section = text_[text_.index("## Upgrading across migration 035"):]
+    blocks = re.findall(r"```sql\n(.*?)\n\s*```", section, re.S)
+    return textwrap.dedent(blocks[1])
+
+
+def test_the_multi_config_operator_statement_flags_every_preflight_rejection():
+    """Codex impl r3: with an `english,simple` fingerprint the per-config
+    parses must be combined with `UNION ALL`. A plain `UNION` keeps one of
+    the two equal per-config rows of each tag word and under-counts the head
+    035 builds under both configs."""
+    with throwaway_db("schema_035_operator_multi", revision="034") as url:
+        sql(url, "INSERT INTO indexer_state (key, value, updated_at) VALUES "
+                 "('fts_fingerprint', '{\"configs\":[\"english\",\"simple\"],\"v\":1}', now())")
+        tags = [f"{i:05d}/x" for i in range(128)]
+        sql(
+            url,
+            "INSERT INTO notes_metadata (id, user_id, file_path, title, frontmatter, tags, "
+            " content_hash, content_tsvector) VALUES (1, NULL, 'c.md', 'Big Note', '{}'::jsonb, "
+            " $1::varchar[], 'h', "
+            " setweight(to_tsvector('english', 'Big Note'), 'A') || "
+            " setweight(to_tsvector('simple', 'Big Note'), 'A') || "
+            " to_tsvector('english', $2) || to_tsvector('simple', $2))",
+            tags, near_limit_words(84_350),
+        )
+        statement = operator_statement_multi()
+        assert "UNION ALL" in statement
+        per_row = statement.split("SELECT count(*)")[0] + "SELECT id, bytes FROM est"
+        union_all = {r["id"]: r["bytes"] for r in fetch(url, per_row)}[1]
+        union = {r["id"]: r["bytes"]
+                 for r in fetch(url, per_row.replace("UNION ALL", "UNION"))}[1]
+        print(f"\n[multi-config operator] UNION ALL {union_all}, UNION {union}")
+        assert fetch(url, statement)[0]["ids"] == [1]
+        assert union <= PREFLIGHT_MAX_035 < union_all, "UNION would pass the row"
+        assert preflight_rejected_ids(url) == {1}
+
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 037 — OIDC account links on `users` (#416)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# `alembic check` sees the six columns (type, nullability, comment) and the
+# two UNIQUEs by name. It cannot see the three CHECK predicates, a constraint's
+# `convalidated`, or a constraint comment, so those are asserted through the
+# catalogue, and the forbidden row shapes are attempted.
+
+OIDC_COLUMNS = (
+    ("oidc_issuer", "character varying(2048)"),
+    ("oidc_subject", "character varying(255)"),
+    ("oidc_linked_at", "timestamp with time zone"),
+    ("oidc_expected_issuer", "character varying(2048)"),
+    ("oidc_expected_email", "character varying(254)"),
+    ("oidc_expected_set_at", "timestamp with time zone"),
+)
+OIDC_COLUMN_NAMES = tuple(n for n, _t in OIDC_COLUMNS)
+OIDC_COLUMN_MARKER = "OIDC account link (037_oidc_account_links)"
+OIDC_CONSTRAINT_MARKER = "OIDC account link constraint (037_oidc_account_links)"
+# What PostgreSQL 16 prints for 037's five constraints. The migration measures
+# the same strings off a scratch table at runtime; this pin tells us if either
+# side moves.
+OIDC_CONSTRAINTS = {
+    "uq_users_oidc_identity": "UNIQUE (oidc_issuer, oidc_subject)",
+    "uq_users_oidc_expected": "UNIQUE (oidc_expected_issuer, oidc_expected_email)",
+    "ck_users_oidc_bound_complete": (
+        "CHECK ((((oidc_issuer IS NULL) AND (oidc_subject IS NULL) AND "
+        "(oidc_linked_at IS NULL)) OR ((oidc_issuer IS NOT NULL) AND "
+        "(oidc_subject IS NOT NULL) AND (oidc_linked_at IS NOT NULL))))"
+    ),
+    "ck_users_oidc_expected_complete": (
+        "CHECK ((((oidc_expected_issuer IS NULL) AND (oidc_expected_email IS NULL) "
+        "AND (oidc_expected_set_at IS NULL)) OR ((oidc_expected_issuer IS NOT NULL) "
+        "AND (oidc_expected_email IS NOT NULL) AND (oidc_expected_set_at IS NOT NULL))))"
+    ),
+    "ck_users_oidc_not_both": (
+        "CHECK (((oidc_subject IS NULL) OR (oidc_expected_email IS NULL)))"
+    ),
+}
+OIDC_ISS = "https://idp.example.test/realms/home"
+
+
+def oidc_column_state(url, column):
+    """`(coltype, attnotnull, default, comment)` on public.users, or None."""
+    rows = fetch(
+        url,
+        "SELECT format_type(a.atttypid, a.atttypmod) AS coltype, a.attnotnull, "
+        "       pg_get_expr(d.adbin, d.adrelid) AS coldefault, "
+        "       col_description(a.attrelid, a.attnum) AS comment "
+        "FROM pg_attribute a "
+        "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+        "WHERE a.attrelid = 'public.users'::regclass "
+        "  AND a.attname = $1 AND a.attnum > 0 AND NOT a.attisdropped",
+        column,
+    )
+    return tuple(rows[0]) if rows else None
+
+
+def oidc_constraint_state(url, name):
+    """`(definition, convalidated, comment)` of the named constraint, or None."""
+    rows = fetch(
+        url,
+        "SELECT pg_get_constraintdef(oid) AS def, convalidated, "
+        "       obj_description(oid, 'pg_constraint') AS comment "
+        "FROM pg_constraint WHERE conrelid = 'public.users'::regclass AND conname = $1",
+        name,
+    )
+    return tuple(rows[0]) if rows else None
+
+
+def oidc_catalogue(url):
+    """Everything 037 owns, for before/after comparisons."""
+    return (
+        {c: oidc_column_state(url, c) for c in OIDC_COLUMN_NAMES},
+        {n: oidc_constraint_state(url, n) for n in OIDC_CONSTRAINTS},
+    )
+
+
+def assert_oidc_shape(url):
+    for column, coltype in OIDC_COLUMNS:
+        state = oidc_column_state(url, column)
+        assert state == (coltype, False, None, OIDC_COLUMN_MARKER), (column, state)
+    for name, definition in OIDC_CONSTRAINTS.items():
+        state = oidc_constraint_state(url, name)
+        assert state == (definition, True, OIDC_CONSTRAINT_MARKER), (name, state)
+
+
+def users_snapshot(url):
+    return [
+        tuple(r)
+        for r in fetch(
+            url,
+            "SELECT id, username, password_hash, is_admin, is_active, session_version, "
+            "       vault_path, created_at, last_login_at FROM users ORDER BY id",
+        )
+    ]
+
+
+def oidc_values(url):
+    return {
+        r["id"]: tuple(r[c] for c in OIDC_COLUMN_NAMES)
+        for r in fetch(url, f"SELECT id, {', '.join(OIDC_COLUMN_NAMES)} FROM users")
+    }
+
+
+def insert_oidc_user(url, user_id, username, *, bound=None, pending=None):
+    """`bound=(iss, sub)` / `pending=(iss, email)`; either, both or neither."""
+    iss, sub = bound if bound else (None, None)
+    eiss, email = pending if pending else (None, None)
+    sql(
+        url,
+        "INSERT INTO users (id, username, password_hash, is_admin, is_active, "
+        " session_version, oidc_issuer, oidc_subject, oidc_linked_at, "
+        " oidc_expected_issuer, oidc_expected_email, oidc_expected_set_at) "
+        "VALUES ($1, $2, 'x', false, true, 1, $3::varchar, $4::varchar, "
+        " CASE WHEN $3::varchar IS NULL THEN NULL ELSE now() END, $5::varchar, "
+        " $6::varchar, CASE WHEN $5::varchar IS NULL THEN NULL ELSE now() END)",
+        user_id, username, iss, sub, eiss, email,
+    )
+
+
+def refuse_037(url, *, must_mention):
+    """Run 037 from 036, require a refusal naming the problem, nothing recorded."""
+    if alembic_version(url) != "036":
+        _harness.run_alembic(url, "stamp", "036", dimensions=DIM)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "037 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention + ["Nothing has been changed"]:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    assert alembic_version(url) == "036", "nothing should have been recorded"
+    return combined
+
+
+def test_037_chains_from_036():
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config()
+    config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    assert script.get_revision("037").down_revision == "036"
+
+
+def test_038_chains_from_037_and_is_head():
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config()
+    config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+    assert script.get_current_head() == HEAD_REVISION == "038"
+    assert script.get_revision("038").down_revision == "037"
+
+
+def test_037_fresh_upgrade_has_the_exact_marked_shape():
+    with throwaway_db("schema_037_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+        assert_oidc_shape(url)
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_037_from_036_leaves_existing_users_unchanged_and_all_null():
+    with throwaway_db("schema_037_chain", revision="036") as url:
+        insert_user(url, 1, "alice")
+        insert_user(url, 2, "bob")
+        sql(url, "UPDATE users SET is_admin = true, last_login_at = now(), "
+                 "vault_path = '/v/a' WHERE id = 1")
+        before = users_snapshot(url)
+        assert oidc_column_state(url, "oidc_issuer") is None
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert users_snapshot(url) == before
+        assert oidc_values(url) == {1: (None,) * 6, 2: (None,) * 6}
+        assert_oidc_shape(url)
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_037_stamp_back_rerun_over_the_marked_shape_changes_nothing():
+    with throwaway_db("schema_037_rerun") as url:
+        insert_oidc_user(url, 1, "alice", bound=(OIDC_ISS, "sub-a"))
+        insert_oidc_user(url, 2, "bob", pending=(OIDC_ISS, "bob@example.com"))
+        insert_oidc_user(url, 3, "carol")
+        catalogue = oidc_catalogue(url)
+        values = oidc_values(url)
+        users = users_snapshot(url)
+
+        _harness.run_alembic(url, "stamp", "036", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert oidc_catalogue(url) == catalogue
+        assert oidc_values(url) == values
+        assert users_snapshot(url) == users
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_037_admits_the_valid_row_shapes():
+    with throwaway_db("schema_037_valid") as url:
+        insert_oidc_user(url, 1, "a")  # unlinked
+        insert_oidc_user(url, 2, "b")  # NULLs are distinct: two unlinked rows
+        insert_oidc_user(url, 3, "c", bound=(OIDC_ISS, "s1"))
+        insert_oidc_user(url, 4, "d", pending=(OIDC_ISS, "d@example.com"))
+        # The same subject under another issuer is another identity.
+        insert_oidc_user(url, 5, "e", bound=("https://other.example.test", "s1"))
+        # The same address under another issuer is another expectation.
+        insert_oidc_user(url, 6, "f", pending=("https://other.example.test", "d@example.com"))
+        assert fetchval(url, "SELECT count(*) FROM users") == 6
+
+
+@pytest.mark.parametrize(
+    "label,statement,error",
+    [
+        (
+            "half_bound",
+            "INSERT INTO users (id, username, password_hash, oidc_issuer, oidc_subject) "
+            "VALUES (10, 'x', 'x', 'https://i', 's')",
+            asyncpg.CheckViolationError,
+        ),
+        (
+            "bound_without_issuer",
+            "INSERT INTO users (id, username, password_hash, oidc_subject, oidc_linked_at) "
+            "VALUES (10, 'x', 'x', 's', now())",
+            asyncpg.CheckViolationError,
+        ),
+        (
+            "half_pending",
+            "INSERT INTO users (id, username, password_hash, oidc_expected_issuer, "
+            " oidc_expected_email) VALUES (10, 'x', 'x', 'https://i', 'a@b')",
+            asyncpg.CheckViolationError,
+        ),
+        (
+            "pending_without_email",
+            "INSERT INTO users (id, username, password_hash, oidc_expected_issuer, "
+            " oidc_expected_set_at) VALUES (10, 'x', 'x', 'https://i', now())",
+            asyncpg.CheckViolationError,
+        ),
+        (
+            "bound_and_pending",
+            "INSERT INTO users (id, username, password_hash, oidc_issuer, oidc_subject, "
+            " oidc_linked_at, oidc_expected_issuer, oidc_expected_email, "
+            " oidc_expected_set_at) VALUES (10, 'x', 'x', 'https://i', 's', now(), "
+            " 'https://i', 'a@b', now())",
+            asyncpg.CheckViolationError,
+        ),
+        (
+            "duplicate_identity",
+            "INSERT INTO users (id, username, password_hash, oidc_issuer, oidc_subject, "
+            f" oidc_linked_at) VALUES (10, 'x', 'x', '{OIDC_ISS}', 'taken', now())",
+            asyncpg.UniqueViolationError,
+        ),
+        (
+            "duplicate_expected",
+            "INSERT INTO users (id, username, password_hash, oidc_expected_issuer, "
+            f" oidc_expected_email, oidc_expected_set_at) VALUES (10, 'x', 'x', "
+            f" '{OIDC_ISS}', 'taken@example.com', now())",
+            asyncpg.UniqueViolationError,
+        ),
+    ],
+)
+def test_037_rejects_every_invalid_row_shape(label, statement, error):
+    with throwaway_db(f"schema_037_invalid_{label}") as url:
+        insert_oidc_user(url, 1, "holder", bound=(OIDC_ISS, "taken"))
+        insert_oidc_user(url, 2, "waiter", pending=(OIDC_ISS, "taken@example.com"))
+        with pytest.raises(error):
+            sql(url, statement)
+        assert fetchval(url, "SELECT count(*) FROM users") == 2
+
+
+def test_037_rejects_setting_an_expectation_on_a_bound_row():
+    with throwaway_db("schema_037_update_both") as url:
+        insert_oidc_user(url, 1, "holder", bound=(OIDC_ISS, "s"))
+        with pytest.raises(asyncpg.CheckViolationError):
+            sql(url, "UPDATE users SET oidc_expected_issuer = 'https://i', "
+                     "oidc_expected_email = 'a@b', oidc_expected_set_at = now() WHERE id = 1")
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        (
+            "wrong_type",
+            "ALTER TABLE users ADD COLUMN oidc_subject varchar(1024)",
+            "users.oidc_subject already exists but it is character varying(1024), "
+            "not character varying(255)",
+        ),
+        (
+            "not_null",
+            "ALTER TABLE users ADD COLUMN oidc_issuer varchar(2048) NOT NULL DEFAULT ''; "
+            "ALTER TABLE users ALTER COLUMN oidc_issuer DROP DEFAULT; "
+            f"COMMENT ON COLUMN users.oidc_issuer IS '{OIDC_COLUMN_MARKER}'",
+            "users.oidc_issuer already exists but it is NOT NULL",
+        ),
+        (
+            "server_default",
+            "ALTER TABLE users ADD COLUMN oidc_linked_at timestamptz DEFAULT now(); "
+            f"COMMENT ON COLUMN users.oidc_linked_at IS '{OIDC_COLUMN_MARKER}'",
+            "users.oidc_linked_at already exists but it has a server default",
+        ),
+        (
+            # The spec's own example: the right shape, no marker.
+            "unmarked_column",
+            "ALTER TABLE users ADD COLUMN oidc_subject varchar(255)",
+            "users.oidc_subject already exists but it does not carry 037's column marker",
+        ),
+    ],
+)
+def test_037_refuses_an_impostor_column(label, ddl, fragment):
+    with throwaway_db(f"schema_037_col_{label}", revision="036") as url:
+        sql(url, ddl)
+        before = oidc_catalogue(url)
+        refuse_037(url, must_mention=[fragment])
+        assert oidc_catalogue(url) == before
+
+
+def _readd_constraint(url, name, body, *, marked=True, not_valid=False):
+    sql(url, f"ALTER TABLE users DROP CONSTRAINT {name}")
+    sql(url, f"ALTER TABLE users ADD CONSTRAINT {name} {body}"
+             + (" NOT VALID" if not_valid else ""))
+    if marked:
+        sql(url, f"COMMENT ON CONSTRAINT {name} ON users IS '{OIDC_CONSTRAINT_MARKER}'")
+
+
+@pytest.mark.parametrize(
+    "label,mutate,fragment",
+    [
+        (
+            "wrong_check_definition",
+            lambda url: _readd_constraint(url, "ck_users_oidc_not_both", "CHECK (true)"),
+            "constraint ck_users_oidc_not_both on users already exists but its "
+            "definition is 'CHECK (true)'",
+        ),
+        (
+            "wrong_unique_definition",
+            lambda url: _readd_constraint(
+                url, "uq_users_oidc_identity", "UNIQUE (oidc_subject)"
+            ),
+            "constraint uq_users_oidc_identity on users already exists but its "
+            "definition is 'UNIQUE (oidc_subject)'",
+        ),
+        (
+            "not_valid_check",
+            lambda url: _readd_constraint(
+                url,
+                "ck_users_oidc_bound_complete",
+                "CHECK ((oidc_issuer IS NULL AND oidc_subject IS NULL AND "
+                "oidc_linked_at IS NULL) OR (oidc_issuer IS NOT NULL AND "
+                "oidc_subject IS NOT NULL AND oidc_linked_at IS NOT NULL))",
+                not_valid=True,
+            ),
+            "constraint ck_users_oidc_bound_complete on users already exists but "
+            "it is NOT VALID",
+        ),
+        (
+            # The spec's own example: the canonical definition, no marker.
+            "unmarked_constraint",
+            lambda url: sql(url, "COMMENT ON CONSTRAINT uq_users_oidc_identity ON users IS NULL"),
+            "constraint uq_users_oidc_identity on users already exists but it does "
+            "not carry 037's constraint marker",
+        ),
+    ],
+)
+def test_037_refuses_an_impostor_constraint(label, mutate, fragment):
+    with throwaway_db(f"schema_037_con_{label}") as url:
+        mutate(url)
+        before = oidc_catalogue(url)
+        refuse_037(url, must_mention=[fragment])
+        assert oidc_catalogue(url) == before
+
+
+def test_037_checks_all_eleven_objects_before_creating_any():
+    """Atomic across the set: a column problem found last stops the five
+    columns before it from being added, and a constraint problem stops the
+    missing column and the other constraints too."""
+    with throwaway_db("schema_037_atomic_columns", revision="036") as url:
+        sql(url, "ALTER TABLE users ADD COLUMN oidc_expected_set_at timestamp")
+        combined = refuse_037(url, must_mention=["users.oidc_expected_set_at"])
+        assert "timestamp without time zone" in combined
+        for column in OIDC_COLUMN_NAMES[:-1]:
+            assert oidc_column_state(url, column) is None, column
+
+    with throwaway_db("schema_037_atomic_constraints", revision="036") as url:
+        # Five of the six columns of the exact marked shape, the sixth absent,
+        # and an unmarked last constraint over the present ones.
+        for column, coltype in OIDC_COLUMNS[:-1]:
+            sql(url, f"ALTER TABLE users ADD COLUMN {column} {coltype}")
+            sql(url, f"COMMENT ON COLUMN users.{column} IS '{OIDC_COLUMN_MARKER}'")
+        sql(url, "ALTER TABLE users ADD CONSTRAINT ck_users_oidc_not_both "
+                 "CHECK (oidc_subject IS NULL OR oidc_expected_email IS NULL)")
+        before = oidc_catalogue(url)
+        refuse_037(url, must_mention=["constraint ck_users_oidc_not_both"])
+        assert oidc_catalogue(url) == before
+        assert oidc_column_state(url, "oidc_expected_set_at") is None
+        assert oidc_constraint_state(url, "uq_users_oidc_identity") is None
+
+
+def test_037_refuses_a_squatting_index_name():
+    with throwaway_db("schema_037_squat", revision="036") as url:
+        sql(url, "CREATE INDEX uq_users_oidc_identity ON users (username)")
+        refuse_037(url, must_mention=["a relation named uq_users_oidc_identity"])
+        assert oidc_column_state(url, "oidc_issuer") is None
+
+
+def test_037_adopts_a_partial_marked_set_and_completes_it():
+    """Marked columns of the exact shape are adopted; the rest is created."""
+    with throwaway_db("schema_037_partial", revision="036") as url:
+        for column, coltype in OIDC_COLUMNS[:3]:
+            sql(url, f"ALTER TABLE users ADD COLUMN {column} {coltype}")
+            sql(url, f"COMMENT ON COLUMN users.{column} IS '{OIDC_COLUMN_MARKER}'")
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert_oidc_shape(url)
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_downgrade_037_drops_the_marked_objects_and_keeps_users():
+    with throwaway_db("schema_037_downgrade") as url:
+        insert_oidc_user(url, 1, "alice", bound=(OIDC_ISS, "s"))
+        insert_oidc_user(url, 2, "bob", pending=(OIDC_ISS, "b@example.com"))
+        _harness.run_alembic(url, "downgrade", "036", dimensions=DIM)
+        assert alembic_version(url) == "036"
+        columns, constraints = oidc_catalogue(url)
+        assert all(v is None for v in columns.values()), columns
+        assert all(v is None for v in constraints.values()), constraints
+        assert [r[1] for r in users_snapshot(url)] == ["alice", "bob"]
+
+
+def test_downgrade_037_skips_unmarked_objects():
+    with throwaway_db("schema_037_downgrade_foreign") as url:
+        sql(url, "COMMENT ON COLUMN users.oidc_issuer IS 'somebody else made this'")
+        sql(url, "COMMENT ON CONSTRAINT ck_users_oidc_not_both ON users IS NULL")
+        result = _harness.run_alembic(url, "downgrade", "036", dimensions=DIM)
+        out = result.stdout
+        assert "leaving users.oidc_issuer in place" in out, out
+        assert "leaving constraint ck_users_oidc_not_both on users in place" in out, out
+        # The surviving constraint still references these two marked columns.
+        assert "leaving users.oidc_subject in place" in out, out
+        assert "leaving users.oidc_expected_email in place" in out, out
+        assert alembic_version(url) == "036"
+        assert oidc_constraint_state(url, "ck_users_oidc_not_both") is not None
+        for name in OIDC_CONSTRAINTS:
+            if name != "ck_users_oidc_not_both":
+                assert oidc_constraint_state(url, name) is None, name
+        kept = {"oidc_issuer", "oidc_subject", "oidc_expected_email"}
+        for column in OIDC_COLUMN_NAMES:
+            assert (oidc_column_state(url, column) is not None) == (column in kept), column
+
+
+def test_downgrade_037_then_reupgrade_recreates_it_identically():
+    with throwaway_db("schema_037_roundtrip") as url:
+        insert_oidc_user(url, 1, "alice", bound=(OIDC_ISS, "s"))
+        catalogue = oidc_catalogue(url)
+        _harness.run_alembic(url, "downgrade", "036", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert oidc_catalogue(url) == catalogue
+        # The link is lost by design (the docstring says so).
+        assert oidc_values(url) == {1: (None,) * 6}
+        assert_alembic_check_clean(url, DIM)
+
+
+# --------------------------------------------------------------------------
+# 038: private_key_jwt for CIMD clients (#420)
+# --------------------------------------------------------------------------
+
+PKJWT_CONSTRAINT = "ck_oauth_clients_private_key_jwt_shape"
+PKJWT_MARKER = "created by 038_oauth_cimd_private_key_jwt (#420)"
+PKJWT_URL = "https://chatgpt.com/oauth/client.json"
+PKJWT_JWKS_URI = "https://chatgpt.com/oauth/jwks.json"
+PKJWT_SNAPSHOT = '{"keys": [{"kty": "RSA", "kid": "k1", "n": "AQAB", "e": "AQAB"}]}'
+
+
+def insert_pkjwt_client(
+    url,
+    client_id,
+    *,
+    metadata_url=PKJWT_URL,
+    secret=None,
+    jwks_uri=PKJWT_JWKS_URI,
+    alg="RS256",
+    snapshot=PKJWT_SNAPSHOT,
+    fetched=True,
+    method="private_key_jwt",
+):
+    sql(
+        url,
+        "INSERT INTO oauth_clients "
+        "(client_id, client_secret_hash, token_endpoint_auth_method, client_name, "
+        " redirect_uris, scope, client_id_metadata_url, jwks_uri, "
+        " token_endpoint_auth_signing_alg, jwks_snapshot, jwks_fetched_at) "
+        "VALUES ($1, $2, $3, 'pkjwt', '[]'::jsonb, 'read', $4, $5, $6, $7::jsonb, "
+        " CASE WHEN $8 THEN now() ELSE NULL END)",
+        client_id,
+        secret,
+        method,
+        metadata_url,
+        jwks_uri,
+        alg,
+        snapshot,
+        fetched,
+    )
+
+
+def pkjwt_constraint_row(url):
+    rows = fetch(
+        url,
+        "SELECT convalidated, obj_description(oid, 'pg_constraint') AS comment "
+        "FROM pg_constraint WHERE conrelid = 'oauth_clients'::regclass "
+        "  AND contype = 'c' AND conname = $1",
+        PKJWT_CONSTRAINT,
+    )
+    return (rows[0]["convalidated"], rows[0]["comment"]) if rows else None
+
+
+def assert_pkjwt_enforced(url):
+    """The four `private_key_jwt` shapes the 038 CHECKs exist to decide."""
+    # With a secret: the replaced auth-method CHECK refuses it.
+    with pytest.raises(asyncpg.exceptions.CheckViolationError) as with_secret:
+        insert_pkjwt_client(url, "cimd_" + "1" * 59, secret="a" * 64)
+    assert "ck_oauth_clients_" in str(with_secret.value)
+
+    # On a DCR id (no metadata URL): the new shape CHECK refuses it.
+    with pytest.raises(asyncpg.exceptions.CheckViolationError) as on_dcr:
+        insert_pkjwt_client(url, "pkjwt-dcr", metadata_url=None)
+    assert PKJWT_CONSTRAINT in str(on_dcr.value)
+
+    # Without a snapshot: the new shape CHECK refuses it.
+    with pytest.raises(asyncpg.exceptions.CheckViolationError) as no_snapshot:
+        insert_pkjwt_client(url, "cimd_" + "2" * 59, snapshot=None)
+    assert PKJWT_CONSTRAINT in str(no_snapshot.value)
+
+    # Well-formed on a cimd_ row: admitted.
+    insert_pkjwt_client(url, "cimd_" + "3" * 59)
+    sql(url, "DELETE FROM oauth_clients WHERE client_id = $1", "cimd_" + "3" * 59)
+
+
+def test_038_private_key_jwt_shapes_on_a_fresh_database():
+    with throwaway_db("schema_038_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+        assert pkjwt_constraint_row(url) == (True, PKJWT_MARKER)
+        # The pre-038 enforcement is unchanged.
+        assert_constraint_enforced(url)
+        assert_pkjwt_enforced(url)
+
+
+def test_038_absent_private_key_jwt_constraint_is_recreated():
+    """#53's shape for the new CHECK: gone from a database stamped past 038."""
+    with throwaway_db("schema_038_absent") as url:
+        sql(url, f"ALTER TABLE oauth_clients DROP CONSTRAINT {PKJWT_CONSTRAINT}")
+        assert pkjwt_constraint_row(url) is None
+        # Absent, a malformed row is admitted: the constraint is the only guard.
+        insert_pkjwt_client(url, "pkjwt-dcr-absent", metadata_url=None)
+        sql(url, "DELETE FROM oauth_clients WHERE client_id = 'pkjwt-dcr-absent'")
+
+        _harness.run_alembic(url, "stamp", "037", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert pkjwt_constraint_row(url) == (True, PKJWT_MARKER)
+        assert_reconciled(url, marker_expected=False)
+        assert_pkjwt_enforced(url)
+
+
+def test_038_keeps_013s_marker_through_upgrade_and_downgrade():
+    """A drifted 012 database: 013 marks the CHECK, 038 replaces it and keeps
+    the mark, and 038's downgrade restores 010's definition with it intact."""
+    with throwaway_db("schema_038_marker", revision="012") as url:
+        drift_to_live_shape(url)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert constraint_row(url) == (True, CANONICAL_CONSTRAINTDEF, MARKER)
+
+        _harness.run_alembic(url, "downgrade", "037", dimensions=DIM)
+        assert constraint_row(url) == (True, CANONICAL_CONSTRAINTDEF_010, MARKER)

@@ -37,7 +37,8 @@ In claude.ai, Claude Desktop or ChatGPT, add a custom connector at
 consent page. [Connect a client](#4-connect-a-client) has the rest.
 
 Stack: Python 3.12, FastAPI, PostgreSQL with pgvector. Pluggable
-embeddings (Ollama bge-m3, or OpenAI `text-embedding-3-{small,large}`).
+embeddings (Ollama — `bge-m3` by default, `qwen3-embedding:0.6b` in the
+reference deployment — or OpenAI `text-embedding-3-{small,large}`).
 
 ![Dashboard](https://raw.githubusercontent.com/maxkuminov/obsidian-mcp/main/screenshots/dashboard.png)
 
@@ -53,6 +54,7 @@ embeddings (Ollama bge-m3, or OpenAI `text-embedding-3-{small,large}`).
 - [Who this is for](#who-this-is-for)
 - [Control panel](#control-panel)
 - [Quick start](#quick-start)
+- [Versioning and compatibility](#versioning-and-compatibility)
 - [Upgrading](#upgrading)
 - [Cost expectations](#cost-expectations)
 - [The self-describing vault](#the-self-describing-vault)
@@ -283,15 +285,28 @@ the wire, so none is cut off by a client's description limit.
 - `keyword_search(query, folder?, tags?, frontmatter?, limit=20)`,
   full-text via PostgreSQL `tsvector`. A note's title and frontmatter
   `aliases` rank above its body, so a query that is a note's title finds
-  that note first; bare terms are ANDed, and when the full matches do not
+  that note first; its tags (frontmatter and inline `#tags`, a nested
+  `#a/b` also as `a` and `b`) are indexed below the title and above the
+  body, and `matched_in` names which of `title`, `tags` and `body`
+  matched; bare terms are ANDed, and when the full matches do not
   fill the page, partial matches follow tagged `match: any`; every row
   carries a `snippet:` with the matches highlighted (or `head:`, the
-  note's opening words, for a title match). The text-search config(s) are
+  note's opening words, for a title or tags match). The text-search config(s) are
   configurable via `FTS_CONFIGS` (see
   [Full-text search language(s)](#full-text-search-languages))
-- `semantic_search(query, folder?, tags?, frontmatter?, limit=15)`,
-  vector similarity via pgvector, one preview chunk per note
-- `hybrid_search(query, limit=10, folder?, tags?, frontmatter?)`, both
+- `semantic_search(query, folder?, tags?, frontmatter?, limit=15, rerank=false)`,
+  vector similarity via pgvector, one one-line preview chunk per note.
+  Notes are chunked at their headings, and each chunk is embedded under a
+  `Title > Heading > Subheading` context prefix. A fresh row names the
+  section it matched: `§ "Plan/Risks" (#7)` or `§ (top of note)`, and
+  `read_note(path, section="#7")` reads exactly that section. Previews start
+  on a word; a section too short to stand alone (under 200 characters) is
+  grouped with its neighbour, so a preview can include an inner heading line
+  and its `§` names the enclosing section. Stale rows,
+  and rows not yet re-embedded since the upgrade to heading-aware chunks,
+  carry no locator. While any of your notes is still on the old chunking,
+  each response says so on an `index_transition:` line under its header
+- `hybrid_search(query, limit=10, folder?, tags?, frontmatter?, rerank=false)`, both
   of the above fused by reciprocal rank fusion over each arm's top 50, one
   line per note with its fused score, each arm's rank and the `1/(k+rank)`
   terms behind the score. The three are peers, and every description
@@ -301,6 +316,25 @@ the wire, so none is cut off by a client's description limit.
   A single arm can beat the fusion on its own kind of query. If the
   embedding provider is down, `hybrid_search` returns the keyword ranking
   marked `arms: keyword-only (semantic unavailable: …)`, never silently
+  degraded: the marker is on every return path, so a keyword-only page
+  cannot pass for a fused one.
+- Every page of `semantic_search` and `hybrid_search` carries a
+  `confidence: ok | low` header token. `low` means no keyword note matched
+  all the terms and the closest semantic candidate is under
+  `SEARCH_LOW_CONFIDENCE_SIMILARITY`, with a one-line hint to try
+  `keyword_search` or `get_neighborhood` when it costs no row. Nothing is
+  filtered. The threshold ships at 0 (off: always `ok`) until you calibrate
+  it.
+- `rerank=true` on either of the last two asks an optional,
+  operator-configured reranker (`RERANK_URL`) to reorder the candidates
+  the call already fetched (at most 50 notes). Each note is scored on the
+  best of up to four of its fetched chunks, sent as the same text they were
+  embedded from (title, heading path and tags, then the chunk); a reranked
+  row's preview and `§` locator show the chunk that scored. The response is either
+  fully reranked (`reranked: true (candidates: N)`, a `rerank_score` per
+  row) or the unreranked page marked `reranked: false (<reason>)`;
+  without a reranker it answers `reranked: false (not_configured)`. Its
+  rows are one-line quoted objects, like `hybrid_search`'s
 - `list_notes(folder?, limit=50, since?, until?, order_by?, cursor?)`,
   sorted by modified time
 - `get_recent(folder?, limit=20, since?, until?, order_by?, cursor?)`,
@@ -455,7 +489,8 @@ origin the mint tools refuse rather than emit a localhost link.
 - `get_neighborhood(path, depth=1, limit=50)`, undirected BFS over the
   resolved-link graph, capped at depth ≤ 5 and limit ≤ 200
 - `find_related(path, limit=10)`, semantic neighbors via averaged
-  chunk embeddings and pgvector cosine distance, deduped per note
+  chunk embeddings and pgvector cosine distance, deduped per note, with
+  the same section locator and `index_transition:` line as `semantic_search`
 - `find_orphans(folder?, limit=50)`, notes with zero in or out
   resolved links
 
@@ -466,7 +501,10 @@ origin the mint tools refuse rather than emit a localhost link.
 - OAuth 2.0 PKCE (S256) flow for public and confidential clients,
   including ChatGPT, Claude Desktop, and claude.ai. Dynamic registration
   defaults to both vault permission levels; the user chooses the actual
-  grant on the consent screen.
+  grant on the consent screen. A read-only grant lists 19 tools — the
+  nine write tools are left out of `tools/list` (and still refused if
+  called by name); choose read + write at consent for all 28, and
+  reconnect the client after changing a grant's scope.
 - Control panel (Jinja2, hand-written CSS, vendored Chart.js, nonce-based
   CSP) for keys, usage logs,
   indexer status, embedding-provider info, and a danger-zone reset.
@@ -735,7 +773,29 @@ Bearer keys with `read` / `readwrite` scopes for API clients, and a
 separate OAuth 2.0 PKCE flow for clients like ChatGPT, Claude Desktop,
 and claude.ai that expect a proper authorization-code dance. The OAuth
 server supports public (`none`) and confidential (`client_secret_post`)
-token-endpoint authentication plus refresh tokens.
+token-endpoint authentication plus refresh tokens, and, for metadata-document
+clients only, `private_key_jwt` (RFC 7523 signed client assertions).
+
+Clients identify themselves in one of two ways:
+- **A Client ID Metadata Document** (CIMD, the MCP 2026-07-28 default). The
+  client's `client_id` is an `https` URL to a JSON document it publishes, and
+  the server fetches it through the same hardened, SSRF-guarded client as
+  `import_from_url`. Claude (claude.ai, Desktop, mobile), Claude Code and
+  ChatGPT use this whenever the server advertises it, which it does by default.
+  Claude Code's loopback callback (`http://localhost:<any port>/callback`) works
+  this way. Claude and Claude Code are public (`none`) clients. ChatGPT's
+  document declares `private_key_jwt`: the server also fetches the document's
+  same-origin `jwks_uri`, stores the validated public keys with the client,
+  and ChatGPT then signs a short-lived, single-use assertion for every token
+  exchange and refresh (and revocation). The server refetches the key set
+  from the same pinned URL when an assertion names a key it does not hold,
+  and before a token request once the stored set is more than a day old.
+- **Dynamic Client Registration** (`/register`, RFC 7591, deprecated by MCP but
+  kept) remains the fallback for any client that sends no URL.
+
+The consent page names a CIMD client by the **host** its document was fetched
+from, never by the name the document gives itself. Every authorization
+response carries the RFC 9207 `iss` parameter.
 
 Each client's page lists its grants — one row per `/authorize` approval,
 not per token — with a Revoke control and a permission select per grant,
@@ -787,9 +847,11 @@ The bundled Caddy configuration fails closed on `/admin`, `/api`, and
 - Docker and Docker Compose
 - A PostgreSQL 16 instance reachable from the container, with
   `pgvector` **0.8.0 or newer** installed
-- Either an Ollama instance running `bge-m3`, or an OpenAI API key.
-  Anything that speaks the OpenAI embeddings protocol works (Azure
-  OpenAI, OpenRouter, Together, etc.).
+- Either an Ollama instance running an embedding model (`bge-m3`, the
+  default, or `qwen3-embedding:0.6b`, which the reference deployment
+  runs; see [Embedding model choice](#embedding-model-choice)), or an
+  OpenAI API key. Anything that speaks the OpenAI embeddings protocol
+  works (Azure OpenAI, OpenRouter, Together, etc.).
 - Linux, kernel 5.6 or newer (see below)
 
 ### System requirements
@@ -879,7 +941,11 @@ EMBEDDING_DIMENSIONS=1024
 ```
 
 This is the default. Omitting `EMBEDDING_PROVIDER` falls back to
-Ollama.
+Ollama. On a new install, consider `qwen3-embedding:0.6b` (also 1024
+dimensions) with a query instruction, which is what the reference
+deployment runs; read [Embedding model choice](#embedding-model-choice)
+before the first index pass, because changing the model later means a
+full re-embed.
 
 The embedding URL must be `https`, or `http` to a loopback host
 (`localhost`, `127.x`, `::1`). Plaintext `http` to any other host —
@@ -943,10 +1009,236 @@ The first thing any agent should do in a new session is call
 `get_vault_guide()`. That's how it learns your folder structure,
 naming conventions, and YAML schema before it writes anything.
 
+## Versioning and compatibility
+
+From 1.0 the version number is a promise about the MCP tool contract:
+the 28 tools' names, their argument schemas, the shape of their result
+lines, and the `MCP-REFUSAL` codes. An agent written against 1.0 keeps
+working against every 1.x.
+
+- **The wire form is pinned.** `tests/fixtures/tools_list_full_v1.json`
+  is the complete `tools/list` result an API key or a `readwrite` OAuth
+  grant sees (every field of all 28 tools), and
+  `tests/fixtures/tools_list_readonly_oauth.json` pins the 19 names a
+  read-only OAuth grant lists. CI fails on any drift; a deliberate change
+  regenerates the fixture and says so in its spec. Result line shapes
+  are specified in `openspec/specs/` and pinned by each tool's tests,
+  not by one fixture.
+- **Refusal codes are a closed set.** Every code an `MCP-REFUSAL` line can
+  carry is declared in `src/services/refusals.py` (`CODES`), and a refusal
+  with any other code cannot be constructed. That module is the catalogue;
+  there is no separate list. The transport 429s (failed authentication,
+  transfer redemption, `body_memory`) are outside that line by design.
+- **Within 1.x, additions only:** new tools, new optional arguments whose
+  default leaves the old result byte-identical, new header tokens or
+  trailing fields, new refusal codes. Never a rename, a removal, a changed
+  default that alters an existing result, or a changed meaning of an
+  existing field or code. A change of that kind is 2.0, announced one
+  minor release earlier in the release notes. Unknown arguments are
+  refused, so a client that sends a newer argument to an older server gets
+  a refusal, not a silently ignored filter.
+- **Settings.** A new setting ships with a default that keeps the previous
+  behaviour. Every setting change is in the release's upgrade notes, in
+  the [Configuration](#configuration) table and in `.env.example`.
+- **Schema.** Every release names its migrations and says whether they
+  refuse startup or need a rebuild or re-embed, and
+  [`DEPLOYMENT.md`](./DEPLOYMENT.md) documents each one's downgrade (it
+  does so for every migration from 033 on).
+
+Not part of the contract: the control panel and its `/api/*` endpoints,
+log fields, the search-evaluation harness (`scripts/search_eval/`), the
+internal MCP SDK version, and ranking quality. Which notes come back, and
+in what order, moves with the index, the embedding model and the
+reranker; the harness measures it
+([docs/architecture/search.md](./docs/architecture/search.md#search-evaluation-harness-356)).
+`MCP_SANDBOX_MODE`, the registry-evaluation switch, is outside the promise
+too.
+
 ## Upgrading
 
 Pull, then `make deploy` (or rebuild your compose stack); migrations
-run on start. Across the hybrid-search release (#354):
+run on start.
+
+Across the ChatGPT `private_key_jwt` release (migration 038, #420):
+
+- **Migration 038** adds four nullable columns to `oauth_clients` and
+  replaces or adds three CHECKs, with no backfill, and takes seconds.
+  Existing DCR and CIMD clients and their grants are untouched. Its
+  downgrade refuses while any `private_key_jwt` client exists (delete it
+  in the panel first; its grants go with it).
+- **ChatGPT connects through CIMD.** It was refused `invalid_client` at
+  `/authorize` before this release, because its document declares
+  `private_key_jwt`. Nothing to configure; there are no new settings.
+- **Re-add an existing ChatGPT connector, don't just reconnect it.** ChatGPT
+  reads the server's OAuth metadata once, when a connector is created, and
+  picks its token authentication method from that copy. A connector created
+  before this release still works from the old metadata, which had no
+  `private_key_jwt`. It authenticates as a public client, and the token
+  request is refused (`oauth_token_refused
+  reason=invalid_client.assertion_missing`). Delete the connector in ChatGPT
+  and add it again with the same URL. Nothing needs changing on the server.
+  The same applies after any future change to
+  `token_endpoint_auth_methods_supported`.
+- **Outbound access.** Besides each client's document, the server now
+  fetches a `private_key_jwt` client's key set (`jwks_uri`, same origin as
+  the document) at consent and, when keys rotate or the stored set is a day
+  old, before a token request. The same SSRF-guarded client and egress
+  rules apply.
+- **The AS metadata** gains `private_key_jwt` in
+  `token_endpoint_auth_methods_supported` and
+  `token_endpoint_auth_signing_alg_values_supported`, only while
+  `OAUTH_CIMD_ENABLED` is true. `/register` still does not accept
+  `private_key_jwt`.
+
+Across the OIDC account-linking release (migration 037, #416):
+
+- **Migration 037** adds six nullable link columns and five
+  constraints to `users`, with no backfill, and takes seconds. With
+  SSO off nothing else changes. Its downgrade drops every link.
+- **`OIDC_SUBJECT_USER_IDS` is retired.** A deployment that still sets
+  it refuses to start. If yours did, do this in order (it is also in
+  the startup message): (1) on the old release, confirm a local admin
+  password works; (2) set `LOCAL_LOGIN_ENABLED=true`; (3) copy the
+  map's subject-to-user pairs, then remove the `OIDC_SUBJECT_USER_IDS`
+  line (delete it; an empty `OIDC_SUBJECT_USER_IDS=` fails to parse at
+  startup); (4) deploy and start; (5) sign in with the password and, on each
+  user's edit page, **Single sign-on → Bind subject** with their
+  former subject; (6) verify an SSO sign-in per user and one MCP
+  client's `/authorize` consent; (7) optionally set
+  `LOCAL_LOGIN_ENABLED=false` again, once the startup log shows no
+  CRITICAL lockout line. Details:
+  [docs/native-oidc.md, "Upgrading from OIDC_SUBJECT_USER_IDS"](./docs/native-oidc.md#upgrading-from-oidc_subject_user_ids).
+- **Wider provider profile.** RS256, PS256 and ES256 ID tokens (as
+  advertised by discovery), `client_secret_post` via
+  `OIDC_TOKEN_AUTH_METHOD`, `OIDC_EXTRA_SCOPES`, `OIDC_DISPLAY_NAME`
+  and `OIDC_CA_FILE` are new. `OIDC_REQUIRED_GROUP` is now optional;
+  set, it works as before. The requested scopes become
+  `openid email profile`. A provider that advertises RFC 9207 must now
+  return `iss` on the callback.
+- SSO logins now stamp the user's last-login time.
+
+Across the reranker-documents release (#402):
+
+- **No migration, nothing re-derived or re-embedded.** `rerank=true` now
+  sends each candidate note's embedding input (title, heading path, tags,
+  then the chunk) for its cosine-best chunk and up to three more of its
+  already-fetched chunks, at most `RERANK_MAX_DOCUMENTS` per call (new,
+  default 100, 50–200; `50` restores the previous count); a note scores
+  the best of its documents. `rerank=false` is byte-identical. The usage
+  row gains `rerank_documents`.
+- **`RERANK_TIMEOUT_MS` accepts 100–30000**; the default stays 1,500.
+  Size it with the document budget: `RERANK_TIMEOUT_MS ≥
+  RERANK_MAX_DOCUMENTS × average characters × per-character cost`,
+  doubled when the GPU is shared with the embedding model. The
+  reference deployment runs `20000`
+  ([DEPLOYMENT.md, "Reranker (optional)"](./DEPLOYMENT.md#reranker-optional)).
+  Under `MCP_CONCURRENCY_MODE` `queue` or `enforce`, keep it at or below
+  `MCP_CONCURRENCY_WAIT_SECONDS × 1000` unless `make concurrency-report`
+  passes with `rerank=true` traffic.
+- **Rollback** is a redeploy of the previous image. Set
+  `RERANK_TIMEOUT_MS` to 10000 or less first: the previous image's range
+  ends there and refuses to start above it.
+
+Across the Client ID Metadata Documents release (migration 036, #357):
+
+- **Migration 036** adds one nullable column and one CHECK to
+  `oauth_clients`, with no backfill, and takes seconds. Its downgrade refuses while CIMD clients
+  exist (delete them in the panel first).
+- **Connectors switch to CIMD on their next connection.** Existing DCR
+  grants keep working. claude.ai, Claude Code and ChatGPT stop calling
+  `/register`. `OAUTH_CIMD_ENABLED=false` is the rollback lever.
+- **Every authorization redirect now carries `iss`** (RFC 9207). A client
+  that compares it does so against the metadata `issuer`, which is
+  unchanged.
+- **`resource` (RFC 8707) is logged, not enforced.** Each `/authorize` and
+  `/token` request is classified (`resource_class`) in the security log.
+  Refusing a foreign `resource` is a later change, gated on 14 days of these
+  logs ([DEPLOYMENT.md](./DEPLOYMENT.md#oauth-cimd-and-the-resource-gate-357)).
+- **The consent page's CSP** gains `form-action http://localhost:* http://127.0.0.1:*`
+  for native loopback callbacks.
+
+Across the scoped tools/list release (#358):
+
+- **No migration and no setting.** An OAuth grant without `readwrite`
+  now lists 19 tools: the nine write-required tools (`create_note`,
+  `edit_note`, `move_note`, `delete_note`, `set_frontmatter`,
+  `write_file`, `delete_file`, `import_from_url`, `request_upload`) are
+  left out. API keys of either permission and `readwrite` grants still
+  list all 28, byte-identical to before. A read-only client that cached
+  the 28 and calls a hidden tool gets `permission_denied`, as before.
+- **No `list_changed` is sent.** After a grant's scope is changed in the
+  panel, the connector sees the new list when it reconnects.
+- **One refusal changes for read-only callers.** The refusals
+  `write_file` / `delete_file` made before their permission check (a
+  malformed `expected_hash`, `no_incumbent` for
+  `write_file(overwrite=false)`) are now `permission_denied`; a
+  `readwrite` caller's refusals are unchanged.
+
+Across the keyword-tags release (migration 035, #391):
+
+- **Tags become searchable at once.** Migration 035 adds each note's tags
+  to its keyword vector in place, in SQL, under the index generation lock
+  (tens of seconds on a few thousand notes); nothing is re-embedded or
+  re-derived and no setting is new. `make deploy` stops the app before
+  the migration; on a hand-driven compose stack: stop → `alembic upgrade
+  head` → start.
+- **Run the read-only check first.** 035 aborts with nothing written if a
+  tagged vector would cross PostgreSQL's 1 MiB tsvector limit; under
+  Kubernetes `Recreate` that is downtime until the digest is reverted.
+  [DEPLOYMENT.md, "Upgrading across migration 035"](./DEPLOYMENT.md#upgrading-across-migration-035-tags-in-keyword-search-391)
+  has the statement to run against the live database before merging and
+  the remedy.
+- **Rollback**: `alembic downgrade 034` with the new image strips the
+  tags part, then deploy the previous image.
+
+Across the chunk-minimum release (`CHUNKING_VERSION` 2, #390):
+
+- **No migration and no new setting, but a second gradual re-embed.**
+  Chunks shorter than 200 characters are no longer stored (a short
+  section is grouped with its neighbours), windows are cut at a line or
+  word start, and long whitespace runs are sent collapsed. Startup does
+  not refuse; every note is selected again in the background under the
+  per-tenant embed budgets.
+- **Until your notes drain**, the `index_transition: N notes not yet
+  re-chunked; …` line returns on `semantic_search`, `find_related` and
+  `hybrid_search`, and `/health` reads `indexer.rechunk: "in_progress"`,
+  then `"complete"`. A section that did not change keeps its vector;
+  each pass logs `Embedding complete: N notes, X chunks (S submitted, R
+  reused)`.
+- **Rollback** is a redeploy of the previous image, which re-embeds
+  every note stamped 2 in full
+  ([DEPLOYMENT.md](./DEPLOYMENT.md#upgrading-to-chunking-version-2-390-minimum-chunk-length)).
+
+Across the search-confidence release (#389):
+
+- **No migration.** Every `semantic_search` and `hybrid_search` page gains
+  one header token: ` — confidence: ok` (at the default threshold 0 that is
+  the only byte that changes). A parser that matched the old header
+  exactly needs to allow it. Usage rows gain `confidence`,
+  `top_similarity` and (hybrid) `keyword_all`. One optional setting,
+  `SEARCH_LOW_CONFIDENCE_SIMILARITY` (default 0 = off); leave it at 0 until
+  the calibration recipe in `DEPLOYMENT.md` passes for both tools.
+- **The search-eval harness** reports recall@20 and recall@50, runs at
+  `--depth` 50 by default and writes `report.json` `schema_version` 2; a
+  `runfile:` baseline staged at depth 20 scores a null recall@50, so re-run
+  it for a delta. It gains a `confidence` subcommand.
+- **Rollback** is a redeploy of the previous image; the new usage keys stay
+  and are ignored.
+
+Across the reranker release (#367):
+
+- **No migration, nothing re-derived or re-embedded.** `semantic_search`
+  and `hybrid_search` gain an optional `rerank` argument (default false,
+  output unchanged), and four optional settings (`RERANK_URL`,
+  `RERANK_MODEL`, `RERANK_TIMEOUT_MS`, `RERANK_ALLOW_PLAINTEXT`). Nothing
+  changes until you set `RERANK_URL`. The concurrency class mapping is
+  unchanged, so readiness evidence carries over. A reference setup is in
+  [Reranker reference setup](#reranker-reference-setup).
+- **Rollback** is a redeploy of the previous image. A client that keeps
+  sending `rerank` is then refused by the unknown-argument rule, which is
+  the normal cost of rolling back a new argument.
+
+Across the hybrid-search release (#354):
 
 - **No migration, nothing re-derived or re-embedded.** A new tool,
   `hybrid_search`, and one optional setting, `HYBRID_RRF_K` (default 60).
@@ -1181,6 +1473,42 @@ Traefik-OAuth-only mode. The schema stays in place, so flipping back
 to multi-user later resumes where you left off without re-bootstrapping
 (the `users` table is non-empty, so `/admin/register` is closed).
 
+### Single sign-on (optional)
+
+Multi-user deployments can add "Sign in with SSO" through any
+standards-compliant OpenID Connect provider (Keycloak, Authentik,
+Authelia, Zitadel, Kanidm, Okta, Entra ID, …). It is off by default
+(`OIDC_ENABLED=false`), and with it off nothing changes.
+
+- **It signs in existing accounts only.** An admin links each account
+  on its edit page, **Single sign-on** card: **Expect email** (the
+  first sign-in within 7 days whose provider-*verified* email matches
+  links the account, once) or **Bind subject** (paste the provider's
+  `sub`, linked immediately). After that only the provider's issuer
+  and subject identify the user; a renamed or re-addressed provider
+  account changes nothing. An identity that is not linked is refused
+  with a page that does not say why.
+- **No provisioning, no role mapping.** Signing in never creates a
+  user, changes the admin flag or assigns a vault, and
+  `/admin/register` is closed while SSO is on. Create users first.
+- **The server stays the OAuth server for MCP clients.** SSO only
+  changes how the panel session is made; that session also covers the
+  consent page, so connecting a client can go through SSO. API keys,
+  grants and tokens are unchanged.
+- **Password login stays** unless you set `LOCAL_LOGIN_ENABLED=false`.
+  While it is off, the panel refuses any change that would leave no
+  active admin linked to SSO, and startup logs a CRITICAL line if
+  there is none. Re-enabling it and restarting is the recovery path.
+- **Unlinking** clears the link and signs that user out everywhere.
+  Removing someone at the provider stops new logins but does not end
+  their existing sessions, keys or grants: deactivate the local
+  account for that.
+
+[docs/native-oidc.md](./docs/native-oidc.md) has the provider
+requirements, every setting, a click-by-click Keycloak walkthrough,
+the setup order, break-glass recovery and troubleshooting by refusal
+reason.
+
 ### Constraints and known limits
 
 - The indexer iterates active users sequentially each cycle. Fine for
@@ -1269,18 +1597,32 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `ALLOWED_HOSTS` | derived | Accepted `Host` headers, JSON list. `localhost` is always added. |
 | `SESSION_MAX_AGE` | `604800` | Panel session lifetime, seconds (multi-user mode). Absolute — the server-side row is never extended, so a session used daily still expires |
 | `SESSION_COOKIE_NAME` | `omcp_session` | Panel session cookie name |
+| `LOCAL_LOGIN_ENABLED` | `true` | The panel's password form (multi-user mode). `false` hides it and refuses its POST; multi-user mode needs this or `OIDC_ENABLED`. Setting it back to `true` and restarting is the recovery path when SSO is unavailable. See [docs/native-oidc.md](./docs/native-oidc.md#recovery-break-glass). |
+| `OIDC_ENABLED` | `false` | Browser SSO through an OpenID Connect provider ([Single sign-on](#single-sign-on-optional)). Requires multi-user mode and an HTTPS `BASE_URL`; refused in sandbox mode. The `OIDC_*` settings below are validated only when it is `true`, without contacting the provider. |
+| `OIDC_ISSUER` | — | Required with SSO. HTTPS issuer URL exactly as the provider's discovery `issuer` states it; no query or fragment; at most 2,048 characters. |
+| `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | — | Required with SSO. The confidential client registered at the provider, redirect URI `<BASE_URL>/admin/auth/oidc/callback`. Keep the secret in your secret store. |
+| `OIDC_TOKEN_AUTH_METHOD` | `client_secret_basic` | `client_secret_basic` (Authorization header) or `client_secret_post` (form body). A login is refused when discovery lists auth methods without this one. |
+| `OIDC_REQUIRED_GROUP` | — | Optional. When set (at most 512 characters), the ID token's `groups` array must contain this exact, case-sensitive string. Empty means no group check. |
+| `OIDC_EXTRA_SCOPES` | — | Extra scopes requested after `openid email profile`: space-separated RFC 6749 scope tokens, at most 8 of at most 64 characters. `offline_access` is refused at startup. |
+| `OIDC_DISPLAY_NAME` | `SSO` | The login button reads "Sign in with {name}". 1–40 printable characters. |
+| `OIDC_CA_FILE` | — | PEM CA file trusted for the provider requests only, for an issuer behind a private CA; when set, only this file is trusted for them. Unset, empty or `off` uses the certifi bundle. Refused if unreadable or holding no CA. |
+| `OIDC_SUBJECT_USER_IDS` | — | **Retired.** Any non-empty value refuses startup; links are made in the panel. See [Upgrading](#upgrading) and [docs/native-oidc.md](./docs/native-oidc.md#upgrading-from-oidc_subject_user_ids). |
 | `PANEL_CSP` | `enforce` | Content-Security-Policy on the panel, login and consent pages: `enforce`, `report-only` (same policy, reports only), or `off`. A rollback lever — change it and recreate the container, no rebuild. Anything but `enforce` logs a WARNING at each start. |
 | `SESSION_TOUCH_INTERVAL_SECONDS` | `60` | How stale a session's `last_seen_at` may get before a validated `GET`/`HEAD` rewrites it. Telemetry only — nothing authorizes on it. Must be ≥ 1. |
 | `SESSION_PURGE_RETAIN_DAYS` | `7` | How long a dead panel session row is kept, measured from the *later* of its expiry and its revocation, so a revocation stays visible for the full window. Must be ≥ 1. |
 | `OAUTH_KNOWN_REDIRECT_HOSTS` | `claude.ai,chatgpt.com` | Redirect **hosts** the consent screen badges as known connector destinations. JSON or CSV. Matched by exact host equality — no wildcards, no suffixes; entries containing `*`, `/`, `@` or internal whitespace are refused at startup. An empty list means every client is shown as unverified. |
+| `OAUTH_CIMD_ENABLED` | `true` | Accept OAuth Client ID Metadata Documents (an `https` URL as `client_id`) and advertise `client_id_metadata_document_supported`. `false` removes the flag, so clients fall back to `/register`; existing CIMD grants keep refreshing. |
+| `OAUTH_CIMD_CACHE_MAX_SECONDS` | `86400` | Ceiling on how long a fetched client metadata document is cached (its `Cache-Control: max-age`; 300 s when absent; `no-store` is honoured). 0–86400; `0` never caches. |
+| `OAUTH_CIMD_FETCHES_PER_ADDRESS_PER_MINUTE` | `10` | Client metadata document fetches one client address may start per minute (1–120). Cache hits and requests joining an in-progress fetch spend nothing. Fetches are also capped at one in flight per address and eight per server. |
 | `OAUTH_GRANT_ABSOLUTE_LIFETIME_DAYS` | `90` | Absolute lifetime of an OAuth grant, in whole days (1–365), counted from when the application first receives its tokens. Refresh never extends it; after it the user must approve again. Stated on the consent page. **No off value** — empty, `null`, `none` and `0` refuse to start. Lowering it applies to every grant at its next request; raising it extends existing grants. |
 | `MAX_FILE_READ_BYTES` | `10485760` | `read_file` cap (10 MB); bounds what the server reads from disk |
 | `MAX_FILE_WRITE_BYTES` | `26214400` | `write_file` cap (25 MB), decoded byte length |
 | `MAX_READ_RESPONSE_CHARS` | `40000` | `read_note` / `read_file` cap on what is returned to the caller (≈10K tokens). See [Response size limits](#response-size-limits). |
 | `FTS_CONFIGS` | `english` | Keyword-search text-search config(s). JSON or CSV. See [Full-text search language(s)](#full-text-search-languages). |
-| `RANK_WEIGHTS` | `{0.02, 0.2, 0.4, 1.0}` | `keyword_search`'s `ts_rank_cd` weight array `{D, C, B, A}`: the title and aliases are indexed at `A`, the body at `D`. At the default one two-word title match outweighs fifty body repetitions; PostgreSQL's own `D=0.1` lets ten tie it. Four finite numbers, each in [1e-6, 1]; only title-versus-body order moves. |
+| `RANK_WEIGHTS` | `{0.02, 0.2, 0.4, 1.0}` | `keyword_search`'s `ts_rank_cd` weight array `{D, C, B, A}`: the title and aliases are indexed at `A`, the tags at `B`, the body at `D` (`C` is unused). At the default one two-word title match outweighs fifty body repetitions, and one tag match ranks below a title match and equals twenty body matches; PostgreSQL's own `D=0.1` lets ten body repetitions tie the title. Four finite numbers, each in [1e-6, 1]; body-only order never moves. |
 | `KEYWORD_EXCERPT_CHARS` | `20000` | Leading characters of each note's indexed text stored for `keyword_search` snippets (1000–100000). Applies to notes indexed afterwards; `make rebuild-tsvectors` rewrites the rest. The snippet cost grows roughly linearly with this; the 300 ms budget was measured at the defaults. |
 | `KEYWORD_SNIPPET_ROWS` | `20` | Rows per `keyword_search` page that get a snippet, whatever `limit` is (0–100; 0 turns snippets off). Bounds the per-call `ts_headline` cost, which grows roughly linearly with this; the 300 ms budget was measured at the defaults. |
+| `SEARCH_LOW_CONFIDENCE_SIMILARITY` | `0` | Where `semantic_search` and `hybrid_search` start reading `confidence: low` (#389): no keyword note matched all terms and the best similarity of the call's candidates is strictly below this value. **0 is off** (the shipped default: the token is still on every page and always reads `ok`, which means "not judged"). Range 0–1; out of range or non-finite refuses to start. Model-dependent: bge-m3's candidate value is 0.50 (live probes: gibberish 0.36–0.49, paraphrases 0.61–0.67; not calibrated for `qwen3-embedding:0.6b`), OpenAI `text-embedding-3-*` cosines run lower, so re-choose it when the embedding model changes. Ranks nothing and is not part of the retrieval fingerprint. Set it only after both tools pass the calibration recipe in `DEPLOYMENT.md`, "Calibrating search confidence". |
 | `HYBRID_RRF_K` | `60` | `hybrid_search`'s reciprocal-rank-fusion constant (1–1000; out of range refuses to start): a note scores the sum over the two arms of `1/(k + rank)`. Smaller lets each arm's top ranks dominate; larger flattens toward counting votes. Measure a change with the harness arms `scripts.search_eval_arms.hybrid:make_arm` / `make_arm_alt` (`ARM_OPTS="hybrid_k=60 hybrid_alt_k=20"`, see `DEPLOYMENT.md`, "Measuring search quality"); there is no per-call argument. |
 | `TRANSFER_TOKEN_TTL_SECONDS` | `600` | Default life of a transfer link. Per-call `expires_in` is clamped to 60–3600. |
 | `TRANSFER_MAX_UPLOAD_SECONDS` | `600` | How long one claimed upload may stream before the token is spent |
@@ -1291,12 +1633,18 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `EMBEDDING_PROVIDER` | `ollama` | `ollama` or `openai` |
 | `EMBEDDING_DIMENSIONS` | `1024` | pgvector column width |
 | `OLLAMA_URL` | `http://ollama:11434` | Used when provider is Ollama. Must be `https`, loopback `http`, or covered by `EMBEDDING_ALLOW_PLAINTEXT`. |
-| `EMBEDDING_MODEL` | `bge-m3` | Ollama model name. Changing it post-deploy requires `make reset-embeddings`; the server refuses to start until the stored vectors match. See [Switching providers or models](#switching-providers-or-models). |
+| `EMBEDDING_MODEL` | `bge-m3` | Ollama model name. `bge-m3` stays the default and fully supported; the reference deployment runs `qwen3-embedding:0.6b` (also 1024-d) with the query instruction below, see [Embedding model choice](#embedding-model-choice). Changing it post-deploy requires `make reset-embeddings`; the server refuses to start until the stored vectors match. See [Switching providers or models](#switching-providers-or-models). |
+| `EMBEDDING_QUERY_INSTRUCTION` | empty | Prepended verbatim, with no separator, to every **search query** sent to the embedding provider, and never to a note. For instruction-tuned embedders such as Qwen3-Embedding, e.g. `"Instruct: Given a question, retrieve the notes that answer it\nQuery: "` (double quotes, so `.env` turns `\n` into a newline). Up to 1,000 characters; NUL and control characters other than newline and tab are refused. It is **not** in the stored embedding fingerprint, so changing it needs no reset and re-embeds nothing; changing the model still does. The default model is unchanged (bge-m3, which wants no instruction); the template above is the one the reference deployment runs with `qwen3-embedding:0.6b`. |
 | `OLLAMA_KEEP_ALIVE` | `-1` | How long Ollama keeps the model resident. `-1` pins it; a Go duration (`30m`) frees VRAM when idle. Ollama only. |
 | `OPENAI_API_KEY` | — | Required when provider is OpenAI |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Override for Azure or proxies. Same transport rule as `OLLAMA_URL` when this provider is active. |
 | `EMBEDDING_ALLOW_PLAINTEXT` | `false` | Permit `http` to a non-loopback embedding host. Without it such a URL refuses to start. `.env.example` sets it `true` to match its `http://ollama:11434` default. |
 | `EMBEDDING_CA_FILE` | — | Trust anchor (PEM) for an `https` embedding endpoint behind an internal CA; replaces the default certifi bundle. Refused with an `http` URL. Embedding clients ignore `HTTP(S)_PROXY`, `SSL_CERT_*` and `.netrc`. |
+| `RERANK_URL` | — | Full URL of an optional reranker speaking the Jina-compatible `/v1/rerank` format (`llama-server --reranking`, vLLM, Infinity), e.g. `http://127.0.0.1:8081/v1/rerank`. Empty means no reranker: `rerank=true` answers `reranked: false (not_configured)`. **The endpoint receives the query and candidate note text.** Same transport rule as the embedding URL (`https`, loopback `http`, or `RERANK_ALLOW_PLAINTEXT`); a bad URL refuses to start, an unreachable reranker never does (it is probed at startup and re-probed in the background; `/health` reports `rerank`). Opt-in: on the reference vault it improves `semantic_search` and makes `hybrid_search` worse (see [Reranker reference setup](#reranker-reference-setup)); measure it with the harness on your own judgments, and a CPU reranker will time out at the default deadline. Since [#402](https://github.com/maxkuminov/obsidian-mcp/issues/402) it scores each note on up to four of its fetched chunks, sent with their heading path (`RERANK_MAX_DOCUMENTS`). See [Reranker reference setup](#reranker-reference-setup) and `DEPLOYMENT.md`, "Reranker (optional)". |
+| `RERANK_MODEL` | — | Sent as `model` in the rerank request (≤ 200 characters). `llama-server` serves one model and ignores it. |
+| `RERANK_TIMEOUT_MS` | `1500` | One deadline per rerank call (100–30000), covering connect, write and read; past it the page falls back unreranked with `reranked: false (timeout)`. Also the extra time a `rerank=true` call can hold its `embedding` concurrency slot: under `MCP_CONCURRENCY_MODE` `queue` or `enforce`, keep it at or below `MCP_CONCURRENCY_WAIT_SECONDS` unless `make concurrency-report` passes with rerank traffic (a long hold delays, or under `enforce` refuses, concurrent vector searches). The reference deployment (GPU `llama-server`, see [Reranker reference setup](#reranker-reference-setup)) runs `20000`, because a hybrid `rerank=true` call there sends 67–68 documents and takes about 9–10 s; size it together with `RERANK_MAX_DOCUMENTS`, which since #402 can double the documents per call (`DEPLOYMENT.md`). |
+| `RERANK_MAX_DOCUMENTS` | `100` | The most documents one rerank call sends (50–200). Every candidate note (at most 50) is sent its best chunk first, then up to three more of its already-fetched chunks in distance order; a note scores the best of its documents. Rerank latency multiplies with it and `RERANK_TIMEOUT_MS`; `50` restores the pre-#402 count. |
+| `RERANK_ALLOW_PLAINTEXT` | `false` | Permit `http` to a non-loopback reranker host. Separate from `EMBEDDING_ALLOW_PLAINTEXT`, which does not cover it. An `https` reranker is verified against `EMBEDDING_CA_FILE` when set, else certifi's bundle. |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI model. Changing it post-deploy requires `make reset-embeddings`; the server refuses to start until the stored vectors match. See [Switching providers or models](#switching-providers-or-models). |
 | `CHUNK_SIZE` | `512` | Approx tokens per chunk (4-char heuristic) |
 | `CHUNK_OVERLAP` | `0` | Token overlap between chunks |
@@ -1347,6 +1695,81 @@ container too small to admit one maximum-size body (about 1.1 GiB with the
 defaults). The `MCP_BODY_*` settings in `.env.example` only allow the safe
 direction.
 
+### Embedding model choice
+
+Two local models are documented here. Both are multilingual and produce
+1024-dimensional vectors, so `EMBEDDING_DIMENSIONS=1024` fits either.
+
+- **`bge-m3`** is the code default (`EMBEDDING_MODEL=bge-m3`) and stays a
+  fully supported choice. It needs no query instruction
+  (`EMBEDDING_QUERY_INSTRUCTION` empty). The default is not changing: the
+  stored-fingerprint guard refuses to start a deployment whose model
+  changed, so a new default would stop every existing install that relies
+  on it.
+- **`qwen3-embedding:0.6b`** is what the reference deployment has run since
+  2026-10-31, with a query instruction. The instruction is applied to
+  queries only (notes are embedded without one) and is outside the stored
+  fingerprint:
+
+  ```env
+  EMBEDDING_PROVIDER=ollama
+  EMBEDDING_MODEL=qwen3-embedding:0.6b
+  EMBEDDING_DIMENSIONS=1024
+  EMBEDDING_QUERY_INSTRUCTION="Instruct: Given a question, retrieve the notes that answer it\nQuery: "
+  ```
+
+What was observed after the switch, on one user's vault (not a
+benchmark): cross-language recall between English and Russian queries and
+notes was strong, and `hybrid_search` became the day-to-day default. **No
+harness A/B was run for the switch**, so no quality gain is claimed. To
+measure it on your own vault, use the search-evaluation recipe in
+[`DEPLOYMENT.md`](./DEPLOYMENT.md#measuring-search-quality).
+
+Switching an existing install is a full re-embed (the procedure is
+[below](#switching-providers-or-models)). For scale: on an 8 GiB Quadro
+P4000 shared by Ollama and the reranker, ~4,200 notes re-embedded in about
+84 minutes. `SEARCH_LOW_CONFIDENCE_SIMILARITY` is model-dependent: its
+0.50 candidate was measured on `bge-m3`, so re-calibrate after a switch.
+
+### Reranker reference setup
+
+`rerank=true` is opt-in. Before [#402](https://github.com/maxkuminov/obsidian-mcp/issues/402)
+the reranker scored one heading-less chunk per note, which demoted some
+notes both search arms ranked first; it now scores each note on the
+embedded text (title, heading path, tags, chunk) of up to four of its
+fetched chunks (`RERANK_MAX_DOCUMENTS`). The #402 real-data gate ran on
+2026-10-31 against the previous reranker documents and passed 4 of 6
+reports (the owner waived one near-miss cell). Measured against
+`rerank=false` on the reference vault (2026-11-01, 196 queries), it
+improves `semantic_search` (overall recall@10 0.505 → 0.582, nDCG@10
+0.389 → 0.442) and makes `hybrid_search` worse (MRR 0.533 → 0.465,
+nDCG@10 0.519 → 0.474), because plain hybrid is already the strongest
+ranking there. Keep `rerank=false` as the default, use `rerank=true`
+with `semantic_search` when the top few rows matter, and call
+`hybrid_search` without it. The intervals and the method are in
+[`DEPLOYMENT.md`](./DEPLOYMENT.md#reranker-optional); measure on your
+own judgments after a model or reranker change.
+
+Ollama has no rerank endpoint
+([ollama/ollama#3368](https://github.com/ollama/ollama/issues/3368)), so
+the reference deployment runs llama.cpp's `llama-server` (image
+`ghcr.io/ggml-org/llama.cpp:server-cuda12-*`, pinned to a build) serving
+`bge-reranker-v2-m3` as a Q8_0 GGUF with `--reranking`, behind TLS:
+
+```env
+RERANK_URL=https://<host>:<port>/v1/rerank
+RERANK_TIMEOUT_MS=20000
+```
+
+Measured on the same P4000 with nothing else running: 50 documents of ~410
+characters in 1.6 s, 50 documents of 2,000 characters in 7.3 s. Candidates
+are cut to 2,048 characters, so the 1,500 ms default deadline is too short
+for this card. A hybrid `rerank=true` call sends 67–68 documents on the
+reference vault and takes about 9–10 s uncontended (68 documents of 2,000
+characters measured 9.1 s), so the reference runs 20,000 ms since
+2026-11-01; the setting accepts 100–30000. Details, the sizing table and
+the startup checks are in [`DEPLOYMENT.md`](./DEPLOYMENT.md#reranker-optional).
+
 ### Switching providers or models
 
 Different models produce vectors in different spaces, and cosine
@@ -1360,6 +1783,14 @@ provider switch. That is every one of:
   the dimension guard cannot see
 - `EMBEDDING_DIMENSIONS`
 - `CHUNK_SIZE` and `CHUNK_OVERLAP`
+
+Two things are deliberately **not** on that list. `EMBEDDING_QUERY_INSTRUCTION`
+touches only queries, so no stored vector depends on it. And the chunking
+format itself (heading-aware sections, the context prefix, and the
+200-character minimum chunk length, which is a constant tied to the chunking
+version rather than a setting) is versioned per note: when it changes, the
+indexer re-embeds notes in the background over several passes, without a
+refused startup or a reset.
 
 The server stores a fingerprint of that configuration and compares it at
 startup. On a mismatch it logs both fingerprints and the fields that
@@ -1414,8 +1845,8 @@ record — while the server is running (pauses the indexer, runs the SQL,
 resumes).
 
 > **The fingerprint records the configuration, not the model artifact.**
-> `bge-m3` is a mutable Ollama tag, so `ollama pull` can replace the
-> weights behind it, and `OLLAMA_URL` / `OPENAI_BASE_URL` are
+> `bge-m3` is a mutable Ollama tag (so is `qwen3-embedding:0.6b`), so
+> `ollama pull` can replace the weights behind it, and `OLLAMA_URL` / `OPENAI_BASE_URL` are
 > deliberately excluded from the fingerprint — repointing at another host
 > or proxy is usually an infrastructure move that serves the identical
 > artifact, and including it would demand a full re-embed for one.
@@ -1435,9 +1866,12 @@ controlled by `FTS_CONFIGS`. It defaults to `english`, which reproduces
 the historical behavior exactly, so existing deployments need no action.
 
 The vector holds the note's **title and frontmatter `aliases` at weight
-`A`** and its body at weight `D`, per configured config, and ranking
+`A`**, its **tags at weight `B`** (frontmatter `tags` and inline `#tags`;
+a nested tag also as each `/`-segment, so `#ctx/phone` is found by
+`phone`) and its body at weight `D`, per configured config, and ranking
 uses `RANK_WEIGHTS` — so a query that is a note's title ranks that note
-first, where it used to lose to a long note repeating the words. Bare
+first, where it used to lose to a long note repeating the words, and a
+note tagged with a word ranks above one that only mentions it. Bare
 terms are ANDed; when the full matches do not fill the page, the same
 terms OR-ed fill the rest, tagged `match: any`. Each row carries a
 `snippet:` built from a stored excerpt of the indexed text

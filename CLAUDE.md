@@ -107,7 +107,7 @@ specific to this MCP server.
 | Schema gate (any change carrying a migration) | `make test-schema` |
 | Integration suite (real Postgres) | `make test-integration` |
 | Search-quality fixture | `make search-eval` |
-| Search eval (any search-path change) | `make search-eval-snapshot` then `make search-eval SEARCH_EVAL_DATA=.search-eval SEARCH_EVAL_DATABASE_URL=<restored BACKUP_FULL=1 copy>` — attach `report.json` only if `attachable: true` (`USER_ID=` export on multi-user), incumbent as `BASELINE`; `CORPUS_LOSS` invalidates |
+| Search eval (any search-path change) | `make search-eval-snapshot` then `make search-eval SEARCH_EVAL_DATA=.search-eval SEARCH_EVAL_DATABASE_URL=<restored BACKUP_FULL=1 copy>` — attach `report.json` only if `attachable: true` (`USER_ID=` export on multi-user), incumbent as `BASELINE`; `CORPUS_LOSS` invalidates; a change with a mechanical bar adds `python -m scripts.search_eval gate` (PASS/FAIL per metric × slice; exit 64 with no output on a non-attachable or multi-user report) and its table goes in the PR body |
 | Deploy | merge to `main` → CI → `image` workflow → Flux (homelab k3s); `make deploy` for a compose host |
 
 **`tests/integration/` skips itself without a database.** Those modules are
@@ -248,6 +248,40 @@ update it in the same change.** What stays here is the short list:
   content-identical to an ordinary failed login — not a 429, not a lockout;
   the window expires on its own. The new timing signal (attempt 11 skips
   bcrypt) is an accepted limitation.
+- **Native OIDC is federated panel login onto existing accounts, linked by an
+  admin and pinned to `(iss, sub)`** (#414, #415, #416, migration 037). Off by
+  default; off, every page and `/authorize` is byte-identical
+  (`tests/golden/oidc_off/`) and the link routes 404. The server stays the MCP
+  OAuth server — OIDC only mints the panel session (via the one guarded
+  `start_session`), which also covers consent. `oidc.exchange()` returns
+  `VerifiedIdentity` claims, never a user id, and **never refuses on email**
+  (non-string/> 254 → `None`; `email_verified` only the JSON `true`).
+  `oidc_links.resolve`: a row bound to `(iss, sub)` wins and email is not
+  read; only otherwise an exact normalized (ASCII-only lower-casing, no
+  IDN folding) verified email matching a pending expectation under the same
+  issuer, < 7 days old (`PENDING_DAYS`, a constant), binds — once.
+  `prepare_login` (account guard, `FOR UPDATE` + `populate_existing`, every
+  check re-run, no commit) then `start_session(expected_session_version=…)`
+  commit bind + `last_login_at` + session together; a refused mint leaves no
+  binding. No provisioning, no group→admin mapping, no SSO bootstrap
+  (`/admin/register` 404 under OIDC), no provider tokens kept, one issuer;
+  every refusal is one page (reason only in `panel_oidc_refused`, never a
+  user id). Admin actions `POST /admin/users/{id}/oidc/{expect,bind,unlink}`:
+  `_lock_admin_guard`, **immediately** `_actor_still_privileged`, then the
+  target; a bound row is never re-pointed (unlink first); unlink revokes the
+  user's sessions. **D15:** while `LOCAL_LOGIN_ENABLED=false`, unlink,
+  demote, deactivate, soft and permanent delete refuse a result with zero
+  active admins bound under the configured issuer (inside the guard, after
+  the actor re-check; `tests/test_oidc_mutation_sites.py` pins the writer
+  allow-list), self-unlink is refused, and the lifespan logs one CRITICAL
+  (never a refusal) when none exists. Provider profile: same-host HTTPS
+  endpoints, RS256/PS256/ES256 ∩ discovery, `client_secret_basic|post`,
+  optional group, RFC 9207 `iss` required when advertised, zero clock leeway,
+  per-login discovery/JWKS (no cache). `OIDC_SUBJECT_USER_IDS` is **retired**
+  and refuses startup; its message names the docs heading "Upgrading from
+  OIDC_SUBJECT_USER_IDS" — change both together. See
+  [native OIDC](docs/native-oidc.md) and
+  [control panel](docs/architecture/control-panel.md).
 - **Unused dynamically registered OAuth clients expire** (#194).
   `oauth_clients.last_used_at` is stamped by consent approval, code exchange
   and refresh; migration 025 stamped every pre-existing row, so **NULL means
@@ -272,6 +306,44 @@ update it in the same change.** What stays here is the short list:
   to an unknown code — and so does **every failed revalidation of a spent
   code** (reason only in the log). A live code keeps its specific refusals
   and the pre-#325 check order (expiry first). See [oauth and grants](docs/architecture/oauth-and-grants.md).
+- **OAuth Client ID Metadata Documents, DCR as the fallback** (#357, #420,
+  migrations 036/038). An `https://` `client_id` at `/authorize` is fetched through
+  `transfer.fetch_url_guarded` (no redirects, 10 s, 64 KiB, the SSRF deny list,
+  pinned). Admission: cache, then **join an in-progress fetch before any
+  charge**, a 30 s failure cooldown, the failed-auth salted 4,096-slot table
+  (`OAUTH_CIMD_FETCHES_PER_ADDRESS_PER_MINUTE`, 10), 1 in flight per slot and
+  8 per process. The URL must be canonical with **no `?`/`#`**, and the
+  document's `client_id` byte-equal to it. One synthetic `oauth_clients` row
+  per (URL, user), `cimd_` + HMAC under a `SECRET_KEY`-derived key, written
+  only by an approve. The consent POST is pinned to the **authorization hash**
+  (client_id, sorted redirect URIs, scope; never `client_name`). **The
+  `cimd_` id is never caller input, and where it is refused differs by
+  endpoint.** At `/authorize` it is refused before any lookup. At `/token`
+  the credential and the unchanged #182/#325/#326 processing run first,
+  then it is refused. At `/revoke` it is a concealed 200 (`{}`). `/token` and
+  `/revoke` never fetch **the document**. **`private_key_jwt` is CIMD-only**
+  (#420; `/register` still refuses it): the declared method is honoured, never
+  downgraded; the document needs a same-origin `jwks_uri`, no inline `jwks`,
+  an optional RS256/PS256/ES256 pin; `/authorize` fetches the JWKS with its
+  own cache and a **second** per-address charge; the approve stores a
+  normalised snapshot with its **origin** fetch time (038's four columns and
+  three CHECKs), and a `private_key_jwt` row never becomes `none` — refused
+  under `FOR UPDATE` *and* by the conflict update's `WHERE` (two first
+  approvals race; L10 owner-accepted) — nor moves its snapshot backwards.
+  `src/oauth/client_assertion.py` verifies the assertion at the one
+  `_client_authenticated` position (one key, one alg; `jku`/`jwk`/`x5*`/`crit`
+  refused; `aud` = issuer or `/token`, single-valued; zero `exp` leeway, 300 s
+  life; `jti` single-use per client URL, a full cache refuses). A failed
+  assertion never revokes; #182 reuse is unchanged (L7 owner-accepted). The
+  JWKS refetch (kid miss, or snapshot > 24 h; 60 s cooldown per URI; a failed
+  stale refetch falls back to the stored snapshot) runs only in a pre-phase,
+  for an eligible credential, **before the main session, with no lock across
+  the hop**, decides no response, and runs while CIMD is disabled. Consent shows the document's host and URL, never its
+  `client_name`. Loopback redirects match on any port for CIMD only. `iss` is
+  on every authorization redirect. RFC 8707 `resource` is **classified, never
+  refused** (`resource_class` on every record; `invalid_target` waits for a
+  14-day gate). CIMD rows with no code or token are swept after the #194
+  age, whoever owns them. See [oauth and grants](docs/architecture/oauth-and-grants.md).
 - **Machine-facing paths refuse plaintext HTTP** (#196): a priority-200
   Traefik router on the `http` entrypoint, in `docker-compose.yml`'s labels,
   answers 403 via `ipAllowList` on `192.0.2.0/32` for `/mcp`, `/transfer`,
@@ -285,8 +357,9 @@ update it in the same change.** What stays here is the short list:
   closed. No inline `style=` anywhere (#289): `style-src-attr 'none'`, dynamic
   presentation through `el.style.*` or classes, SVG colours via classes, no
   `!important`; `_utilities.html` is generated. The consent page's
-  `form-action` is `'self' https:` by owner decision (multi-hop OAuth
-  callbacks). Scope is a marker set by the context
+  `form-action` is `'self' https: http://localhost:* http://127.0.0.1:*` by
+  owner decision (multi-hop OAuth callbacks; the two loopback sources since
+  #357 for native RFC 8252 callbacks). Scope is a marker set by the context
   processor on the four panel/auth/consent template instances — not a path, so
   transfer pages and `/docs` are untouched. `PANEL_CSP=report-only|off` is the
   rollback (recreate, no rebuild). htmx is deliberately absent: its `hx-*`
@@ -304,7 +377,9 @@ update it in the same change.** What stays here is the short list:
   connecting, and the lifespan exits on an unencrypted session. The active
   embedding URL must be `https` or loopback unless `EMBEDDING_ALLOW_PLAINTEXT`,
   and every embedding HTTP client comes from `embedding_http_client`
-  (`trust_env=False`, no redirects). See
+  (`trust_env=False`, no redirects). The optional reranker (#367) is a third
+  hop under the same policy: `RERANK_URL` judged by the same parser with its
+  own `RERANK_ALLOW_PLAINTEXT`, every client from `rerank_http_client`. See
   [schema and migrations](docs/architecture/schema-and-migrations.md) and
   [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
 - **The app is never the PostgreSQL superuser** (#324). The lifespan reads
@@ -366,9 +441,11 @@ update it in the same change.** What stays here is the short list:
   the stamp records only when an in-transaction re-read finds every surviving
   row current, after re-resolving every link target. A skip (including an
   unlisted directory) withholds only over a row that is not current.
-- **The keyword vector is `A(title) || A(aliases) || D(body)`** (#344,
-  migration 031), built by the one builder in `src/services/fts.py` for every
-  writer, ranked with `ts_rank_cd(RANK_WEIGHTS, …)` (`{0.02,0.2,0.4,1.0}`, a
+- **The keyword vector is `A(title) || A(aliases) || B(tags) || D(body)`**
+  (#344, #391, migrations 031/035), built by the one builder in
+  `src/services/fts.py` for every writer — a required `tags_bind` that every
+  `src/` writer passes (`fts.tags_text`: each tag plus its `/`-segments,
+  2,048 chars on whole tags) and only 031 passes `None` (AST-pinned) — ranked with `ts_rank_cd(RANK_WEIGHTS, …)` (`{0.02,0.2,0.4,1.0}`, a
   bound `float4[]`) so one title cover outweighs fifty body covers.
   `keyword_search` runs the conjunction first (`match: all`) and, when it
   under-fills the page, a disjunction **derived per config from PostgreSQL's
@@ -384,16 +461,75 @@ update it in the same change.** What stays here is the short list:
   `make rebuild-tsvectors`. 031 re-heads in SQL under the generation lock
   with the **stored fingerprint's** configs and skips rows already headed
   (`rehead` is not position-idempotent); its downgrade strips every `A`
-  lexeme. **Both move paths re-head under the generation lock with the
+  lexeme. 035 does the same for tags after a read-only size preflight
+  (abort above 1,048,511 bytes, naming ids), all-or-nothing, skipping rows
+  already carrying a `B` lexeme or whose tags yield none; downgrade keeps
+  `{a,d}`. `matched_in` is six `ts_filter` flags → eleven values (`title`,
+  `tags`, `body`, comma-joined, or the first `+` split). **Both move paths re-head under the generation lock with the
   fingerprint re-read** — the title is inside the vector — and `make deploy`
   stops the app before a pending migration. See
   [search](docs/architecture/search.md).
+- **`semantic_search` / `hybrid_search` pages carry `confidence: ok | low`**
+  (#389). One pure rule (`src/services/search_confidence.py`): `low` ⇔
+  `SEARCH_LOW_CONFIDENCE_SIMILARITY > 0` ∧ `keyword_all == 0` (`match: any`
+  is not evidence; semantic passes 0) ∧ the best similarity of the call's
+  candidate set (semantic: first overfetched row; hybrid: max over its
+  50-chunk arm, `HybridResult.top_similarity`; both before rerank and the
+  cap) is none or strictly below it. **Ships at 0 = off** — set a value only
+  after both tools' `confidence` tabulation lines PASS (DEPLOYMENT.md). The
+  token is base budget like `arm_depth` (a displaced boundary row is
+  disclosed by the cap footer, L14); the hint line is kept only when it
+  leaves every row byte-identical. A refusal carries neither; usage rows
+  always record `confidence`, `top_similarity`, `keyword_all`. Bounds:
+  hybrid header 405 / 444 (`rerank=true`), semantic rerank header 199, floor
+  995 (row structure 345 / 367 with #391's `title+tags+body`), last rung
+  `explain omitted`. See [search](docs/architecture/search.md).
 - **The vector index is a `halfvec` expression index** (#283, migration 027),
   defined once in `src/services/vector_index.py` and excluded from `alembic
   check` by `include_object`; queries cast to match it and re-rank by
   full-precision distance. Recall measured 1.00 → 1.00; ~146 MB → 45 MB.
   Embedding reuses a stored vector only on exact chunk text and a matching
   model fingerprint, re-verified under the generation lock (#281).
+- **Chunks are heading-aware, and the chunking format is per note, not in
+  the fingerprint** (#355, #367, migration 034). `chunk_note_bounded` splits
+  at ATX headings with `vault._scan_headings` itself (each heading's own text;
+  heading lines excluded; a headings-only note falls back to whole-body
+  chunking), so a chunk's
+  `section_ordinal` is the `#N` `read_note(section=…)` resolves. The provider
+  input is `embed_prefix + "\n\n" + chunk_text` (`Title > H > H`, tags line
+  if ≤ 300 chars); `chunk_text` stays un-prefixed. `certify_embedded` stamps that version and
+  `embedded_input_digest`; the upsert clears certification on a changed
+  title/tags and the full-hash pass re-checks the digest. A version change
+  re-selects notes through the backlog (budgeted in **every** mode, after
+  real edits) under `IS DISTINCT FROM CHUNKING_VERSION`, never `<`/`>`;
+  vector responses carry `index_transition: N …` while the caller's scope
+  has notes **holding vectors** of another generation (the query is echoed
+  as one escaped line), and `/health` only `indexer.rechunk:
+  in_progress|complete`, never a number. Rows print `§ "<path>" (#N)` /
+  `§ (top of note)`, withheld on stale and pre-034 rows; previews are one
+  line from the uncut chunk. Every embedding call passes `kind=query|
+  document`; `EMBEDDING_QUERY_INSTRUCTION` is queries-only and outside the
+  stored fingerprint (in the logged retrieval fingerprint). A heading-scan
+  change bumps `CHUNKING_VERSION`. See [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
+- **No chunk is shorter than the minimum; `CHUNKING_VERSION` is 2** (#390,
+  no migration). `CHUNK_MIN_CHARS = 200` and the 200-char boundary lookback
+  are **constants** in `embeddings.py` (never settings or fingerprint fields;
+  changing one is a version bump); the effective minimum is
+  `min(200, W // 2)`, `W = CHUNK_SIZE × 4`. Every length is `clen` (ASCII
+  whitespace runs collapsed, stripped; `CLEN_SQL` is its tested SQL twin);
+  stored `chunk_text` is the raw, unstripped window. Short sections group
+  forward (a short tail backward; a sole short group stands alone only in a
+  whole-short note, else the whole body is one group at 0); a group is its
+  contiguous cleaned span, inner heading lines included, then windowed at a
+  line/word start within the lookback, cuts admissible only at `clen ≥ m`,
+  the last two windows re-balanced, overlap starts never past the cut. The
+  locator is the **deepest** `#N` whose `read_note` body contains the chunk.
+  The provider input collapses whitespace runs > 8 (`EMBEDDED_TEXT_FORMATTERS`,
+  frozen per version, never edited; a prefix/separator change clears it);
+  reuse needs the stamp to be a key, equal prefixes and
+  `fmt[stamp](stored) == fmt[current](new)`. The embed completion line reads
+  `(S submitted, R reused)`; the harness's `chunk_lengths.under_min` must be
+  0. See [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
 - **A pass does not prune what it could not see** (#309). Rows at or beneath
   a directory the walk could not list (or type) are neither pruned nor
   move-paired, and the run is recorded `walk incomplete` (failed); under a
@@ -417,6 +553,15 @@ update it in the same change.** What stays here is the short list:
   wire (the raw docstring is what ships); the four long ones lead with their
   contract and the reasoning moved to the vault-tools note. See
   [vault tools](docs/architecture/vault-tools.md), "Tool metadata".
+  **`tools/list` is scoped by the presented credential** (#358): an OAuth
+  grant without `readwrite` lists 19 — the full list minus
+  `tool_permissions.WRITE_REQUIRED_TOOLS`, the one literal that also drives
+  `_tracked`'s body-boundary write gate (after quota, so spend is unchanged);
+  API keys of either permission, `readwrite` grants, sandbox and in-process
+  callers list 28, byte-identical to `tests/fixtures/tools_list_full_v1.json`
+  (the 1.0 freeze fixture — regenerate only deliberately). The seam is the
+  public `list_tools()` override (survives SDK 2.x); no setting, no
+  `list_changed`, instructions unfiltered.
 - **`hybrid_search` is a third search peer, not a primary** (#354). All three
   search descriptions carry one routing sentence (identifiers →
   `keyword_search`, paraphrase → `semantic_search`, unsure →
@@ -486,6 +631,30 @@ update it in the same change.** What stays here is the short list:
   `since`/`until`/`order_by`/`cursor` with keyset paging, and a call using
   none of them is byte-identical. See
   [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
+- **The reranker is opt-in, all or nothing, and can never fail a search**
+  (#367). `rerank: bool = false` is always in `semantic_search`'s and
+  `hybrid_search`'s schemas; `rerank=false` is byte-identical to the render
+  before it. With `RERANK_URL` empty, `rerank=true` answers
+  `reranked: false (not_configured)` — never a refusal. Otherwise the call's
+  already-fetched candidates (≤ 50 notes, `semantic_candidates` / the first
+  50 fused rows; no second retrieval) go to one Jina-compatible `/v1/rerank`
+  exchange under one `RERANK_TIMEOUT_MS` deadline, and the page is either
+  fully reranked (`reranked: true (candidates: N)`, `rerank_score` after the
+  `"} — ` separator) or the capped unreranked baseline with one closed reason
+  code. `rerank=true` always renders hybrid's quoted-object encoding. A
+  failed startup probe (both document orders) disables reranking with one
+  CRITICAL and **never exits**; a background re-probe re-enables it.
+  `/health` gains `rerank: enabled|disabled|absent` without touching
+  `status` or the 200. The session closes before the hop (no connection held),
+  the call stays in the `embedding` class (no version bump), the trust anchor
+  is `EMBEDDING_CA_FILE`'s with a separate plaintext flag, and the CLAUDE.md
+  eval-gate row applies to any rerank change. Since #402 the documents are
+  the stored embedding input (`embed_prefix` + the stamped formatter; title
+  only for an unknown stamp), every candidate's cosine-best chunk first and
+  then further fetched chunks in distance order (≤ 4 per note, ≤
+  `RERANK_MAX_DOCUMENTS`, default 100), scored per note by the max, and a
+  chunk winner's preview and `§` are that chunk's. See
+  [search](docs/architecture/search.md), "Reranking (#367)".
 - `MCP_SANDBOX_MODE=true` is a registry-eval-only switch: lifespan skips `_check_embedding_dim` and the indexer, and `APIKeyMiddleware` bypasses auth on `/mcp/*`. Lets Glama's sandbox build the image and validate MCP introspection without external deps. Never enable in production — tools register but cannot run.
 
 ## MCP tools
@@ -499,9 +668,18 @@ Every registration carries `title=` and `annotations=` (one of four shared
 registration without them, on a description over 4,000 characters, and on a
 destructive set that drifts from the write bucket.
 
+A read-only OAuth grant **sees 19 of the 28** (#358): `tools/list` omits the
+nine names in `src/mcp_server/tool_permissions.py`'s `WRITE_REQUIRED_TOOLS`
+(the write bucket plus `request_upload`). That same literal drives the write
+gate `_tracked` runs at the body boundary, so the list and enforcement cannot
+drift; a hidden tool called by name is refused `permission_denied` as before.
+API keys and `readwrite` grants see all 28. See
+[vault tools](docs/architecture/vault-tools.md), "Who sees which tools (#358)".
+
 **Search and read** — `keyword_search`, `semantic_search`, `hybrid_search`
 (RRF of the two, for a query that is neither clearly an identifier nor a
-paraphrase), `read_note`, `list_notes`, `get_tags`, `get_recent`, `get_vault_guide`, `get_changes`
+paraphrase; it and `semantic_search` take the optional `rerank` argument,
+#367), `read_note`, `list_notes`, `get_tags`, `get_recent`, `get_vault_guide`, `get_changes`
 (the change feed, after an `ev:<seq>` cursor or a UTC date; `by` =
 `any | me | agents | human`), and `list_tasks` (see **Tasks** below).
 
@@ -555,6 +733,8 @@ summaries.
 | [rate-limits.md](docs/architecture/rate-limits.md) | `src/services/rate_limits.py`, `src/services/concurrency.py`, `src/services/pool_budget.py`, `src/services/concurrency_counters.py`, `src/services/concurrency_readiness.py`, `src/services/refusals.py`, the pool subclass in `src/database.py`, the failed-auth budget in `APIKeyMiddleware`, the gate order in `_tracked`, the worker count, the key-creation budget and active-key cap (`src/services/api_keys.py`), and every `MCP_RATE_LIMIT_*` / `MCP_AUTH_FAILURE_*` / `MCP_CONCURRENCY_*` / `KEY_CREATION_*` / `KEY_MAX_ACTIVE_PER_ACCOUNT` / `DEFAULT_DAILY_REQUEST_LIMIT` setting |
 | [usage-attribution.md](docs/architecture/usage-attribution.md) | `usage_logs`, `_log_usage`, actor columns |
 | [control-panel.md](docs/architecture/control-panel.md) | panel templates, flash messages, admin guards, the Danger zone |
+| [native-oidc.md](docs/native-oidc.md) | `src/auth/oidc.py`, `src/services/oidc_links.py`, the OIDC callback and the `/admin/users/{id}/oidc/*` routes, `_warn_oidc_lockout`, any `OIDC_*` / `LOCAL_LOGIN_ENABLED` setting, migration 037's link columns (operator guide; the invariants are in control-panel.md) |
 
 Formal requirements live in `openspec/specs/`; the change history and its
 reasoning in `openspec/changes/archive/`.
+

@@ -202,6 +202,13 @@ both loaded with `envFrom`. Anything unset takes the default below. Invalid
 values refuse startup with a message naming the setting. The server does not
 silently fall back.
 
+The `migrate` initContainer and the example Jobs load the same two objects and
+validate the same settings. Keep it that way. A credential added to the app
+container alone, for example `OIDC_CLIENT_SECRET` through `env`/`secretKeyRef`
+when you turn on [native OIDC](native-oidc.md), passes the app's checks but
+makes the initContainer refuse to start. Under `Recreate` that is an outage,
+not a stalled rollout.
+
 List-valued settings: `TRUSTED_PROXY_IPS`, `FTS_CONFIGS` and
 `OAUTH_KNOWN_REDIRECT_HOSTS` accept CSV or a JSON list. `ALLOWED_ORIGINS`,
 `ALLOWED_HOSTS` and `EMBEDDING_EXCLUDE_PATTERNS` accept **JSON lists only**
@@ -252,6 +259,10 @@ List-valued settings: `TRUSTED_PROXY_IPS`, `FTS_CONFIGS` and
 | `OLLAMA_EMBED_BATCH_SIZE` | `16` | Chunks per `/api/embed` request (1 to 256). |
 | `EMBEDDING_ALLOW_PLAINTEXT` | `false` | Acknowledge a plaintext `http://` embedding URL to a non-loopback host. |
 | `EMBEDDING_CA_FILE` | unset | PEM CA for an `https` embedding endpoint behind a private CA. Replaces the default bundle. |
+| `RERANK_URL` | unset | Optional Jina-compatible `/v1/rerank` endpoint (e.g. `llama-server --reranking`) for `rerank=true`. Receives query and note text. Same `https`/loopback rule; an unreachable reranker never blocks startup. See DEPLOYMENT.md, "Reranker (optional)". |
+| `RERANK_MODEL` | unset | Sent as `model` in the rerank request. |
+| `RERANK_TIMEOUT_MS` | `1500` | One deadline per rerank call (100 to 10000); past it the page falls back unreranked. |
+| `RERANK_ALLOW_PLAINTEXT` | `false` | Acknowledge a plaintext `http://` reranker URL to a non-loopback host (separate from the embedding flag). |
 | `EMBEDDING_EXCLUDE_PATTERNS` | `["*.excalidraw.md","Excalidraw/*"]` | fnmatch globs that are keyword-indexed but not embedded (JSON list). |
 | `CHUNK_SIZE` / `CHUNK_OVERLAP` | `512` / `0` | Chunking (tokens). Overlap must be below size. A change needs a reset. |
 
@@ -674,6 +685,15 @@ The procedure:
    `kubectl -n obsidian-mcp exec deploy/obsidian-mcp -- alembic check` should print
    "No new upgrade operations detected."
 
+**Upgrading to the reranker release (#367)** there is no migration and no
+operator step: `semantic_search` and `hybrid_search` gain an optional
+`rerank` argument whose `false` default leaves their output unchanged, and
+four optional settings (`RERANK_*`, unset by default) enable it. The class
+mapping is unchanged, so readiness evidence carries over. `/health` gains a
+`rerank` field (`absent` until `RERANK_URL` is set; never a non-200).
+Rolling the image back is a plain redeploy; a client still sending `rerank`
+is then refused by the unknown-argument rule.
+
 **Upgrading to `hybrid_search` (#354)** there is no migration and no
 operator step: a new tool, one optional setting (`HYBRID_RRF_K`, default 60,
 1–1000, set in the ConfigMap if at all), and `CLASS_MAPPING_VERSION` 5, which
@@ -918,6 +938,7 @@ unverified archive.
 | Startup, readiness or liveness probe fails with **400** | The probe lost its `Host: localhost` header, or `ALLOWED_HOSTS` was set explicitly without `localhost` (it is always added, so check the override). |
 | Every request through the ingress gets **400** | The ingress rewrites `Host`. It must reach the app as `MCP_HOSTNAME`. |
 | Container exits at start with a `critical` log line | Each startup check names itself: `openat2` unavailable (kernel or seccomp), pgvector < 0.8.0, `EMBEDDING_DIMENSIONS` or model disagreeing with the stored vectors, a placeholder `SECRET_KEY`, a plaintext embedding URL without `EMBEDDING_ALLOW_PLAINTEXT`, a TLS key in `DATABASE_URL`. |
+| `migrate` initContainer exits 1 with `OIDC requires OIDC_CLIENT_ID and OIDC_CLIENT_SECRET` (or another settings `ValidationError`) | The initContainer does not get the same environment as the app. Add the missing variable to the Secret every container loads, or add the same `secretKeyRef` to the initContainer. To restore service at once, set `OIDC_ENABLED=false`. |
 | `migrate` initContainer fails with `permission denied to create extension "vector"` | Create the extension once as a superuser in the app database. |
 | Container exits at start: `Database role … is a PostgreSQL superuser. Refusing to start` | The role in `DATABASE_URL` is a superuser. Point it at a non-superuser role that owns the app database (the bundled Postgres and CloudNativePG both create one). `DATABASE_ALLOW_SUPERUSER=true` turns the refusal into a warning, as a stop-gap only. |
 | Container exits at start: `DATABASE_URL carries a placeholder password (changeme / CHANGE_ME)` | The Secret still carries a shipped placeholder. Generate one (`openssl rand -hex 32`), set it on the database role, and put it in `DATABASE_URL`. |

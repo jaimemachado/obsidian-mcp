@@ -39,6 +39,7 @@ from sqlalchemy.pool import NullPool
 import _harness
 from src.config import settings
 from src.models.db import APIKey, NoteEmbedding, NoteMetadata, OAuthClient, OAuthToken, UsageLog, User
+from src.services.embeddings import CHUNKING_VERSION
 from src.services.search_analytics import analysable_sql
 from src.services.usage_stats import PRE_BODY_REFUSAL_BINDS
 
@@ -520,7 +521,7 @@ def test_a_deleted_row_is_corpus_loss(loss_db, tmp_path):
 def test_deleted_embeddings_are_loss_for_the_semantic_arm_only(loss_db, tmp_path, monkeypatch):
     users = arun(seed_notes(loss_db))
 
-    async def fake_get_embedding(text_: str):
+    async def fake_get_embedding(text_: str, **_kw):
         return [0.01] * DIM
 
     monkeypatch.setattr("src.services.embeddings.get_embedding", fake_get_embedding)
@@ -539,6 +540,56 @@ def test_deleted_embeddings_are_loss_for_the_semantic_arm_only(loss_db, tmp_path
     assert res.exit_code == EXIT_INSUFFICIENT and res.report["verdict"] == "CORPUS_LOSS"
 
 
+def test_legacy_chunked_notes_is_scoped_to_the_exports_owner(loss_db, tmp_path, monkeypatch):
+    """#355 (Codex r1 B2): a `USER_ID=` (single-user) report counts its own
+    owner's legacy-chunked notes only. Another tenant's rows cannot change a
+    byte of the staged meta or the report; a `"multi"` report counts all."""
+    users = arun(seed_notes(loss_db))
+
+    async def fake_get_embedding(text_: str, **_kw):
+        return [0.01] * DIM
+
+    monkeypatch.setattr("src.services.embeddings.get_embedding", fake_get_embedding)
+    # User 1 re-embedded (current version); user 2 still legacy.
+    arun(_exec(loss_db, "UPDATE notes_metadata SET embedded_chunking_version = :v "
+                        "WHERE user_id = :u", u=users["u1"], v=CHUNKING_VERSION))
+    d = tmp_path / "d"
+    arun(write_snapshot(data=d, database_url=loss_db))
+    write_data(d, [{"user_id": users["u1"], "text": "runbook", "relevant": ["Ops/Runbook.md"]}])
+
+    def staged_meta(gen):
+        out = arun(run_generation(d, ["semantic"], generation=gen, database_url=loss_db))
+        assert out.exit_code == EXIT_OK, out.manifest
+        meta = json.loads((d / "runs" / out.manifest["files"]["semantic"]["path"]).read_text())["meta"]
+        return {k: v for k, v in meta.items() if k != "generation"}
+
+    first = staged_meta("G1")
+    assert first["legacy_chunked_notes"] == 0
+    assert json.loads(first["retrieval_fingerprint"])["chunking_version"] == CHUNKING_VERSION
+    # #390 (D8): user 1's chunk-length distribution, every chunk a whole
+    # (one-chunk) note, so nothing counts as under the minimum.
+    lengths = first["chunk_lengths"]
+    assert lengths is not None and lengths["under_min"] == 0
+    assert lengths["chunks"] == lengths["whole_short"] >= 1
+    report = score(d, ["semantic"], min_queries=1).report
+    assert report["arms"][0]["legacy_chunked_notes"] == 0
+    assert report["arms"][0]["chunk_lengths"] == lengths
+    # Another tenant's legacy rows multiply; nothing of user 1's report moves.
+    for i in range(37):
+        arun(_exec(loss_db,
+                   "WITH n AS (INSERT INTO notes_metadata (user_id, file_path, title, content_hash) "
+                   "VALUES (:u, :p, 't', 'h') RETURNING id) "
+                   f"INSERT INTO note_embeddings (note_id, chunk_index, chunk_text, embedding) "
+                   f"SELECT id, 0, 'x', CAST(:v AS vector) FROM n",
+                   u=users["u2"], p=f"Legacy/{i}.md", v=str([0.01] * DIM)))
+    assert staged_meta("G2") == first
+
+    # A multi-user (never attachable) report covers every owner.
+    (d / "mine-report.json").write_text(pretty_json(
+        {"window_seconds": 120, "provenance": {"users": "multi", "basis": "mixed"}}))
+    assert staged_meta("G3")["legacy_chunked_notes"] == 1 + 37
+
+
 def test_the_hybrid_arm_replays_the_service_and_writes_nothing(main_db, tmp_path, monkeypatch):
     """#354: `scripts.search_eval_arms.hybrid:make_arm` answers with exactly the
     fused paths `hybrid_search` returns for the same query, owner, filters and
@@ -548,7 +599,7 @@ def test_the_hybrid_arm_replays_the_service_and_writes_nothing(main_db, tmp_path
     url, users = main_db
     monkeypatch.delenv("DATABASE_URL", raising=False)
 
-    async def fake_get_embedding(text_: str):
+    async def fake_get_embedding(text_: str, **_kw):
         return [0.01] * DIM
 
     monkeypatch.setattr("src.services.embeddings.get_embedding", fake_get_embedding)
@@ -581,3 +632,66 @@ def test_the_hybrid_arm_replays_the_service_and_writes_nothing(main_db, tmp_path
     assert staged["runs"][qids[("runbook", None)]] == arun(service(None))
     assert staged["runs"][qids[("runbook", "Ops")]] == arun(service("Ops"))
     assert "Ops/Other runbook.md" not in staged["runs"][qids[("runbook", None)]]
+
+
+def test_the_semantic_rerank_arm_dials_only_the_reranker_and_writes_nothing(
+        main_db, tmp_path, monkeypatch):
+    """#367: `scripts.search_eval_arms.rerank:make_semantic_arm` replays the
+    production candidates through the fake reranker on a loopback port; no
+    write counter moves, every rerank request reaches the fake, and the answers
+    are the reranked candidates of `semantic_candidates`.
+
+    `get_embedding` is stubbed because the provider hop is the ordinary one
+    the incumbent `semantic` arm makes too (design L15), not one the rerank arm
+    adds; the hop under test is `RERANK_URL`, which is real (a loopback fake)."""
+    from src.services import embeddings, rerank
+    from tests.fixtures.fake_reranker import FakeReranker
+
+    url, users = main_db
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+
+    async def fake_get_embedding(text_: str, **_kw):
+        return [0.01] * DIM
+
+    monkeypatch.setattr("src.services.embeddings.get_embedding", fake_get_embedding)
+    server = FakeReranker().start()
+    # Reverse the vector order, so the answer differs from the incumbent's.
+    server.scorer = lambda q, docs: [float(i) for i in range(len(docs))]
+    monkeypatch.setattr(settings, "rerank_url", server.url)
+    monkeypatch.setattr(rerank, "_client", None)
+    rerank._reset_state_for_tests()
+    try:
+        d = tmp_path / "d"
+        arun(write_snapshot(data=d, database_url=url))
+        qids = write_data(d, [
+            {"user_id": users["u1"], "text": "runbook", "relevant": ["Ops/Runbook.md"]},
+        ])
+        before = _settled_writes(url)
+        spec = "scripts.search_eval_arms.rerank:make_semantic_arm"
+        out = arun(run_generation(d, ["semantic", spec], generation="R1", database_url=url,
+                                  depth=20))
+        assert out.exit_code == EXIT_OK, out.manifest
+        assert _settled_writes(url) == before, "the rerank arm wrote something"
+        staged = json.loads((d / "runs" / out.manifest["files"][spec]["path"]).read_text())
+        assert staged["meta"]["membership"] == "semantic"
+        probe = [r for r in server.requests if r["query"] == rerank.PROBE_QUERY]
+        scored = [r for r in server.requests if r["query"] == "runbook"]
+        assert len(probe) == 2 and len(scored) == 1, "probe, then one request per query"
+
+        async def expected():
+            engine = _engine(url)
+            maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+            async with maker() as s:
+                found = await embeddings.semantic_candidates(s, "runbook", limit=20,
+                                                             user_id=users["u1"])
+            await engine.dispose()
+            return [r["path"] for r in reversed(found.rows)][:20]
+
+        answer = staged["runs"][qids[("runbook", None)]]
+        assert answer == arun(expected()) and len(answer) >= 2
+        incumbent = json.loads(
+            (d / "runs" / out.manifest["files"]["semantic"]["path"]).read_text())
+        assert incumbent["runs"][qids[("runbook", None)]] == list(reversed(answer))
+    finally:
+        rerank._reset_state_for_tests()
+        server.stop()

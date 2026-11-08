@@ -80,7 +80,14 @@ VERDICT_OK = "OK"
 VERDICT_INSUFFICIENT = "INSUFFICIENT_DATA"
 VERDICT_LOSS = "CORPUS_LOSS"
 
-METRICS = ("recall@5", "recall@10", "mrr", "ndcg@10")
+METRICS = ("recall@5", "recall@10", "recall@20", "recall@50", "mrr", "ndcg@10")
+#: The recall depths, by metric name (#389): a recall@k with k above an arm's
+#: `staged_depth` is null, never computed on a shorter run.
+RECALL_K = {"recall@5": 5, "recall@10": 10, "recall@20": 20, "recall@50": 50}
+#: 3 since the gate step, built for the first real-data evaluation run
+#: (2026-10-31): `deltas_baseline`, and `source_generation` / `source_report_sha256`
+#: on a `runfile:` arm.
+SCHEMA_VERSION = 3
 SLICES = ("overall", *(f"class:{c}" for c in CLASSES), "source:mined", "source:manual")
 NOT_ATTACHABLE_LINE = "NOT ATTACHABLE (multi-user provenance)"
 
@@ -184,21 +191,37 @@ def _slice_names(q: dict) -> list[str]:
     return names
 
 
-def _per_query(relevant: set[str], pool: set[str], run: list[str]) -> dict[str, float]:
-    return {
-        "recall@5": recall_at(relevant, run, 5),
-        "recall@10": recall_at(relevant, run, 10),
+def _per_query(relevant: set[str], pool: set[str], run: list[str],
+               staged_depth: int | None = None) -> dict[str, float | None]:
+    out: dict[str, float | None] = {
+        name: (None if staged_depth is not None and k > staged_depth
+               else recall_at(relevant, run, k))
+        for name, k in RECALL_K.items()
+    }
+    out.update({
         "mrr": reciprocal_rank(relevant, run),
         "ndcg@10": ndcg_at(relevant, run, 10),
         "novel@10": novel_at(pool, run, 10),
-    }
+    })
+    return out
 
 
-def _summarise(values: list[dict[str, float]]) -> dict:
+def _summarise(values: list[dict[str, float | None]]) -> dict:
     out: dict[str, Any] = {"n_queries": len(values)}
     for m in (*METRICS, "novel@10"):
-        out[m] = mean([v[m] for v in values])
+        column = [v[m] for v in values]
+        # A metric beyond the arm's staged depth is null for every query.
+        out[m] = None if any(x is None for x in column) else mean(column)
     return out
+
+
+def _staged_depth(meta: dict, manifest: dict) -> int | None:
+    """The arm's `staged_depth` (#389): recorded by `run` since then; an
+    older run file falls back to its own `depth`, then the manifest's."""
+    for value in (meta.get("staged_depth"), meta.get("depth"), manifest.get("depth")):
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return None
 
 
 def commit_sha() -> str:
@@ -242,7 +265,11 @@ _DATA_KEYED = frozenset({"deltas", "options"})
 #: against query text would refuse real data sets (a query `2026` inside a
 #: UTC-stamp generation, a query `hybrid` inside an arm label); they are
 #: checked for exact equality only.
-_EXACT_ONLY = frozenset({"generation", "arm", "baseline"})
+#: `deltas_baseline` (an arm label) and a runfile arm's `source_generation`
+#: (a generation id) are the same kind of value (Codex review of the gate
+#: step: a query `hybrid` inside a baseline label refused the report).
+_EXACT_ONLY = frozenset({"generation", "arm", "baseline", "deltas_baseline",
+                         "source_generation"})
 
 
 def _strings(value: Any, parent: str | None = None, exact: bool = False):
@@ -263,19 +290,21 @@ class ReportLeak(RuntimeError):
     """The report would carry query text or a note path (exit 1)."""
 
 
-def assert_no_leak(serialized: str, texts: set[str], paths: set[str]) -> None:
+def assert_no_leak(serialized: str, texts: set[str], paths: set[str], *,
+                   vocabulary: frozenset[str] = frozenset()) -> None:
     """No string in the report equals, or contains, a query text or a note path.
 
     Fixed vocabulary and hex digests are skipped: they are produced by this
     code. The generation, arm labels and option keys and values must not
     equal any text or path. Every other string must not equal any text or
     path, and must not contain any path or any text of four or more
-    characters.
+    characters. `vocabulary` adds a caller's own fixed words (the
+    `confidence` tabulation's verdicts and tool names, #389).
     """
     report = json.loads(serialized)
     long_texts = {t for t in texts if len(t) >= 4}
     for s, exact_only in _strings(report):
-        if s in _VOCABULARY or _HEX.fullmatch(s):
+        if s in _VOCABULARY or s in vocabulary or _HEX.fullmatch(s):
             continue
         if s in texts or s in paths:
             raise ReportLeak("the report would contain a query text or a note path")
@@ -312,18 +341,21 @@ def render_table(report: dict) -> str:
         f"drift: {c['dropped_paths']} judged path(s) and {c['dropped_queries']} query(ies) "
         f"absent from the snapshot; {c['ownerless_queries']} ownerless"
     )
-    header = f"{'arm':<28} {'slice':<16} {'n':>4} {'R@5':>6} {'R@10':>6} {'MRR':>6} {'nDCG@10':>7} {'novel@10':>8}"
+    header = (f"{'arm':<28} {'slice':<16} {'n':>4} {'R@5':>6} {'R@10':>6} {'R@20':>6} "
+              f"{'R@50':>6} {'MRR':>6} {'nDCG@10':>7} {'novel@10':>8}")
     lines.append(header)
     for arm in report["arms"]:
         for sl in SLICES:
             m = arm["metrics"][sl]
             lines.append(
                 f"{arm['arm'][:28]:<28} {sl:<16} {m['n_queries']:>4} {_fmt(m['recall@5'])} "
-                f"{_fmt(m['recall@10'])} {_fmt(m['mrr'])} {_fmt(m['ndcg@10']):>7} "
+                f"{_fmt(m['recall@10'])} {_fmt(m['recall@20'])} {_fmt(m['recall@50'])} "
+                f"{_fmt(m['mrr'])} {_fmt(m['ndcg@10']):>7} "
                 f"{_fmt(m['novel@10']):>8}"
             )
         lines.append(
-            f"{'':<28} membership {arm['membership']}, corpus_loss {arm['corpus_loss']}, "
+            f"{'':<28} membership {arm['membership']}, staged_depth {arm['staged_depth']}, "
+            f"corpus_loss {arm['corpus_loss']}, "
             f"unsearchable_before {arm['unsearchable_before']}, missing {arm['missing_queries']}"
         )
     if report["baseline"] is not None:
@@ -401,7 +433,8 @@ def score(data_dir: Path, arms: list[str] | None = None, *, baseline: str | None
         content = staged[spec]
         meta, runs = content["meta"], content["runs"]
         tolerated = set(meta.get("missing_queries") or [])
-        values: dict[str, dict[str, float]] = {}
+        depth_of_arm = _staged_depth(meta, manifest)
+        values: dict[str, dict[str, float | None]] = {}
         for qid in selected:
             run = runs.get(qid)
             if run is None:
@@ -410,7 +443,7 @@ def score(data_dir: Path, arms: list[str] | None = None, *, baseline: str | None
                 else:
                     raise UsageError(f"the run file for arm {spec!r} has no entry for a selected query")
             q = data.queries[qid]
-            values[qid] = _per_query(drift.judged[qid], set(q["pool"]), run)
+            values[qid] = _per_query(drift.judged[qid], set(q["pool"]), run, depth_of_arm)
         per_arm[spec] = values
         loss = sum(len(v) for k, v in (meta.get("corpus_loss") or {}).items() if k in selected)
         before = sum(len(v) for k, v in (meta.get("unsearchable_before") or {}).items() if k in selected)
@@ -423,10 +456,20 @@ def score(data_dir: Path, arms: list[str] | None = None, *, baseline: str | None
             "arm": meta.get("label", spec),
             "membership": meta.get("membership"),
             "options": meta.get("options") or {},
+            "staged_depth": depth_of_arm,
             "corpus_loss": loss,
             "unsearchable_before": before,
             "missing_queries": len([q for q in tolerated if q in selected]),
             "metrics": metrics,
+            # #355 / #390 (D8): semantic arms only; fixture arms gain no key.
+            **{k: meta.get(k)
+               for k in ("retrieval_fingerprint", "legacy_chunked_notes", "chunk_lengths")
+               if k in meta},
+            # The gate step: a `runfile:` arm carries its source generation and that
+            # generation's report digest, which `gate` binds to.
+            **({"source_generation": meta.get("source_generation"),
+                "source_report_sha256": meta.get("source_report_sha256")}
+               if meta.get("source") == "runfile" else {}),
         })
 
     label_of = {spec: rep["arm"] for spec, rep in zip(arms, arm_reports)}
@@ -441,7 +484,13 @@ def score(data_dir: Path, arms: list[str] | None = None, *, baseline: str | None
                 qids = [qid for qid in selected if sl in _slice_names(data.queries[qid])]
                 by_metric = {}
                 for metric in METRICS:
-                    ds = [per_arm[spec][qid][metric] - base[qid][metric] for qid in qids]
+                    pairs = [(per_arm[spec][qid][metric], base[qid][metric]) for qid in qids]
+                    if any(a is None or b is None for a, b in pairs):
+                        # Beyond either arm's staged depth: no delta, no CI.
+                        by_metric[metric] = {"n": len(pairs), "mean": None, "ci95": None,
+                                             "deltas": None}
+                        continue
+                    ds = [a - b for a, b in pairs]
                     ci = bootstrap_ci(ds, seed=seed)
                     by_metric[metric] = {
                         "n": len(ds),
@@ -468,7 +517,7 @@ def score(data_dir: Path, arms: list[str] | None = None, *, baseline: str | None
     mr = data.mine_report
     provenance = mr.get("provenance") or {"users": "multi", "basis": "empty"}
     report = {
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
         "verdict": verdict,
         "generation": gen,
         "commit_sha": commit_sha(),
@@ -502,6 +551,9 @@ def score(data_dir: Path, arms: list[str] | None = None, *, baseline: str | None
         )},
         "arms": arm_reports,
         "baseline": label_of[baseline] if baseline is not None else None,
+        # The gate step: the arm every entry of `deltas` was computed against; `gate`
+        # requires it to equal `baseline` and to occur once in `arms`.
+        "deltas_baseline": label_of[baseline] if baseline is not None else None,
         "deltas": deltas,
     }
 

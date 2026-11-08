@@ -1,7 +1,7 @@
 # search-quality Specification
 
 ## Purpose
-TBD - created by archiving change search-recall-and-latency. Update Purpose after archive.
+What the vector and keyword search paths must return and how they render it: filtered HNSW recall held against an exact baseline, the correctness `SET LOCAL`s, staleness and truncation annotations that never filter, explicit projections, keyword ranking and snippets, and (#355) the section locator that names the `read_note(section="#N")` a fresh vector row matched, one-line previews from the uncut chunk, and the `index_transition:` line that `semantic_search`, `find_related` and `hybrid_search` all carry while the caller's notes hold vectors of another chunking generation.
 ## Requirements
 ### Requirement: Filtered vector search recall against an exact baseline
 
@@ -113,7 +113,7 @@ After each periodic indexer pass, while still holding the indexer pass lock, the
 
 ### Requirement: Search calls record per-phase timing
 
-`semantic_search` SHALL record `embed_ms` (time to obtain the query embedding) and `db_ms` (time in the vector query, including `SET LOCAL`s and fetch); `find_related` SHALL record `db_ms` only (it performs no embedding-provider call; its source-chunk fetch is included in `db_ms`). Values SHALL be non-negative integers stored in `usage_logs.params` alongside the existing whole-call `duration_ms`. Timing SHALL be scoped to the tool call: the `_tracked` decorator SHALL initialise the timing holder at call start and clear it in `finally`, so a value can never be attributed to a different call, and early returns or exceptions SHALL leave partial phases at their measured value or absent, never stale. The service functions' return types SHALL be unchanged; timing travels on a call-scoped holder, not in the return value.
+`semantic_search` SHALL record `embed_ms` (time to obtain the query embedding) and `db_ms` (time in the vector query, including `SET LOCAL`s and fetch); `find_related` SHALL record `db_ms` only (it performs no embedding-provider call; its source-chunk fetch is included in `db_ms`). Values SHALL be non-negative integers stored in `usage_logs.params` alongside the existing whole-call `duration_ms`. Timing SHALL be scoped to the tool call: the `_tracked` decorator SHALL initialise the timing holder at call start and clear it in `finally`, so a value can never be attributed to a different call, and early returns or exceptions SHALL leave partial phases at their measured value or absent, never stale. The service functions' return types SHALL be unchanged; timing travels on a call-scoped holder, not in the return value. A `semantic_search` call with `rerank=true` SHALL also record `reranked` (boolean), `rerank_reason` (only when `reranked` is false), `rerank_ms` (a non-negative integer, only when a rerank request was sent), `rerank_candidates` and `rerank_documents` (both only when candidates were computed), and its `result_count` and `result_paths` SHALL be recorded once, after reranking, from the rows rendered in their final order; for such a call `embed_ms + db_ms + rerank_ms` SHALL NOT exceed `duration_ms`. A call with `rerank=false` or the argument omitted SHALL record none of the five rerank keys.
 
 #### Scenario: Timing fields present
 
@@ -129,6 +129,16 @@ After each periodic indexer pass, while still holding the indexer pass lock, the
 
 - **WHEN** a `find_related` call completes (including the "not embedded yet" early return)
 - **THEN** its usage row SHALL contain `db_ms` and SHALL NOT contain `embed_ms`
+
+#### Scenario: Rerank timing fields
+
+- **WHEN** a `semantic_search(rerank=true)` call is reranked
+- **THEN** its usage row's `params` SHALL contain integer `embed_ms`, `db_ms` and `rerank_ms` with `embed_ms + db_ms + rerank_ms ≤ duration_ms`, `reranked: true`, an integer `rerank_documents` at most `RERANK_MAX_DOCUMENTS`, and `result_paths` in reranked order
+
+#### Scenario: Unreranked calls carry no rerank timing
+
+- **WHEN** a `semantic_search` call omits `rerank`
+- **THEN** its usage row SHALL NOT contain `rerank_ms`, `reranked`, `rerank_reason`, `rerank_candidates` or `rerank_documents`
 
 ### Requirement: The owner predicate makes every vector query a filtered query
 
@@ -252,7 +262,7 @@ The change SHALL NOT alter any predicate, `SET LOCAL`, overfetch, or exact-fallb
 
 `list_notes` and `get_recent` SHALL order by `modified_at DESC, file_path ASC`. `find_orphans` SHALL keep its existing `modified_at DESC NULLS LAST` and add `file_path ASC` after it. Rows with exactly equal `modified_at` therefore have a deterministic order.
 
-For the vector, listing and graph paths, results SHALL be identical to the pre-change implementation (the same result set, the same order, and every non-similarity field byte-equal) with exactly three permitted exceptions, all confined to exact ties. For `keyword_search` the identity claim is narrower, because the ranking change is intended: against the pre-change implementation on the same corpus, filters and limit, (a) the set of paths tagged `match: "all"` SHALL equal the pre-change result set whenever the limit cuts neither list, (b) among rows whose `matched_in` is `body` alone the relative order SHALL equal the pre-change order up to the same tie rules, and (c) `rank` values and the position of any row whose `matched_in` includes `title` are exempt — the new ranking contract is asserted by its own requirement above, not by the oracle. The `any` block has no pre-change counterpart and is outside the oracle. The three tie exceptions:
+For the vector, listing and graph paths, results SHALL be identical to the pre-change implementation (the same result set, the same order, and every non-similarity field byte-equal) with exactly three permitted exceptions, all confined to exact ties. For `keyword_search` the identity claim is narrower, because the ranking change is intended: against the pre-change implementation on the same corpus, filters and limit, (a) the set of paths tagged `match: "all"` SHALL equal the pre-change result set whenever the limit cuts neither list, (b) among rows whose `matched_in` is `body` alone the relative order SHALL equal the pre-change order up to the same tie rules, and (c) `rank` values and the position of any row whose `matched_in` includes `title` are exempt — the new ranking contract is asserted by its own requirement above, not by the oracle. Since #391 the comparison is further restricted to rows with **no tag contribution**: a row has a tag contribution for a call when any lexeme of any configured config's `websearch_to_tsquery` parse of the query, positive or negated, is present in the row's tags part (`ts_filter(content_tsvector, '{b}')`). Membership in either block, order and rank of a row with a tag contribution are exempt from (a) and (b) — the tags contract is asserted by its own requirement above — and (a) and (b) SHALL hold over the rows with no tag contribution, so a query none of whose lexemes is any returned or pre-change row's tag keeps the whole pre-#391 guarantee. The `any` block has no pre-change counterpart and is outside the oracle. The three tie exceptions:
 - **membership at a tied cutoff**: when more rows share the boundary sort key (`modified_at`, `rank` or distance) than fit under the limit, which of them are returned MAY differ;
 - **the representative chunk among exact distance ties**: when two chunks of one note have exactly equal distance, the kept `chunk_index` and its preview MAY differ.
 - **order among exact ties**: rows whose sort key (`modified_at`, `rank` or distance) is exactly equal MAY appear in a different relative order, even when all of them fit under the limit (the previous order among such rows was unspecified; the new `file_path ASC` tie-break makes it deterministic).
@@ -270,7 +280,12 @@ No other difference is permitted.
 #### Scenario: Results match the previous implementation
 - **WHEN** the same fixed corpus and query set are run through the previous and the new implementation, covering stale, truncated, filtered, unfiltered and exact-fallback cases
 - **THEN** for the vector, listing and graph paths the result sets SHALL be equal, the order SHALL be equal, and every field other than `similarity` SHALL be byte-equal, except for the three permitted tie cases
-- **AND** for `keyword_search` the `all` paths SHALL equal the pre-change set and the body-only rows SHALL keep their pre-change relative order, with rank values and title-matched rows' positions exempt
+- **AND** for `keyword_search`, over the rows with no tag contribution, the `all` paths SHALL equal the pre-change set restricted to those rows and the body-only rows SHALL keep their pre-change relative order, with rank values, title-matched rows' positions and every row with a tag contribution exempt
+
+#### Scenario: The tag exemption is exactly the rows a query lexeme reaches through the tags
+
+- **WHEN** the oracle corpus holds a note tagged `hoa` with `hoa` nowhere else, a note tagged `budget` whose body also contains `budget forecast`, and an untagged note whose body contains `budget forecast`, and the queries `hoa`, `budget forecast`, `forecast` and `forecast -hoa` are run through the pre-change and the new implementation
+- **THEN** the tagged `hoa` note SHALL be exempt for `hoa` and for `forecast -hoa`, the `budget`-tagged note SHALL be exempt for `budget forecast` and SHALL NOT be exempt for `forecast`, and every non-exempt row SHALL satisfy (a) and (b)
 
 #### Scenario: The permitted tie differences are exercised
 - **WHEN** the corpus contains more notes with an identical `modified_at` than the requested limit, two notes with an identical `modified_at` that both fit under the limit, and one note with two chunks at exactly equal distance
@@ -320,9 +335,11 @@ If the index ships:
 
 ### Requirement: The keyword vector weights the title and aliases above the body, and ranking uses an explicit weight array
 
-`notes_metadata.content_tsvector` SHALL be built, for every configured FTS config in sorted order (the order the stored keyword fingerprint lists them, so migration 031 and every writer build the same bytes whatever order `FTS_CONFIGS` names them in), as the title parts for every config, then the aliases parts for every config, then the content parts for every config, concatenated with `||`: each title part `setweight(to_tsvector(cfg, title), 'A')`, each aliases part `setweight(to_tsvector(cfg, aliases), 'A')`, and each content part the pre-change `to_tsvector(cfg, content)` (implicit weight `D`, byte-identical fragment). `title` SHALL be the value `notes_metadata.title` holds for the row — the shared title rule (sanitised frontmatter `title`, else the filename stem, bounded to the column width) — and `aliases` SHALL be the text the shared `note_aliases` rule derives from the note's frontmatter (see `index-integrity`). One builder in `src/services/fts.py` SHALL produce the fragment for every writer, and no writer SHALL compose the expression by hand.
+`notes_metadata.content_tsvector` SHALL be built, for every configured FTS config in sorted order (the order the stored keyword fingerprint lists them, so migration 031 and every writer build the same bytes whatever order `FTS_CONFIGS` names them in), as the title parts for every config, then the aliases parts for every config, then the tags parts for every config, then the content parts for every config, concatenated with `||`: each title part `setweight(to_tsvector(cfg, title), 'A')`, each aliases part `setweight(to_tsvector(cfg, aliases), 'A')`, each tags part `setweight(to_tsvector(cfg, tags), 'B')`, and each content part the pre-change `to_tsvector(cfg, content)` (implicit weight `D`, byte-identical fragment). `title` SHALL be the value `notes_metadata.title` holds for the row — the shared title rule (sanitised frontmatter `title`, else the filename stem, bounded to the column width) — `aliases` SHALL be the text the shared `note_aliases` rule derives from the note's frontmatter, and `tags` SHALL be the text the shared `tags_text` rule derives from the note's extracted tags (see `index-integrity`). No writer SHALL emit weight `C`. One builder in `src/services/fts.py` SHALL produce the fragment for every writer, every writer under `src/` SHALL pass it the tags bind, and no writer SHALL compose the expression by hand; only migration 031 SHALL call the builder with no tags part, so that it keeps building the head it always built.
 
-`full_text_search` SHALL rank with `ts_rank_cd(RANK_WEIGHTS, content_tsvector, tsquery)` where `RANK_WEIGHTS` is the `RANK_WEIGHTS` setting — default `{0.02, 0.2, 0.4, 1.0}` (`D, C, B, A`), four finite numbers each in `[1e-6, 1]`, bound as `float4[]` and never interpolated — so that at the default one cover at weight `A` outweighs fifty covers of the same shape at weight `D`, and SHALL use the same array in every ranking statement it issues. The relative order of two rows that match only in their bodies SHALL be the same as under PostgreSQL's default array.
+`full_text_search` SHALL rank with `ts_rank_cd(RANK_WEIGHTS, content_tsvector, tsquery)` where `RANK_WEIGHTS` is the `RANK_WEIGHTS` setting — default `{0.02, 0.2, 0.4, 1.0}` (`D, C, B, A`), four finite numbers each in `[1e-6, 1]`, bound as `float4[]` and never interpolated — so that at the default one cover at weight `A` outweighs fifty covers of the same shape at weight `D`, one cover at weight `B` (a tag) ranks below one at `A` and above one at `D`, and SHALL use the same array in every ranking statement it issues. The relative order of two rows that match only in their bodies SHALL be the same as under PostgreSQL's default array.
+
+Accepted limitation: at the default array one tag cover equals twenty body covers of the same shape, so a note repeating a word more than twenty times in its body can outrank a note only tagged with it.
 
 #### Scenario: A note is found and ranked first by its own title
 
@@ -334,6 +351,27 @@ If the index ships:
 - **WHEN** a note's frontmatter declares `aliases: [Q3 retro, retrospective]` and no note body contains `retrospective`
 - **THEN** `keyword_search("retrospective")` SHALL return that note, ranked by an `A` cover
 
+#### Scenario: A word a note carries only as a tag finds it
+
+- **WHEN** a note's frontmatter declares `tags: [hoa]`, neither its title, its aliases nor its body contains `hoa`, and `keyword_search("hoa")` runs
+- **THEN** the note SHALL be returned tagged `match: "all"` with `matched_in: tags`
+
+#### Scenario: A tag hit ranks between a title hit and a body hit
+
+- **WHEN** one note is titled `HOA`, a second carries the tag `hoa` and has no `hoa` in its title, aliases or body, a third contains `hoa` three times in its body only, and `keyword_search("hoa")` runs
+- **THEN** the titled note SHALL be first, the tagged note second and the body note third
+
+#### Scenario: A query split between the tags and the body finds the tagged note
+
+- **WHEN** a note carries the tag `HOA`, its body contains `the siding complaint went in` and does not contain `hoa`, and `keyword_search("HOA siding complaint")` runs
+- **THEN** the note SHALL be returned tagged `match: "all"` with `matched_in: tags+body`
+
+#### Scenario: A nested tag is found by its full form and by each segment
+
+- **WHEN** a note's frontmatter declares `tags: [ctx/phone]` and its title, aliases and body contain no occurrence of `ctx` or `phone`
+- **THEN** `keyword_search("phone")`, `keyword_search("ctx")` and `keyword_search("ctx/phone")` SHALL each return it with `matched_in: tags`
+- **AND** when the same tag is only inline (`#ctx/phone` in the body), `phone` and `ctx` SHALL return it with `matched_in: tags` alone, while `ctx/phone` SHALL return it with `matched_in: tags,body`, because the inline tag's text is body text that PostgreSQL parses as the one token `ctx/phone`
+
 #### Scenario: Body-only order is unchanged by the weight array
 
 - **WHEN** two notes match a query only in their bodies and are ranked under `RANK_WEIGHTS` and under PostgreSQL's default array over the same vectors
@@ -341,8 +379,18 @@ If the index ships:
 
 #### Scenario: Every writer produces the same shape
 
-- **WHEN** the incremental pass, the full rebuild and migration 031's re-head (over a row whose vector carries no weight-`A` lexeme) each write a vector for the same title, aliases and body
+- **WHEN** the incremental pass, the full rebuild and migration 035's re-head (over a row whose vector carries only weight-`D` lexemes) each write a vector for the same title, aliases, tags and body, under `FTS_CONFIGS=english` and under `FTS_CONFIGS=english,simple`
 - **THEN** the three stored vectors SHALL be byte-equal
+
+#### Scenario: An untagged note's vector is unchanged by the tags part
+
+- **WHEN** a note has no tags, or only tags that produce no lexeme under any configured config
+- **THEN** the vector the builder writes SHALL be byte-equal to `A(title) || A(aliases) || D(body)` for the same title, aliases and body
+
+#### Scenario: Every builder call in the source passes the tags bind
+
+- **WHEN** the calls of the head, full and re-head builders under `src/` and `alembic/` are inspected
+- **THEN** every call under `src/` SHALL pass a tags bind, and the only call passing none SHALL be in `alembic/versions/031_*.py`, whose fragment SHALL be byte-identical to its pre-change text
 
 ### Requirement: Keyword search runs the conjunction first and fills the page from a disjunction derived from PostgreSQL's parse
 
@@ -395,7 +443,7 @@ If the index ships:
 
 ### Requirement: Each keyword result carries a snippet computed over the page only
 
-Each of the first `KEYWORD_SNIPPET_ROWS` (default 20, a setting in `0..100`) rows of a `keyword_search` page SHALL carry `snippet`: `ts_headline(cfg, body_excerpt, q, opts)` where `body_excerpt` is the stored excerpt (see `index-integrity`), `q` is the tsquery that matched the row's block, and `opts` is `MaxFragments=2, MaxWords=18, MinWords=6` with U+0002/U+0003 as `StartSel`/`StopSel` rendered as `«`/`»`; rows beyond that count SHALL carry neither `snippet` nor `head`, and the header SHALL say so. The headline SHALL be computed by a statement whose predicate is those rows' ids (`id = ANY(:ids)`), never over the candidate set, so its cost is a function of `KEYWORD_SNIPPET_ROWS`, `KEYWORD_EXCERPT_CHARS` and the config count alone — never of `limit` — and that statement's time SHALL be recorded as `snippet_ms`. The integration suite SHALL measure the worst case on the throwaway PostgreSQL 16 container — twenty distinct 20,000-character excerpts with repeated matches, `FTS_CONFIGS=english,simple`, head-fallback rows included — and SHALL assert the snippet statement completes in under 300 ms; the measurement is recorded in the change's design. The same statement SHALL project `matched_in` from `ts_filter(content_tsvector, '{a}') @@ q` (title or aliases) and `ts_filter(content_tsvector, '{d}') @@ q` (body) — rendered `title+body` when neither part alone matches (the terms are split between them) — and the term count, rendered `terms: k/n` (the service field is `matched_terms`) — for each config whose parse is a plain conjunction of at most 32 positive units, the count of that config's positive units present in the row's vector over that count, rendered as the single pair with the greatest ratio (ties: the greater denominator, then config order). A headline SHALL be shown as `snippet` only when the row's body part matched `q`; a row whose body part did not match, or whose headline contains no highlight, SHALL instead render the excerpt's leading words labelled `head:`, taken from `ts_headline(fts_configs[0], body_excerpt, q, 'MaxFragments=0, MinWords=18, MaxWords=24')` with the U+0002/U+0003 sentinels as `StartSel`/`StopSel` and removed from the result, evaluated by a second statement over only such rows; a row whose excerpt is NULL SHALL render neither, and the header SHALL carry the count of such rows always, including zero, with a footer naming the rebuild command when the count is positive. The server SHALL NOT cut or mark inside a snippet, SHALL render each `snippet:` and `head:` on exactly one line (every run of whitespace, line breaks included, rendered as one space), and the header SHALL carry the `all` and `any` counts always, including zero.
+Each of the first `KEYWORD_SNIPPET_ROWS` (default 20, a setting in `0..100`) rows of a `keyword_search` page SHALL carry `snippet`: `ts_headline(cfg, body_excerpt, q, opts)` where `body_excerpt` is the stored excerpt (see `index-integrity`), `q` is the tsquery that matched the row's block, and `opts` is `MaxFragments=2, MaxWords=18, MinWords=6` with U+0002/U+0003 as `StartSel`/`StopSel` rendered as `«`/`»`; rows beyond that count SHALL carry neither `snippet` nor `head`, and the header SHALL say so. The headline SHALL be computed by a statement whose predicate is those rows' ids (`id = ANY(:ids)`), never over the candidate set, so its cost is a function of `KEYWORD_SNIPPET_ROWS`, `KEYWORD_EXCERPT_CHARS` and the config count alone — never of `limit` — and that statement's time SHALL be recorded as `snippet_ms`. The integration suite SHALL measure the worst case on the throwaway PostgreSQL 16 container — twenty distinct 20,000-character excerpts with repeated matches, `FTS_CONFIGS=english,simple`, head-fallback rows included — and SHALL assert the snippet statement completes in under 300 ms; the measurement is recorded in the change's design. The same statement SHALL project `matched_in` from six flags `ts_filter(content_tsvector, W) @@ q` for `W` in `{a}` (title or aliases), `{b}` (tags), `{d}` (body), `{a,b}`, `{a,d}` and `{b,d}`: `matched_in` SHALL be every single part whose flag is true, in the order `title`, `tags`, `body`, rendered comma-joined; when no single part matches (the terms are split between parts), the first true pair in the order `title+tags`, `title+body`, `tags+body`; and when no pair matches, `title+tags+body` — so the rendered value is always one of `title`, `tags`, `body`, `title,tags`, `title,body`, `tags,body`, `title,tags,body`, `title+tags`, `title+body`, `tags+body`, `title+tags+body` — and the term count, rendered `terms: k/n` (the service field is `matched_terms`) — for each config whose parse is a plain conjunction of at most 32 positive units, the count of that config's positive units present in the row's vector over that count, rendered as the single pair with the greatest ratio (ties: the greater denominator, then config order). A headline SHALL be shown as `snippet` only when the row's body part matched `q`; a row whose body part did not match, or whose headline contains no highlight, SHALL instead render the excerpt's leading words labelled `head:`, taken from `ts_headline(fts_configs[0], body_excerpt, q, 'MaxFragments=0, MinWords=18, MaxWords=24')` with the U+0002/U+0003 sentinels as `StartSel`/`StopSel` and removed from the result, evaluated by a second statement over only such rows; a row whose stored excerpt is the empty string (a note with no body) SHALL render no second line at all — never a fabricated `head:` — SHALL keep its `matched_in`, and SHALL NOT be counted as a row without an excerpt, so the service SHALL distinguish a computed empty headline from a headline not computed (a row beyond `KEYWORD_SNIPPET_ROWS`) and from a NULL excerpt, and the renderer SHALL NOT decide between them by truthiness; a row whose excerpt is NULL SHALL render neither, and the header SHALL carry the count of such rows always, including zero, with a footer naming the rebuild command when the count is positive. The server SHALL NOT cut or mark inside a snippet, SHALL render each `snippet:` and `head:` on exactly one line (every run of whitespace, line breaks included, rendered as one space), and the header SHALL carry the `all` and `any` counts always, including zero.
 
 Accepted limitations: a literal `«` or `»` in a note collides with the rendered highlight markers — the stored markers are the unforgeable U+0002/U+0003, stripped from excerpts at index time, and the visible rendering is a convenience the agent verifies with `read_note`; the 300 ms gate is measured at the defaults, and the cost scales roughly linearly with `KEYWORD_EXCERPT_CHARS` and `KEYWORD_SNIPPET_ROWS`, whose maxima are about 25× the measured work.
 
@@ -408,6 +456,26 @@ Accepted limitations: a literal `«` or `»` in a note collides with the rendere
 
 - **WHEN** a note matches only through its title or aliases
 - **THEN** the row SHALL render `head:` with the excerpt's leading words, `matched_in` SHALL be `title` alone, and no highlight marker SHALL appear
+
+#### Scenario: A tags-only match shows the head
+
+- **WHEN** a note with a non-empty body matches only through its tags
+- **THEN** the row SHALL render `head:` with the excerpt's leading words, `matched_in` SHALL be `tags` alone, and no highlight marker SHALL appear
+
+#### Scenario: A tags-only match on a note with no body shows no preview
+
+- **WHEN** a note consists only of frontmatter `tags: [hoa]` and an empty body, and `keyword_search("hoa")` returns it within the snippet rows
+- **THEN** the row SHALL render `matched_in: tags` and no `snippet:` or `head:` line, and the header's count of rows without an excerpt SHALL NOT include it
+
+#### Scenario: A tags-and-body split match says so and shows the head
+
+- **WHEN** a note's tags contain one query term and its body the others, and neither its tags nor its body alone contains them all
+- **THEN** the row SHALL render `matched_in: tags+body` and `head:`
+
+#### Scenario: A match in the title and in the tags names both
+
+- **WHEN** a note's title contains every query term and one of its tags also contains every query term, and its body contains none
+- **THEN** the row SHALL render `matched_in: title,tags` and `head:`
 
 #### Scenario: A one-word body hit on a title match is not a highlight
 
@@ -436,7 +504,7 @@ Accepted limitations: a literal `«` or `»` in a note collides with the rendere
 
 #### Scenario: The worst-case snippet latency is measured and gated
 
-- **WHEN** the integration suite seeds twenty notes with distinct 20,000-character excerpts containing repeated matches, some matching only through their title, under `FTS_CONFIGS=english,simple`, and runs the snippet statement for that page on the throwaway PostgreSQL 16 container
+- **WHEN** the integration suite seeds twenty notes with distinct 20,000-character excerpts containing repeated matches, some matching only through their title and some only through their tags, under `FTS_CONFIGS=english,simple`, and runs the snippet statement for that page on the throwaway PostgreSQL 16 container
 - **THEN** the statement SHALL complete in under 300 ms, or the change SHALL lower the default `KEYWORD_EXCERPT_CHARS` until it does and record why
 
 #### Scenario: A row indexed before migration 031 is counted, not guessed
@@ -451,15 +519,130 @@ Accepted limitations: a literal `«` or `»` in a note collides with the rendere
 
 ### Requirement: The keyword_search docstring states the conjunction and the result fields, as a peer of semantic_search
 
-The `keyword_search` docstring SHALL state that bare terms are ANDed and that partial matches follow the full matches tagged `match: any`; SHALL show the `"exact phrase"`, `a OR b` and `-excluded` forms; SHALL describe `snippet`/`head`, `matched_in` and `terms`; and SHALL keep the cross-reference to `semantic_search` in the same shape `semantic_search` uses for it, ranking neither tool above the other.
+The `keyword_search` docstring SHALL state that bare terms are ANDed and that partial matches follow the full matches tagged `match: any`; SHALL show the `"exact phrase"`, `a OR b` and `-excluded` forms; SHALL state that a note's tags are indexed below its title and aliases and above its body; SHALL describe `snippet`/`head`, `matched_in` (naming its parts `title`, `tags` and `body`) and `terms`; SHALL stay within the 4,000-character description bound; and SHALL keep the cross-reference to `semantic_search` in the same shape `semantic_search` uses for it, ranking neither tool above the other.
 
 #### Scenario: The docstring names the semantics
 
 - **WHEN** the registered tool description for `keyword_search` is read
-- **THEN** it SHALL contain the AND default, the three operator forms, and the five rendered result-field names `match`, `matched_in`, `terms`, `snippet:` and `head:`
+- **THEN** it SHALL contain the AND default, the three operator forms, the five rendered result-field names `match`, `matched_in`, `terms`, `snippet:` and `head:`, and the statement that tags are indexed, and it SHALL be at most 4,000 characters
 
 #### Scenario: The two tools remain symmetric peers
 
 - **WHEN** the registered descriptions of `keyword_search` and `semantic_search` are compared
 - **THEN** each SHALL point at the other for the cases it is weaker on, and neither SHALL describe itself as the primary or preferred search
+
+### Requirement: Each fresh vector-search row SHALL name the section it matched as a quoted heading path and a server-authored ordinal
+`semantic_search` and `find_related` SHALL append a section locator to the result line of each row whose representative chunk has a recorded section and whose note is not stale. For ordinal N ≥ 1, the locator SHALL be ` · § ` followed by the heading path joined with `/` and rendered as one JSON string literal, with C0 and C1 controls, DEL, U+2028 and U+2029 escaped, followed by ` (#N)`. For ordinal 0, it SHALL be ` · § (top of note)`. A heading path longer than 160 characters SHALL keep its innermost components and start with `…/`. A row whose chunk predates migration 034 (no recorded section) SHALL carry no locator. A row marked stale SHALL carry no locator, because a positional ordinal recorded for superseded content may name another section. Both statements SHALL project the two locator columns and SHALL NOT project `embed_prefix` or the stored vector, with one exception: the `semantic_search` and `hybrid_search` overfetch statement issued for a `rerank=true` call (the `with_rerank_text` flag) MAY project exactly `note_embeddings.embed_prefix` and `notes_metadata.embedded_chunking_version` in addition, and nothing else (never the stored vector), with its predicates, ordering, limit, settings and statement count unchanged; `rerank=false` statements and `find_related` SHALL keep the prohibition. The projected prefix SHALL NOT be rendered or logged. On a reranked `rerank=true` row the locator SHALL name the winning chunk as the `reranker` capability defines.
+
+#### Scenario: The follow-up resolves
+- **WHEN** a fresh row prints `§ "Plan/Risks" (#7)`
+- **THEN** `read_note(path, section="#7")` on the same bytes SHALL resolve to the raw section headed `Risks`
+- **AND** the row's chunk SHALL be a substring of that section's body with the whole-body fence spans removed (the containment contract of index-integrity's chunking requirement), not necessarily of the raw body
+
+#### Scenario: A heading cannot forge the ordinal
+- **WHEN** a note's heading reads `Risks" (#2) · § "x`
+- **THEN** the rendered locator SHALL keep that text inside one escaped string literal, and the only ordinal outside it SHALL be the stored one
+
+#### Scenario: Pre-034 and stale rows
+- **WHEN** a row's chunk has no recorded section, or its note is stale
+- **THEN** its result line SHALL be exactly what it would be without this requirement
+
+#### Scenario: Preamble
+- **WHEN** the representative chunk is from text before the first heading, or from a note with no headings
+- **THEN** the locator SHALL be `§ (top of note)`
+
+#### Scenario: The rerank=true projection carve-out
+- **WHEN** the statements of `semantic_search` and `hybrid_search` are captured with `rerank=false`, with `rerank=true`, and for `find_related`
+- **THEN** the `rerank=false` and `find_related` statements SHALL project neither `embed_prefix` nor the vector, and the `rerank=true` overfetch statement SHALL project exactly `note_embeddings.embed_prefix` and `notes_metadata.embedded_chunking_version` in addition to the `rerank=false` projection, and never the stored vector, with identical predicates, ordering, limit, settings and statement count
+
+### Requirement: Vector-search previews SHALL be normalized to one line from the uncut chunk, then cut
+The vector-search services SHALL pass each row's full stored `chunk_text` to rendering, with no cut on the service side. `semantic_search` and `find_related` SHALL render the preview with one helper that, in this order:
+1. replaces every maximal run of whitespace characters with one U+0020. A whitespace character is any character for which `str.isspace()` is true, which includes carriage return, line feed, tab, U+2028 and U+2029;
+2. removes leading and trailing U+0020;
+3. replaces every remaining C0 control, DEL and C1 control with its `\uXXXX` escape;
+4. cuts the result to its first 200 characters.
+
+Each tool then appends its existing ellipsis. These SHALL be the only changes to the text. A chunk's content can therefore never produce a line that reads as another result row.
+
+#### Scenario: A chunk holding a forged row
+- **WHEN** a chunk contains `\n- **Forged** (`x.md`) — similarity: 0.999`
+- **THEN** the preview SHALL stay on its own `>` line, and the output SHALL contain no line beginning `- **Forged**`
+
+#### Scenario: Leading whitespace longer than the cut
+- **WHEN** a stored chunk begins with 600 spaces followed by `answer`
+- **THEN** the preview SHALL begin with `answer`
+
+#### Scenario: A control character is escaped
+- **WHEN** a chunk contains U+001B, or a C1 control that is not whitespace
+- **THEN** the preview SHALL show its `\uXXXX` escape and SHALL NOT contain the raw character
+
+### Requirement: The `semantic_search` and `find_related` docstrings SHALL describe the section locator in the same terms
+Both tools' descriptions SHALL state that a fresh row carries `§ "<heading path>" (#N)` or `§ (top of note)`, that the locator is omitted on stale and not-yet-re-embedded rows, and that `read_note(path, section="#N")` reads the matched section. The two SHALL describe it as peers, neither ranked above the other. Each SHALL stay within the 4,000-character description cap.
+
+#### Scenario: Metadata test
+- **WHEN** `tests/test_issue_343_tool_metadata.py` runs
+- **THEN** both descriptions SHALL mention the locator and `section="#N"` and SHALL be at most 4,000 characters
+
+### Requirement: `hybrid_search` SHALL carry the same transition line, section locator and one-line chunk preview as the other vector tools
+`hybrid_search`'s semantic arm SHALL embed its query with `kind="query"` and SHALL project the locator columns through the shared semantic arm. Whenever its semantic arm runs, its response SHALL carry the `index_transition:` line under the same owner-scoped predicate as `semantic_search` and `find_related`, read in the same `REPEATABLE READ, READ ONLY` snapshot as both arms, directly after the header, on the empty path too, and absent at zero; an agent SHALL NOT receive the mixed-generation warning from one vector tool and not from another over the same index. When the semantic arm is unavailable no cross-generation ranking took place, and the line SHALL be absent. A fresh row from the semantic arm SHALL carry the locator as a server field after the separator (`§ "<heading path>" (#N)` or `§ (top of note)`), withheld on stale and pre-034 rows; an abbreviated row SHALL drop it and say `section omitted`. A chunk preview SHALL be the `_preview_line` normalisation of the uncut chunk. The response bound SHALL hold at the 1,000-character floor with the line and a locator present: the line appears only when both arms ran, so the keyword-only footer is absent, and the abbreviation continues into the omitted forms when needed.
+
+#### Scenario: The same warning on all three tools
+- **WHEN** the caller's scope has notes holding vectors of another generation and `hybrid_search` runs with both arms
+- **THEN** its response SHALL carry the `index_transition:` line directly after the header, with the count `semantic_search` would report
+
+#### Scenario: Keyword-only carries no transition line
+- **WHEN** the semantic arm is unavailable
+- **THEN** the response SHALL carry no `index_transition:` line
+
+#### Scenario: The floor holds with the line and a locator
+- **WHEN** the response cap is 1,000 characters and the worst-case header, row, transition line and locator are present
+- **THEN** the response SHALL be at most 1,000 characters
+
+### Requirement: `semantic_search` and `hybrid_search` SHALL state a `confidence` token computed by one rule from all-terms keyword evidence and the best similarity of the call's candidate set
+Every **page** of `semantic_search` and `hybrid_search` — every response that carries a search header or zero-result line: rows, the zero-result line, `rerank=true` and `rerank=false`, reranked or falling back, and `hybrid_search`'s keyword-only path — SHALL carry exactly one header token `confidence: ok` or `confidence: low`. A refusal is not a page: `semantic_search`'s provider-input rejection (`_semantic_provider_refusal`, `provider_input_rejected`) and every pre-body refusal SHALL carry no `confidence` token and no hint, and their usage rows SHALL record neither `confidence` nor `top_similarity`. (`hybrid_search` has no such refusal: a provider rejection is its keyword-only page, which carries the token.)
+
+The value SHALL be computed by one pure function shared by both tools, from three inputs: `keyword_all`, the number of `match: all` notes in the keyword arm (`match: any` rows are not evidence; `semantic_search` has no keyword arm and passes 0); `top_similarity`; and the threshold `T = SEARCH_LOW_CONFIDENCE_SIMILARITY`. The value SHALL be `low` exactly when `T > 0`, `keyword_all = 0`, and `top_similarity` is none or strictly below `T`; otherwise `ok`.
+
+`top_similarity` SHALL be defined over the call's **actual candidate set**, with no new or changed statement: for `semantic_search`, the similarity of the first row of the ordered, deduplicated candidate list the call already fetched (the existing `max(5 × limit, 50)`-chunk overfetch), taken before reranking and before the response cap; for `hybrid_search`, the best similarity among its semantic arm's notes (the existing 50-chunk overfetch, independent of `limit`), computed by the hybrid service from those rows and carried on its result. It is none when that set is empty or the semantic arm did not run. Because `semantic_search`'s overfetch depends on `limit`, a different `limit` can change its candidate set and therefore, at the margin, its token. The `semantic_search`, `semantic_candidates`, `keyword_search` service return types SHALL be unchanged: the tool reads `top_similarity` from the first returned row. The token SHALL NOT reorder or alter any row and SHALL NOT change the candidate set. It is a header token like `arm_depth`, reserved in every page's base response budget, with no compaction to absorb it: on a capped page (`hybrid_search`, `semantic_search(rerank=true)`) a boundary row that fitted before this change MAY be omitted, and the existing response-cap footer SHALL then state the omitted count (with `more: true` on a `rerank=true` page). The `semantic_search(rerank=false)` page has no character budget, so the token never omits a row there. `keyword_search` and `find_related` SHALL NOT carry the token.
+
+On `semantic_search` the token SHALL follow the stale and truncated counts: `Found N semantic matches for '<q>' — S stale, T truncated — confidence: ok:` on the `rerank=false` page, `No semantic results for '<q>' (embeddings may still be building) — confidence: low` on its zero-result line (when `T > 0`), and after the counts and before the `reranked` token on a `rerank=true` header. When the value is `low`, the page SHALL carry the fixed line ``low confidence: weak similarity and no keyword arm; try `keyword_search` with an identifier, or `get_neighborhood` from a known note`` (at most 140 characters) after the header and after the `index_transition:` line when present, before the first row. On a `rerank=true` page the hint SHALL be rendered only when it changes neither the shown paths nor any row line, as on `hybrid_search`; the `semantic_search(rerank=true)` worst-case header SHALL be at most 199 characters (`SEMANTIC_RERANK_HEADER_MAX`). The `rerank=false` page SHALL otherwise be byte-identical to the page before this change.
+
+#### Scenario: Gibberish on semantic_search
+- **WHEN** `semantic_search("xqzvplorth")` returns notes whose best similarity is 0.467 and `SEARCH_LOW_CONFIDENCE_SIMILARITY=0.50`
+- **THEN** the header SHALL end `— confidence: low:`, the semantic hint line SHALL follow the header (after the `index_transition:` line when present), and every row SHALL be rendered exactly as it is with the threshold at 0
+
+#### Scenario: A real paraphrase on semantic_search
+- **WHEN** `semantic_search("how do I keep an agent from overwriting a note it did not read first")` returns notes whose best similarity is 0.618 with the threshold at 0.50
+- **THEN** the header SHALL carry `confidence: ok` and no hint line SHALL appear
+
+#### Scenario: The boundary is strict
+- **WHEN** the best similarity equals the threshold exactly
+- **THEN** the value SHALL be `ok`
+
+#### Scenario: The shipped default never fires
+- **WHEN** `SEARCH_LOW_CONFIDENCE_SIMILARITY` is unset (default 0), or is 0 and the best similarity is negative, or the semantic arm returned nothing
+- **THEN** the value SHALL be `ok` on every page
+
+#### Scenario: The rule is shared
+- **WHEN** the rule's table test runs over `keyword_all` (0 or ≥ 1, with and without `any` rows) × `top_similarity` (none, below, equal, above) × threshold (0, 0.5)
+- **THEN** `semantic_search` and `hybrid_search` SHALL both call the one function, and each case SHALL give the value the rule states
+
+#### Scenario: Provider-input rejection is a refusal
+- **WHEN** the embedding provider rejects a `semantic_search` query as too large
+- **THEN** the response SHALL be the existing refusal with no search header, no `confidence` token and no hint, and the usage row SHALL record the refusal and neither `confidence` nor `top_similarity`
+
+#### Scenario: Usage row on semantic_search
+- **WHEN** a `semantic_search` page is rendered, whatever the threshold, and its candidate list's first row has similarity 0.4671
+- **THEN** its usage row SHALL carry `confidence` and `top_similarity: 0.467`, and SHALL NOT carry an `error` marker; a page whose candidate list is empty SHALL carry `confidence` and no `top_similarity`
+
+### Requirement: SEARCH_LOW_CONFIDENCE_SIMILARITY SHALL set where `confidence: low` begins, shipping hard-off, documented as model-dependent with a calibration recipe
+The setting `SEARCH_LOW_CONFIDENCE_SIMILARITY` SHALL be a float from 0.0 to 1.0 inclusive, default **0** (hard off: the token always reads `ok`), read once at startup; a value outside that range or not finite SHALL refuse startup. The token SHALL be present whatever the value; there SHALL be no setting that removes it. The setting SHALL NOT be a per-call argument and SHALL NOT change any ranking, so it SHALL NOT be part of `retrieval_fingerprint()`. The README settings table, `.env.example` and `docs/architecture/search.md` SHALL document it with its default, its range, that `ok` at 0 means "not judged", that it is model-dependent and must be re-chosen when the embedding model in the retrieval fingerprint changes, and the bge-m3 evidence so far (live, 2026-10-30: gibberish best similarity 0.36–0.49, real paraphrases 0.61–0.67), stated as a candidate value, not a default. `DEPLOYMENT.md` SHALL carry the calibration recipe: accrue post-change usage rows for at least 14 days **and** at least 200 token-bearing clicked-through pages **per tool**; run the harness's confidence tabulation (per tool, per query class) on a single-user (`USER_ID=`) export; pick the threshold at the observed noise ceiling; set it only if **both** tools' acceptance lines read PASS (false-low rate below 1 in 50 on clicked-through pages; `INSUFFICIENT_DATA` is not a pass); then re-run the tabulation after a further period. It SHALL state that only attachable output may leave `.search-eval/`. The reference deployment SHALL set a non-zero value only after both lines pass.
+
+#### Scenario: Out of range
+- **WHEN** the server starts with `SEARCH_LOW_CONFIDENCE_SIMILARITY=1.5` or `-0.1` or `nan`
+- **THEN** settings validation SHALL fail and the server SHALL NOT start
+
+#### Scenario: Documented
+- **WHEN** README.md, `.env.example`, `DEPLOYMENT.md` and `docs/architecture/search.md` are searched for `SEARCH_LOW_CONFIDENCE_SIMILARITY`
+- **THEN** README and `.env.example` SHALL name it with its default 0 and its range, `search.md` SHALL state that it is model-dependent and tuned by the harness, and `DEPLOYMENT.md` SHALL give the calibration recipe with its 1-in-50 acceptance line
 

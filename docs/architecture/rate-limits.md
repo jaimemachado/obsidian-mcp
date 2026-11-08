@@ -81,7 +81,13 @@ middleware, which binds a principal or answers 401/429. The failed-auth budget
 
 ## Gate order, and the invariant it preserves
 
-L2 → L3 → L4 → L5a/b → L5c (slots) → L6 (quota) → body → telemetry.
+L2 → L3 → L4 → L5a/b → L5c (slots) → L6 (quota) → write gate → body → telemetry.
+
+The **write gate** (#358) is not an admission gate: it runs `_require_write()`
+at the body boundary for the tools in `tool_permissions.WRITE_REQUIRED_TOOLS`
+and its refusal is the body's own (executed work, the `permission_denied`
+marker). Those bodies used to refuse as their first act, so the tokens and the
+quota slot a read-only write call spends are exactly what they were.
 
 - **A token is not a quota slot.** A rate token refills, so consuming one on a
   call a later gate refuses is correct — the refusal itself costs work. The
@@ -657,6 +663,24 @@ against credential guessing; #194's own verification withdrew that (256-bit
 > `MCP_AUTH_FAILURE_LIMIT=null`, and by the one WARNING naming the address the
 > first time a slot engages.
 
+## The CIMD document fetch: the failed-auth table, a second time (#357)
+
+`/authorize` with an `https://` client_id makes an outbound fetch that an
+unauthenticated caller can drive in single-user mode. In the reference
+deployment it sits behind SSO, but the app does not rely on that.
+`src/oauth/cimd.py` bounds it in this order, and a refusal spends nothing:
+1. A cache hit charges nothing.
+2. **Joining an in-progress fetch of the same URL** charges nothing. The join is evaluated before every cap, so it can never be refused by one.
+3. A 30 s per-URL cooldown after a failure.
+4. `OAUTH_CIMD_FETCHES_PER_ADDRESS_PER_MINUTE` (10, 1–120) on a fixed 4,096-slot table using **exactly** this section's algorithm. `rate_limits.salted_slot_index` is now the one shared definition, with its own per-process salt; slot 0 is reserved for no address; a fixed 60 s window; collisions merge and nothing is evicted, so address churn cannot refill a spent slot.
+5. At most one fetch in flight per slot.
+6. At most eight per process.
+
+The per-slot in-flight cap is the defence against one caller holding the pool
+with slow origins. Eight distinct slots can still fill it for up to 10 s (L11
+in [oauth and grants](oauth-and-grants.md)). The state is in-process, under
+the same `--workers 1` contract as everything else here.
+
 ## The panel login budget is keyed by account, exactly, and is not a lockout
 
 `POST /admin/auth/login` keeps its 5/min per-address slowapi limit and gains a
@@ -1041,6 +1065,23 @@ ending in a 500, shared with the panel and `/token`.
 one provider), and a call that degrades to keyword-only still held the slot —
 the class is per tool, not per outcome. Its database work is one session
 held only after the embedding returns, so one connection.
+
+A `rerank=true` call (#367) on either tool **stays in `embedding`**: the
+class is per tool, not per argument, so `CLASS_MAPPING_VERSION` does not
+move. The slot is held through the rerank exchange, which extends the hold by
+at most `RERANK_TIMEOUT_MS` (1.5 s by default, 30 s at most since #402); the database
+session is closed before the request is sent, so no connection is held during
+it. In `shadow` nothing waits, and the reranker client's two-connection pool
+is what bounds work in flight on the reranker. Readiness evidence gathered
+while reranking is in use mixes the two hold profiles, and the class version
+does not separate them (L7); read `make concurrency-report` with that in mind
+before promoting to `queue`. **Under `queue` or `enforce`, keep
+`RERANK_TIMEOUT_MS ≤ MCP_CONCURRENCY_WAIT_SECONDS × 1000`** unless that report
+passes over evidence including `rerank=true` traffic (#402, rerank-documents
+L10): with `MCP_CONCURRENCY_EMBEDDING=1`, one rerank call holding the sole
+`embedding` slot for 20 s makes a concurrent `semantic_search` /
+`hybrid_search` wait the 5 s tool wait and then, under `enforce`, be refused
+with `slot_timeout` (under `queue`, admitted with `overrun`).
 
 #261's `other` held 15 of the 25 tools and was pinned to 1. Raising it alone
 would let one tenant's scans hold every cheap-read slot, so it was split by

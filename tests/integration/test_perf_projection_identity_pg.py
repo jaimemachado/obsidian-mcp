@@ -71,6 +71,7 @@ from src.services import vault as vault_service
 from src.services.embeddings import semantic_search
 from src.services.filters import apply_note_filters
 from src.services.fts import combined_tsquery, index_tsvector_sql
+from src.services.fts import tags_text as fts_tags_text
 from src.services.search import full_text_search
 from test_search_recall import (
     _as_authenticated_request,
@@ -240,7 +241,7 @@ async def corpus(sessionmaker, queries):
         None,
     ))
 
-    fragment, cfg_params = index_tsvector_sql()
+    fragment, cfg_params = index_tsvector_sql(tags_bind="tags_text")
     async with sessionmaker() as session:
         notes = []
         for path, _vecs, attrs, _body in pending:
@@ -268,14 +269,15 @@ async def corpus(sessionmaker, queries):
         tsv = text(
             f"UPDATE notes_metadata SET content_tsvector = {fragment} WHERE id = :id"
         )
-        for path, _vecs, _attrs, body in pending:
+        for path, _vecs, row_attrs, body in pending:
             if body is not None:
                 # The title rides in the vector at weight A (#344), so the
                 # corpus has title-matched rows for the oracle to exempt.
                 await session.execute(tsv, {
                     "id": ids[path], "content": body,
                     "title": path.rsplit("/", 1)[-1].removesuffix(".md"),
-                    "aliases": "", **cfg_params,
+                    "aliases": "",
+                    "tags_text": fts_tags_text(row_attrs.get("tags")), **cfg_params,
                 })
 
         # Links for `get_neighborhood` and `find_orphans`: a chain over every
@@ -315,7 +317,7 @@ def embed_as(monkeypatch):
     """Make `get_embedding` return a chosen vector, for old and new alike."""
     state = {"vec": None}
 
-    async def _fake(_text):
+    async def _fake(_text, **_kw):
         return state["vec"]
 
     monkeypatch.setattr("src.services.embeddings.get_embedding", _fake)
@@ -788,9 +790,21 @@ async def _semantic_pair(sessionmaker, embed_as, vec, **kw):
     token = timing.begin()
     try:
         async with sessionmaker() as session:
+            # #355: semantic_search requires its REPEATABLE READ, READ ONLY
+            # snapshot; this test opens the transaction, so it opens it so.
+            await session.execute(text(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
             await session.execute(text("SET LOCAL enable_indexscan = off"))
             new = await semantic_search(session, "q", **kw)
         new_fb = timing.current()["exact_fallback"]
+        # #355 adds `section` and hands the renderer the uncut chunk; the old
+        # arm predates both. Project the new result back onto the old shape so
+        # this stays a test of #280's projection identity.
+        new = [
+            {**{k: v for k, v in r.items() if k != "section"},
+             "chunk": None if r["chunk"] is None else r["chunk"][:500]}
+            for r in new
+        ]
     finally:
         timing.clear(token)
     return old, new, old_fb, new_fb

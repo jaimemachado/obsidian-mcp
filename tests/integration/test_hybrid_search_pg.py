@@ -31,7 +31,7 @@ from sqlalchemy.pool import NullPool
 
 import _harness
 from src.models.db import NoteEmbedding, NoteMetadata, UsageLog, User
-from src.services import embeddings, hybrid, search, timing, vector_index
+from src.services import embeddings, fts, hybrid, search, timing, vector_index
 from src.services.embeddings import semantic_search
 from src.services.fts import index_tsvector_sql
 from src.services.hybrid import fuse
@@ -68,7 +68,7 @@ async def maker(migrated_url):
 
 async def _add_note(session, *, path, body, vectors, user_id, title=None, tags=None,
                     frontmatter=None):
-    fragment, cfg_params = index_tsvector_sql()
+    fragment, cfg_params = index_tsvector_sql(tags_bind="tags_text")
     note = NoteMetadata(
         file_path=path, title=title or path.rsplit("/", 1)[-1].removesuffix(".md"),
         content_hash=path, embedded_content_hash=path, tags=tags or [],
@@ -82,7 +82,8 @@ async def _add_note(session, *, path, body, vectors, user_id, title=None, tags=N
     await session.flush()
     await session.execute(
         text(f"UPDATE notes_metadata SET content_tsvector = {fragment} WHERE id = :id"),
-        {"id": note.id, "content": body, "title": note.title, "aliases": "", **cfg_params},
+        {"id": note.id, "content": body, "title": note.title, "aliases": "",
+         "tags_text": fts.tags_text(tags), **cfg_params},
     )
     return note.id
 
@@ -142,7 +143,7 @@ async def corpus(maker, migrated_url):
 
 @pytest.fixture(autouse=True)
 def _fixed_embedding(monkeypatch):
-    async def _embed(_text):
+    async def _embed(_text, **_kw):
         return list(Q)
 
     monkeypatch.setattr(embeddings, "get_embedding", _embed)
@@ -250,7 +251,7 @@ async def test_the_exact_fallback_is_restored_before_correct_snippets(maker, cor
 
 
 async def test_keyword_only_with_a_raising_provider(maker, corpus, monkeypatch):
-    async def _down(_text):
+    async def _down(_text, **_kw):
         raise ConnectionError("provider unreachable")
 
     monkeypatch.setattr(embeddings, "get_embedding", _down)
@@ -290,6 +291,60 @@ async def test_one_snapshot_serves_both_arms(maker, corpus, monkeypatch):
         async with maker() as session:
             await session.execute(delete(NoteMetadata).where(NoteMetadata.file_path == late))
             await session.commit()
+
+
+def _strict_listener_engine(monkeypatch, url, **kw):
+    """An engine carrying the production D3b listener (strict
+    `DATABASE_SSL_MODE`), its probe answered `ssl = true` because the
+    throwaway server has no TLS: the listener's statement runs on every new
+    connection exactly as it does in production."""
+    from src.services import transport_security as ts
+
+    monkeypatch.setattr(ts, "_PG_STAT_SSL_PROBE", "SELECT true, 'TLSv1.3', 'test'")
+    engine = create_async_engine(url, **kw)
+    ts.install_strict_transport_listener(engine)
+    return engine, async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+
+async def test_a_new_strict_mode_connection_opens_no_transaction(migrated_url, corpus,
+                                                                 monkeypatch):
+    """The 2026-10-30 production failure: under a strict `DATABASE_SSL_MODE`
+    the D3b probe ran on every new pooled connection and left the driver's
+    transaction open, so the first session on that connection found a query
+    already run and `SET TRANSACTION ISOLATION LEVEL` was refused. NullPool
+    makes every session a new connection, i.e. every call the bad case."""
+    engine, fresh = _strict_listener_engine(monkeypatch, migrated_url, poolclass=NullPool)
+    u7 = corpus["u7"]
+    try:
+        result = await _hybrid(fresh, folder="Projects/", user_id=u7)
+        assert result.arms == "both" and result.rows
+        async with fresh() as session:
+            assert await full_text_search(session, QUERY, limit=5, user_id=u7)
+        async with fresh() as session:
+            await session.execute(
+                text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
+            assert (await session.execute(
+                text("SHOW transaction_isolation"))).scalar() == "repeatable read"
+    finally:
+        await engine.dispose()
+
+
+async def test_parallel_calls_through_a_growing_strict_mode_pool(migrated_url, corpus,
+                                                                 monkeypatch):
+    """The reported shape: five parallel calls, the pool growing to serve
+    them, so some calls get a brand-new connection and some a reused one."""
+    import asyncio
+
+    engine, fresh = _strict_listener_engine(
+        monkeypatch, migrated_url, pool_size=2, max_overflow=6)
+    u7 = corpus["u7"]
+    try:
+        for _ in range(2):
+            results = await asyncio.gather(
+                *(_hybrid(fresh, folder="Projects/", user_id=u7) for _ in range(5)))
+            assert all(r.arms == "both" and r.rows for r in results)
+    finally:
+        await engine.dispose()
 
 
 async def test_the_search_analytics_page_has_a_hybrid_table(migrated_url, maker, corpus,
@@ -352,3 +407,138 @@ async def test_the_search_analytics_page_has_a_hybrid_table(migrated_url, maker,
     assert "Keyword search" in body and "Semantic search" in body
     assert "Hybrid search" in body
     assert "hybrid-panel-probe" in body
+
+
+# ── #367: rerank candidates (design D6) ─────────────────────────────────────
+
+NO_VECTORS = "Empty/no-vectors.md"
+
+
+async def test_a_keyword_only_candidate_is_scored_on_its_excerpt_from_the_same_snapshot(
+        maker, corpus, monkeypatch):
+    """The excerpt statement runs inside the hybrid snapshot: an excerpt
+    committed on another connection between the arms is not what is sent."""
+    u7 = corpus["u7"]
+
+    async def commit_between_arms(session):
+        async with maker() as other:
+            await other.execute(text(
+                "UPDATE notes_metadata SET body_excerpt = 'CHANGED AFTER THE SNAPSHOT' "
+                "WHERE file_path = :p"), {"p": NO_VECTORS})
+            await other.commit()
+
+    monkeypatch.setattr(hybrid, "_between_arms_hook", commit_between_arms)
+    try:
+        result = await _hybrid(maker, user_id=u7, limit=10, rerank_candidates=True)
+    finally:
+        monkeypatch.setattr(hybrid, "_between_arms_hook", None)
+        async with maker() as session:
+            await session.execute(text(
+                "UPDATE notes_metadata SET body_excerpt = 'zx81 without any embedding' "
+                "WHERE file_path = :p"), {"p": NO_VECTORS})
+            await session.commit()
+    row = next(r for r in result.rows if r.path == NO_VECTORS)
+    assert row.semantic_rank is None and row.keyword_rank is not None
+    assert row.rerank_text == "zx81 without any embedding"
+    both = next(r for r in result.rows if r.path == "Projects/both.md")
+    assert both.semantic_rank is not None and both.rerank_text == both.chunk
+    # Another tenant's excerpt is never read (the owner predicate).
+    assert all(not r.path.endswith(("tenant8.md", "ownerless.md")) for r in result.rows)
+
+
+async def test_a_null_excerpt_sends_the_title_alone(maker, corpus):
+    u7 = corpus["u7"]
+    async with maker() as session:
+        await session.execute(text(
+            "UPDATE notes_metadata SET body_excerpt = NULL WHERE file_path = :p"),
+            {"p": NO_VECTORS})
+        await session.commit()
+    try:
+        result = await _hybrid(maker, user_id=u7, limit=10, rerank_candidates=True)
+    finally:
+        async with maker() as session:
+            await session.execute(text(
+                "UPDATE notes_metadata SET body_excerpt = 'zx81 without any embedding' "
+                "WHERE file_path = :p"), {"p": NO_VECTORS})
+            await session.commit()
+    row = next(r for r in result.rows if r.path == NO_VECTORS)
+    assert row.rerank_text is None
+    from src.services.rerank import build_document
+
+    assert build_document(row.title, row.rerank_text) == row.title
+
+
+async def test_a_keyword_only_call_still_reranks(maker, corpus, monkeypatch):
+    from src.config import settings
+    from src.services import rerank
+    from tests.fixtures.fake_reranker import FakeReranker
+
+    async def _down(_text, **_kw):
+        raise ConnectionError("provider unreachable")
+
+    monkeypatch.setattr(embeddings, "get_embedding", _down)
+    server = FakeReranker().start()
+    monkeypatch.setattr(settings, "rerank_url", server.url)
+    monkeypatch.setattr(rerank, "_client", None)
+    rerank._reset_state_for_tests()
+    rerank._set_enabled()
+    try:
+        result = await _hybrid(maker, folder="Projects/", user_id=corpus["u7"], limit=10,
+                               rerank_candidates=True)
+        assert result.arms == "keyword_only"
+        outcome = await rerank.rerank_candidates(
+            QUERY, [(r.title, r.rerank_text) for r in result.rows])
+        assert outcome.reranked is True and outcome.candidates == len(result.rows)
+        sent = server.requests[-1]["documents"]
+        assert all(doc for doc in sent) and any("zx81" in doc for doc in sent)
+    finally:
+        await rerank.close_rerank_client()
+        rerank._reset_state_for_tests()
+        server.stop()
+
+
+async def test_a_same_path_note_of_another_tenant_never_supplies_the_excerpt(maker, corpus):
+    """Verifier V5: the excerpt statement selects by path, so the owner
+    predicate is what keeps another tenant's note at the same path out."""
+    u7, u8 = corpus["u7"], corpus["u8"]
+    async with maker() as session:
+        await _add_note(session, path=NO_VECTORS, body="zx81 TENANT EIGHT SECRET EXCERPT",
+                        vectors=[], user_id=u8)
+        await session.commit()
+    try:
+        result = await _hybrid(maker, user_id=u7, limit=10, rerank_candidates=True)
+        row = next(r for r in result.rows if r.path == NO_VECTORS)
+        assert row.rerank_text == "zx81 without any embedding"
+        assert all("SECRET" not in (r.rerank_text or "") for r in result.rows)
+        other = await _hybrid(maker, user_id=u8, limit=10, rerank_candidates=True)
+        mine = next(r for r in other.rows if r.path == NO_VECTORS)
+        assert mine.rerank_text == "zx81 TENANT EIGHT SECRET EXCERPT"
+    finally:
+        async with maker() as session:
+            await session.execute(delete(NoteMetadata).where(
+                NoteMetadata.file_path == NO_VECTORS, NoteMetadata.user_id == u8))
+            await session.commit()
+
+
+async def test_the_keyword_arm_carries_a_tags_and_body_match(maker, corpus):
+    """#391 through hybrid: `HOA` only in the tags, `siding complaint` only in
+    the body — the keyword arm finds the note (`matched_in: tags+body`) and
+    its preview is the keyword `head`, under the existing preview rule."""
+    u8 = corpus["u8"]
+    async with maker() as session:
+        await _add_note(session, path="HOA/board.md", title="Neighborhood board",
+                        body="the siding complaint went in", vectors=[_unit((6, 1.0))],
+                        user_id=u8, tags=["HOA"])
+        await session.commit()
+    try:
+        async with maker() as session:
+            result = await hybrid.hybrid_search(
+                session, "HOA siding complaint", limit=10, folder="HOA/", user_id=u8)
+        row = next(r for r in result.rows if r.path == "HOA/board.md")
+        assert row.keyword_rank == 1 and row.match == "all"
+        assert row.matched_in == ["tags+body"]
+        assert row.snippet is None and row.head.startswith("the siding complaint")
+    finally:
+        async with maker() as session:
+            await session.execute(text("DELETE FROM notes_metadata WHERE file_path = 'HOA/board.md'"))
+            await session.commit()

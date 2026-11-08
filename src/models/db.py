@@ -42,6 +42,34 @@ _INDEXED_PROVENANCE_MARKER = (
     "(016_indexed_vault_provenance)"
 )
 
+# Migration 037's ownership marker for the six OIDC link columns on `users`
+# (#416), mirrored here so `alembic check` compares it like any other column
+# attribute. Must stay byte identical to `COLUMN_MARKER` in
+# `alembic/versions/037_oidc_account_links.py`; a mismatch shows up as a
+# pending `alter_column(comment=...)` rather than as a `downgrade()` that has
+# quietly stopped recognising its own columns. The five constraints carry a
+# separate marker (`CONSTRAINT_MARKER` there) that autogenerate does not
+# compare, so it lives in the migration only and the schema gate reads it from
+# the catalogue.
+_OIDC_LINK_COLUMN_MARKER = "OIDC account link (037_oidc_account_links)"
+
+# The three CHECK predicates migration 037 creates, byte identical to the
+# migration's literals. Autogenerate does not compare CHECK predicates; they
+# are declared here so a fresh `create_all` and the migration agree, and the
+# schema gate asserts them through `pg_constraint` by definition.
+_OIDC_BOUND_COMPLETE_PREDICATE = (
+    "(oidc_issuer IS NULL AND oidc_subject IS NULL AND oidc_linked_at IS NULL) OR "
+    "(oidc_issuer IS NOT NULL AND oidc_subject IS NOT NULL "
+    "AND oidc_linked_at IS NOT NULL)"
+)
+_OIDC_EXPECTED_COMPLETE_PREDICATE = (
+    "(oidc_expected_issuer IS NULL AND oidc_expected_email IS NULL "
+    "AND oidc_expected_set_at IS NULL) OR "
+    "(oidc_expected_issuer IS NOT NULL AND oidc_expected_email IS NOT NULL "
+    "AND oidc_expected_set_at IS NOT NULL)"
+)
+_OIDC_NOT_BOTH_PREDICATE = "oidc_subject IS NULL OR oidc_expected_email IS NULL"
+
 
 class User(Base):
     __tablename__ = "users"
@@ -57,6 +85,47 @@ class User(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     last_login_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # ── OIDC account link (issue #416, migration 037) ──────────────────────
+    #
+    # Two triples, each all-NULL or all-set (the two `_complete` CHECKs), and
+    # never both set on one row (`ck_users_oidc_not_both`).
+    #
+    # *Bound*: `(oidc_issuer, oidc_subject)` is the provider identity this
+    # user signs in as, compared by exact equality with a validated ID
+    # token's `(iss, sub)`. Once set, nothing else about the token (email,
+    # username) is ever consulted for this user. UNIQUE, so one identity maps
+    # to at most one user; NULLs are distinct, so unlinked rows never collide.
+    #
+    # *Pending*: an administrator's expectation that the first verified login
+    # whose normalized email equals `oidc_expected_email` under
+    # `oidc_expected_issuer`, within `oidc_links.PENDING_DAYS` of
+    # `oidc_expected_set_at`, binds this user. Stored already normalized
+    # (`oidc_links.normalize_email`), so a plain UNIQUE suffices and no
+    # functional index is needed.
+    #
+    # Columns rather than a table on purpose: a table needs a foreign key to
+    # `users`, and an FK to `users` reopened the permanent-deletion deadlock
+    # for the feed tables. Deleting the row deletes its link. All writes go
+    # through `src/services/oidc_links.py` under the account guard.
+    oidc_issuer: Mapped[str | None] = mapped_column(
+        String(2048), nullable=True, comment=_OIDC_LINK_COLUMN_MARKER
+    )
+    oidc_subject: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, comment=_OIDC_LINK_COLUMN_MARKER
+    )
+    oidc_linked_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment=_OIDC_LINK_COLUMN_MARKER
+    )
+    oidc_expected_issuer: Mapped[str | None] = mapped_column(
+        String(2048), nullable=True, comment=_OIDC_LINK_COLUMN_MARKER
+    )
+    oidc_expected_email: Mapped[str | None] = mapped_column(
+        String(254), nullable=True, comment=_OIDC_LINK_COLUMN_MARKER
+    )
+    oidc_expected_set_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment=_OIDC_LINK_COLUMN_MARKER
+    )
 
     # ── Index provenance (issue #91, migration 016) ────────────────────────
     #
@@ -209,6 +278,21 @@ class User(Base):
         back_populates="user", cascade="all, delete", passive_deletes=True
     )
 
+    # Migration 037's five constraints (#416), named as the migration names
+    # them so `alembic check` compares the two UNIQUEs. The CHECK predicates
+    # are not compared by autogenerate; the schema gate asserts them.
+    __table_args__ = (
+        UniqueConstraint("oidc_issuer", "oidc_subject", name="uq_users_oidc_identity"),
+        UniqueConstraint(
+            "oidc_expected_issuer", "oidc_expected_email", name="uq_users_oidc_expected"
+        ),
+        CheckConstraint(_OIDC_BOUND_COMPLETE_PREDICATE, name="ck_users_oidc_bound_complete"),
+        CheckConstraint(
+            _OIDC_EXPECTED_COMPLETE_PREDICATE, name="ck_users_oidc_expected_complete"
+        ),
+        CheckConstraint(_OIDC_NOT_BOTH_PREDICATE, name="ck_users_oidc_not_both"),
+    )
+
 
 # Migration 020's ownership marker for `api_keys.daily_request_limit` (#162).
 # Mirrored here for 015/016/017/018's reason: `alembic check` compares column
@@ -322,6 +406,27 @@ _OAUTH_CLIENT_LAST_USED_COLUMN_MARKER = (
     "(025_oauth_client_last_used)"
 )
 
+# Byte-identical to `COLUMN_MARKER` in 036_oauth_cimd.py, so `alembic check`
+# compares it and a re-run of 036 can recognise its own column (#357).
+_OAUTH_CLIENT_CIMD_URL_COLUMN_MARKER = (
+    "created by 036_oauth_cimd: Client ID Metadata Document URL (#357)"
+)
+
+# Byte-identical to the four column markers in
+# 038_oauth_cimd_private_key_jwt.py (#420), same device.
+_OAUTH_CLIENT_PKJWT_JWKS_URI_MARKER = (
+    "created by 038_oauth_cimd_private_key_jwt: pinned JWKS URI (#420)"
+)
+_OAUTH_CLIENT_PKJWT_SIGNING_ALG_MARKER = (
+    "created by 038_oauth_cimd_private_key_jwt: pinned assertion signing alg (#420)"
+)
+_OAUTH_CLIENT_PKJWT_SNAPSHOT_MARKER = (
+    "created by 038_oauth_cimd_private_key_jwt: validated JWKS snapshot (#420)"
+)
+_OAUTH_CLIENT_PKJWT_FETCHED_AT_MARKER = (
+    "created by 038_oauth_cimd_private_key_jwt: JWKS snapshot origin fetch time (#420)"
+)
+
 # Same device, same rule: byte identical to `CODE_GRANT_MARKER` and
 # `ISSUED_AT_MARKER` in `alembic/versions/029_oauth_grant_lifetime.py`.
 _OAUTH_CODE_GRANT_ID_COLUMN_MARKER = (
@@ -354,6 +459,30 @@ _CONTENT_CHANGED_AT_COLUMN_MARKER = "content-change stamp (033_content_changed_a
 _NOTE_EVENTS_TABLE_MARKER = "change-feed events (033_content_changed_at)"
 _NOTE_EVENT_SCOPES_TABLE_MARKER = "change-feed scope counters (033_content_changed_at)"
 _NOTE_EVENT_GAPS_TABLE_MARKER = "change-feed write gaps (033_content_changed_at)"
+# Migration 034 (#355, heading-aware chunks; design D4/D5). Byte identical to
+# the migration's literals, so `alembic check` compares them.
+_HEADING_META_COLUMN_MARKER = "chunk section locator (034_heading_chunks)"
+_EMBED_PREFIX_COLUMN_MARKER = "embedded context prefix (034_heading_chunks)"
+_EMBEDDED_CHUNKING_VERSION_COLUMN_MARKER = (
+    "chunking version of the stored vectors (034_heading_chunks)"
+)
+_EMBEDDED_INPUT_DIGEST_COLUMN_MARKER = (
+    "digest of the embedded provider inputs (034_heading_chunks)"
+)
+# The two CHECKs 034 adds. Alembic does not compare CHECK predicates; the
+# schema gate asserts both through `pg_constraint`. Byte identical to the
+# migration's `HEADING_META_PREDICATE` / `CHUNKING_VERSION_PREDICATE`.
+_HEADING_META_CHECK_NAME = "ck_note_embeddings_heading_meta"
+_HEADING_META_PREDICATE = (
+    "(heading_path IS NULL AND section_ordinal IS NULL AND embed_prefix IS NULL) OR "
+    "(heading_path IS NOT NULL AND section_ordinal IS NOT NULL "
+    "AND embed_prefix IS NOT NULL AND section_ordinal >= 0 "
+    "AND (section_ordinal = 0) = (cardinality(heading_path) = 0))"
+)
+_CHUNKING_VERSION_CHECK_NAME = "ck_notes_metadata_embedded_chunking_version"
+_CHUNKING_VERSION_PREDICATE = (
+    "embedded_chunking_version IS NULL OR embedded_chunking_version >= 1"
+)
 # The all-or-none CHECK over those four columns. The predicate is the
 # migration's `STAT_PREDICATE`, byte for byte.
 _NOTE_STAT_CHECK_NAME = "ck_notes_metadata_stat_all_or_none"
@@ -451,6 +580,25 @@ class NoteMetadata(Base):
     frontmatter: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     embedded_content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Heading-aware chunks (#355, migration 034, design D3a/D4). Stamped by
+    # `certify_embedded` in the same conditional UPDATE as
+    # `embedded_content_hash`, on every certifying branch (embedded,
+    # certified-empty, excluded). `embedded_chunking_version` is the
+    # `src.services.embeddings.CHUNKING_VERSION` the stored vectors were built
+    # under; NULL means "pre-034 chunking". It is deliberately **not** part of
+    # the stored embedding fingerprint: a note on another version is re-selected
+    # by the embed backlog (`IS DISTINCT FROM`, never `<`), not refused at
+    # startup. `embedded_input_digest` is the SHA-256 hex of the canonical JSON
+    # of the ordered provider inputs the certification covers (`[]` for an
+    # empty or excluded note); the full-hash pass recomputes it as a backstop.
+    embedded_chunking_version: Mapped[int | None] = mapped_column(
+        SmallInteger,
+        nullable=True,
+        comment=_EMBEDDED_CHUNKING_VERSION_COLUMN_MARKER,
+    )
+    embedded_input_digest: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, comment=_EMBEDDED_INPUT_DIGEST_COLUMN_MARKER
+    )
     # Which fence grammar derived this row's links, tags and vectors.
     # `content_hash` cannot see a grammar change — the bytes are unchanged — so
     # without a separate marker the derivation gate would certify stale link
@@ -649,6 +797,10 @@ class NoteMetadata(Base):
         # Migration 026. Alembic does not compare CHECK predicates; the schema
         # gate asserts this one through `pg_constraint`.
         CheckConstraint(_NOTE_STAT_PREDICATE, name=_NOTE_STAT_CHECK_NAME),
+        # Migration 034, asserted by the schema gate like the one above.
+        CheckConstraint(
+            _CHUNKING_VERSION_PREDICATE, name=_CHUNKING_VERSION_CHECK_NAME
+        ),
     )
 
 
@@ -660,6 +812,22 @@ class NoteEmbedding(Base):
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     chunk_text: Mapped[str] = mapped_column(Text, nullable=False)
     embedding: Mapped[list[float]] = mapped_column(Vector(settings.embedding_dimensions), nullable=False)
+    # The chunk's section (#355, migration 034, design D1/D5/D6): the heading
+    # path outermost first (`{}` for the text before the first heading) and
+    # the `read_note(section="#N")` ordinal (0 for that preamble), plus the
+    # context prefix the provider input was built from (`embed_prefix +
+    # "\n\n" + chunk_text`). All three NULL on a pre-034 row, all three set on
+    # a row written since (the CHECK below). `chunk_text` stays un-prefixed.
+    # The reuse key is `(embed_prefix, chunk_text)`; the locator is not in it.
+    heading_path: Mapped[list[str] | None] = mapped_column(
+        ARRAY(Text), nullable=True, comment=_HEADING_META_COLUMN_MARKER
+    )
+    section_ordinal: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment=_HEADING_META_COLUMN_MARKER
+    )
+    embed_prefix: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment=_EMBED_PREFIX_COLUMN_MARKER
+    )
 
     note: Mapped["NoteMetadata"] = relationship(back_populates="embeddings")
 
@@ -673,6 +841,7 @@ class NoteEmbedding(Base):
     # used to be declared here is dropped by 027.
     __table_args__ = (
         Index("ix_note_embeddings_note_id", "note_id"),
+        CheckConstraint(_HEADING_META_PREDICATE, name=_HEADING_META_CHECK_NAME),
     )
 
 
@@ -953,6 +1122,20 @@ class OAuthClient(Base):
     history is visible to it. The absence of child rows is still required as a
     second, independent guard; see
     `docs/architecture/oauth-and-grants.md`.
+
+    ## Client authentication methods (#357, #420)
+
+    `token_endpoint_auth_method` is the one pinned method, for DCR and CIMD
+    rows alike: `client_secret_post` (a DCR confidential client, with a
+    secret hash), `none` (a public client), or `private_key_jwt` (CIMD rows
+    only, migration 038). A `private_key_jwt` row authenticates at `/token`
+    and `/revoke` with a `client_assertion` verified against `jwks_snapshot`,
+    the validated JWKS fetched from the document's pinned, same-origin
+    `jwks_uri`; `jwks_fetched_at` is that snapshot's **origin** fetch time,
+    never the approval time, and drives the stale refetch. The four
+    `private_key_jwt` columns are NULL on every other row. The three CHECKs
+    below make a DCR `private_key_jwt` row, or one without keys,
+    unrepresentable.
     """
 
     __tablename__ = "oauth_clients"
@@ -986,14 +1169,56 @@ class OAuthClient(Base):
         nullable=True,
         comment=_OAUTH_CLIENT_LAST_USED_COLUMN_MARKER,
     )
+    # A Client ID Metadata Document client's URL (#357, migration 036). Set
+    # exactly when `client_id` starts `cimd_` (the synthetic, per-(URL, user)
+    # row); NULL for every RFC 7591 registration. The CHECK below enforces it.
+    client_id_metadata_url: Mapped[str | None] = mapped_column(
+        String(2048), nullable=True, comment=_OAUTH_CLIENT_CIMD_URL_COLUMN_MARKER
+    )
+    # `private_key_jwt` CIMD clients only (#420, migration 038); NULL on every
+    # other row. See the class docstring and the CHECKs below.
+    jwks_uri: Mapped[str | None] = mapped_column(
+        String(2048), nullable=True, comment=_OAUTH_CLIENT_PKJWT_JWKS_URI_MARKER
+    )
+    token_endpoint_auth_signing_alg: Mapped[str | None] = mapped_column(
+        String(16), nullable=True, comment=_OAUTH_CLIENT_PKJWT_SIGNING_ALG_MARKER
+    )
+    jwks_snapshot: Mapped[dict | None] = mapped_column(
+        JSONB, nullable=True, comment=_OAUTH_CLIENT_PKJWT_SNAPSHOT_MARKER
+    )
+    jwks_fetched_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment=_OAUTH_CLIENT_PKJWT_FETCHED_AT_MARKER,
+    )
 
     user: Mapped["User | None"] = relationship(back_populates="oauth_clients")
 
     __table_args__ = (
+        # The three predicates are 038's, verbatim (#420).
         CheckConstraint(
             "(token_endpoint_auth_method = 'none' AND client_secret_hash IS NULL) OR "
-            "(token_endpoint_auth_method = 'client_secret_post' AND client_secret_hash IS NOT NULL)",
+            "(token_endpoint_auth_method = 'client_secret_post' AND client_secret_hash IS NOT NULL) OR "
+            "(token_endpoint_auth_method = 'private_key_jwt' AND client_secret_hash IS NULL)",
             name="ck_oauth_clients_auth_method_secret",
+        ),
+        CheckConstraint(
+            "((client_id LIKE 'cimd\\_%') = (client_id_metadata_url IS NOT NULL)) AND "
+            "(client_id_metadata_url IS NULL OR "
+            "(token_endpoint_auth_method IN ('none', 'private_key_jwt') "
+            "AND client_secret_hash IS NULL))",
+            name="ck_oauth_clients_cimd_shape",
+        ),
+        CheckConstraint(
+            "((token_endpoint_auth_method = 'private_key_jwt' "
+            "AND client_id_metadata_url IS NOT NULL AND jwks_uri IS NOT NULL "
+            "AND jwks_snapshot IS NOT NULL AND jwks_fetched_at IS NOT NULL) OR "
+            "(token_endpoint_auth_method <> 'private_key_jwt' "
+            "AND jwks_uri IS NULL AND token_endpoint_auth_signing_alg IS NULL "
+            "AND jwks_snapshot IS NULL AND jwks_fetched_at IS NULL)) AND "
+            "(token_endpoint_auth_signing_alg IS NULL OR "
+            "token_endpoint_auth_signing_alg IN ('RS256', 'PS256', 'ES256'))",
+            name="ck_oauth_clients_private_key_jwt_shape",
         ),
     )
 

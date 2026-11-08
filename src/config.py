@@ -342,6 +342,55 @@ class _FieldFilteredSource(PydanticBaseSettingsSource):
         return f"{self.__class__.__name__}({self._inner!r})"
 
 
+# ── Native OIDC (#415, #416) ────────────────────────────────────────────────
+#
+# The startup refusal for the retired subject map (design D3). The section
+# name at the end must match the heading in docs/native-oidc.md.
+OIDC_SUBJECT_USER_IDS_RETIRED = (
+    "OIDC_SUBJECT_USER_IDS is retired (#416). Upgrade: (1) confirm a local admin "
+    "password works; (2) set LOCAL_LOGIN_ENABLED=true; (3) remove "
+    "OIDC_SUBJECT_USER_IDS; (4) start; (5) bind each former subject on its user's "
+    "edit page (Single sign-on → Bind subject); (6) verify SSO and /authorize; "
+    "(7) optionally set LOCAL_LOGIN_ENABLED=false. See docs/native-oidc.md, "
+    "\"Upgrading from OIDC_SUBJECT_USER_IDS\"."
+)
+OIDC_TOKEN_AUTH_METHODS = ("client_secret_basic", "client_secret_post")
+OIDC_BASE_SCOPES = ("openid", "email", "profile")
+OIDC_MAX_ISSUER_CHARS = 2048
+OIDC_MAX_EXTRA_SCOPES = 8
+OIDC_MAX_SCOPE_CHARS = 64
+OIDC_MAX_DISPLAY_NAME_CHARS = 40
+# RFC 6749 §3.3: scope-token = 1*( %x21 / %x23-5B / %x5D-7E )
+_OIDC_SCOPE_TOKEN_CHARS = frozenset(
+    chr(c) for c in (0x21, *range(0x23, 0x5C), *range(0x5D, 0x7F))
+)
+
+
+def _normalise_oidc_extra_scopes(value: str) -> str:
+    """`OIDC_EXTRA_SCOPES` → its canonical space-joined form, or `ValueError`.
+
+    Separated by spaces only (a tab is not a scope-token character, so it is
+    refused rather than split on); each token an RFC 6749 scope-token of at
+    most 64 characters; at most eight distinct extra tokens. `offline_access`
+    is refused — no refresh token is ever wanted. `openid`, `email`,
+    `profile` and repeats are dropped, as they are already requested.
+    """
+    tokens = [t for t in value.split(" ") if t]
+    if len(tokens) > OIDC_MAX_EXTRA_SCOPES:
+        raise ValueError(f"OIDC_EXTRA_SCOPES accepts at most {OIDC_MAX_EXTRA_SCOPES} scopes")
+    kept: list[str] = []
+    for token in tokens:
+        if len(token) > OIDC_MAX_SCOPE_CHARS or not set(token) <= _OIDC_SCOPE_TOKEN_CHARS:
+            raise ValueError(
+                "OIDC_EXTRA_SCOPES must be space-separated RFC 6749 scope tokens "
+                f"of at most {OIDC_MAX_SCOPE_CHARS} characters")
+        if token.casefold() == "offline_access":
+            raise ValueError("OIDC_EXTRA_SCOPES must not request offline_access")
+        if token not in OIDC_BASE_SCOPES and token not in kept:
+            kept.append(token)
+    return " ".join(kept)
+
+
 class Settings(BaseSettings):
     # No password in the default (#324): an unset DATABASE_URL must not
     # authenticate with a known value. The bundled compose files set it from
@@ -437,6 +486,16 @@ class Settings(BaseSettings):
     change_feed_lock_timeout_ms: int = Field(2_000, ge=100, le=30_000)
     embedding_model: str = "bge-m3"
     embedding_dimensions: int = Field(1024, ge=1, le=16000)
+    # Prepended verbatim, with no separator, to every *query* embedding input
+    # and never to a document (#367; heading-chunks design D7). Instruction-
+    # tuned embedders (Qwen3-Embedding) expect e.g. "Instruct: <task>\nQuery: ".
+    # Empty by default, so bge-m3's inputs are byte-identical to before. **Not**
+    # part of the stored embedding fingerprint — every stored vector is a
+    # document vector embedded without it — so changing it neither refuses
+    # startup nor re-embeds anything; it is in the logged, non-stored
+    # retrieval fingerprint instead. At most 1,000 characters; NUL and C0
+    # controls other than LF and TAB are refused at load.
+    embedding_query_instruction: str = Field("", max_length=1000)
     # bge-m3 design point. Must stay strictly greater than `chunk_overlap`:
     # the chunker steps by `max(char_size - char_overlap, 1)`, so at equality
     # the step collapses to one character and `MAX_CHUNKS_PER_NOTE` stops
@@ -520,15 +579,17 @@ class Settings(BaseSettings):
     # validator below so the CSV form doesn't trip pydantic-settings' JSON
     # decode of complex (list) fields.
     fts_configs: Annotated[list[str], NoDecode] = ["english"]
-    # ── Keyword ranking and snippets (#344, migration 031) ─────────────────
+    # ── Keyword ranking and snippets (#344/#391, migrations 031/035) ───────
     #
     # `ts_rank_cd`'s weight array `{D, C, B, A}`, bound as `float4[]` and never
-    # interpolated. The keyword vector holds the title and aliases at `A` and
-    # the body at `D`; at the default one adjacent two-word title cover
-    # (`2/(1+1) = 1.0`) outweighs fifty body covers (`2/(50+50) = 0.02` each),
-    # where PostgreSQL's default `D = 0.1` lets ten body repetitions tie the
-    # title — the #344 failure. Changing it re-ranks title-versus-body
-    # competition only; body-only order is unchanged by any uniform `D`.
+    # interpolated. The keyword vector is `A(title) || A(aliases) || B(tags)
+    # || D(body)` (`C` unused); at the default one adjacent two-word title
+    # cover (`2/(1+1) = 1.0`) outweighs fifty body covers (`2/(50+50) = 0.02`
+    # each), where PostgreSQL's default `D = 0.1` lets ten body repetitions tie
+    # the title — the #344 failure — and one tag cover (`0.4`) ranks below a
+    # title cover and equals twenty body covers. Changing it re-ranks
+    # title-versus-tags-versus-body competition only; body-only order is
+    # unchanged by any uniform `D`.
     # Accepts `{0.02, 0.2, 0.4, 1.0}`, a JSON list or a CSV; four finite
     # numbers in [1e-6, 1] (`RANK_WEIGHT_MIN`: float4 must not round one to 0). See "Keyword ranking" in docs/architecture/search.md.
     rank_weights: Annotated[list[float], NoDecode] = [0.02, 0.2, 0.4, 1.0]
@@ -547,6 +608,18 @@ class Settings(BaseSettings):
     # count. Operator configuration, measured with the harness arm
     # (`scripts/search_eval_arms/hybrid.py`); there is no per-call argument.
     hybrid_rrf_k: int = Field(60, ge=1, le=1000)
+    # Where `semantic_search` and `hybrid_search` start reading
+    # `confidence: low` (#389): no `match: all` keyword note and the best
+    # similarity of the call's candidate set strictly below this value.
+    # **0 is hard off** (the shipped default): the token is still on every
+    # page and reads `ok`, and the usage rows still record the evidence.
+    # Model-dependent (bge-m3's candidate value is 0.50; OpenAI
+    # `text-embedding-3-*` cosines run lower), so it is chosen by the
+    # calibration recipe in DEPLOYMENT.md and re-chosen when the embedding
+    # model changes. It ranks nothing, so it is not in
+    # `retrieval_fingerprint()`. See "Confidence (#389)" in
+    # docs/architecture/search.md.
+    search_low_confidence_similarity: float = Field(0.0, ge=0.0, le=1.0, allow_inf_nan=False)
 
     embedding_provider: Literal["ollama", "openai"] = "ollama"
     openai_api_key: str | None = None
@@ -565,6 +638,37 @@ class Settings(BaseSettings):
     # only (replacing certifi's bundle; the OS store is never consulted).
     # Parsed once, at settings construction, in every mode including sandbox.
     embedding_ca_file: Annotated[str | None, BeforeValidator(_off_means_none)] = None
+
+    # ── Optional reranker (#367) ───────────────────────────────────────────
+    #
+    # `RERANK_URL` is the **full** endpoint URL of a Jina-compatible
+    # `/v1/rerank` server (llama-server `--reranking`, vLLM, Infinity); empty
+    # means the feature is absent and `rerank=true` answers
+    # `reranked: false (not_configured)`. The URL is judged by the embedding
+    # hop's parser and plaintext rule (`https`, loopback `http`, or `http`
+    # admitted by `RERANK_ALLOW_PLAINTEXT` — a separate written decision from
+    # `EMBEDDING_ALLOW_PLAINTEXT`); a policy violation refuses boot, a
+    # reranker that is merely down never does. An `https` reranker is
+    # verified against `EMBEDDING_CA_FILE`'s context, else certifi. The
+    # endpoint receives note text. See "Reranking (#367)" in
+    # docs/architecture/search.md.
+    rerank_url: str = ""
+    # Sent as `model` in the request body; llama-server serves one model and
+    # ignores it.
+    rerank_model: str = Field("", max_length=200)
+    # One wall-clock deadline per rerank exchange (pool wait, connect, write
+    # and read); past it the page falls back with `reranked: false (timeout)`.
+    # Up to 30 s (#402): size it together with `rerank_max_documents` from
+    # DEPLOYMENT.md's latency table. Under `MCP_CONCURRENCY_MODE` queue or
+    # enforce it must not exceed the tool wait unless the concurrency report
+    # passes with rerank traffic: the call holds its `embedding` slot.
+    rerank_timeout_ms: int = Field(1500, ge=100, le=30000)
+    rerank_allow_plaintext: bool = False
+    # #402: the most documents one rerank call sends. Every candidate note
+    # (≤ 50) gets its primary document first, then further fetched chunks in
+    # distance order, at most 4 per note; 50 reproduces the incumbent count.
+    # Latency scales with it (see DEPLOYMENT.md, "Reranker (optional)").
+    rerank_max_documents: int = Field(100, ge=50, le=200)
 
     # Caps for the raw file-access tools (read_file / write_file). Read is
     # checked against on-disk size before reading; write against the decoded
@@ -963,6 +1067,51 @@ class Settings(BaseSettings):
         return self
 
     multi_user_mode: bool = False
+    oidc_enabled: bool = False
+    oidc_issuer: str = ""
+    oidc_client_id: str = ""
+    oidc_client_secret: str = Field("", repr=False)
+    # Optional since #416: empty means no group check; set, the exact
+    # case-sensitive element check of #415 applies.
+    oidc_required_group: str = ""
+    # `client_secret_basic` (Authorization header) or `client_secret_post`
+    # (form body) — never both. Checked against discovery at login (D5).
+    oidc_token_auth_method: str = "client_secret_basic"
+    # Space-separated scopes requested after `openid email profile`; RFC 6749
+    # scope-tokens, ≤ 8 of ≤ 64 characters; `offline_access` refused.
+    oidc_extra_scopes: str = ""
+    # The login button reads "Sign in with {OIDC_DISPLAY_NAME}".
+    oidc_display_name: str = "SSO"
+    # PEM trust anchor for the OIDC back-channel only (not EMBEDDING_CA_FILE:
+    # different operators, different roots). Unset → certifi's bundle.
+    # Parsed once, when OIDC is enabled, by `_validate_oidc`.
+    oidc_ca_file: Annotated[str | None, BeforeValidator(_off_means_none)] = None
+    # Retired (#416). Kept only so that a non-empty value can be refused with
+    # the upgrade sequence; linking now lives on the `users` row.
+    oidc_subject_user_ids: dict[str, Any] = Field(default_factory=dict, repr=False)
+    local_login_enabled: bool = True
+
+    _oidc_ssl_context: Any = PrivateAttr(default=None)
+
+    @property
+    def oidc_ssl_context(self):
+        """The parsed `OIDC_CA_FILE` context, or `None` (certifi applies)."""
+        return self._oidc_ssl_context
+
+    @field_validator("oidc_ca_file", mode="before")
+    @classmethod
+    def _oidc_ca_off(cls, value):
+        if isinstance(value, str) and value.strip().casefold() == "off":
+            return None
+        return value
+
+    @field_validator("oidc_subject_user_ids", mode="before")
+    @classmethod
+    def _oidc_mapping_retired(cls, value):
+        if value is None or value == {} or (isinstance(value, str) and not value.strip()):
+            return {}
+        raise ValueError(OIDC_SUBJECT_USER_IDS_RETIRED)
+
     session_max_age: int = 60 * 60 * 24 * 7
     session_cookie_name: str = "omcp_session"
 
@@ -1058,6 +1207,25 @@ class Settings(BaseSettings):
     # OAUTH_GRANT_ABSOLUTE_LIFETIME_DAYS.
     oauth_grant_absolute_lifetime_days: int = Field(90, ge=1, le=365)
 
+    # Client ID Metadata Documents (#357, MCP 2026-07-28). When true the AS
+    # metadata advertises `client_id_metadata_document_supported` and an
+    # `https://` client_id at /authorize is fetched as a metadata document
+    # through the transfer subsystem's hardened fetch. When false the flag is
+    # absent and such a client_id is an unknown client, so clients fall back
+    # to DCR; existing CIMD grants keep refreshing (the token endpoint never
+    # fetches). Env: OAUTH_CIMD_ENABLED.
+    oauth_cimd_enabled: bool = True
+    # Ceiling, in seconds, on how long a validated document is cached (its
+    # `Cache-Control: max-age`, 300 s when absent). 0 = never cache.
+    # Env: OAUTH_CIMD_CACHE_MAX_SECONDS.
+    oauth_cimd_cache_max_seconds: int = Field(86400, ge=0, le=86400)
+    # Document fetches each client address slot may start per 60 s window —
+    # the outbound hop an unauthenticated caller can drive. Same salted
+    # fixed-slot algorithm as the /mcp failed-auth budget; cache hits and
+    # joins of an in-progress fetch spend nothing.
+    # Env: OAUTH_CIMD_FETCHES_PER_ADDRESS_PER_MINUTE.
+    oauth_cimd_fetches_per_address_per_minute: int = Field(10, ge=1, le=120)
+
     # Registry-eval only: when true, lifespan skips the DB dim check,
     # indexer, and embedding provider, and the /mcp auth middleware
     # short-circuits. Lets Glama's sandbox build the image and validate
@@ -1129,6 +1297,20 @@ class Settings(BaseSettings):
             _FieldFilteredSource(dotenv_settings),
             file_secret_settings,
         )
+
+    @field_validator("embedding_query_instruction")
+    @classmethod
+    def _refuse_instruction_controls(cls, v: str) -> str:
+        """NUL and C0 controls other than `\n` and `\t` are refused: the value
+        is prepended to provider input verbatim, and a stray CR or NUL is a
+        silent query degradation nobody would see (design D7)."""
+        for ch in v:
+            if ord(ch) < 0x20 and ch not in "\n\t":
+                raise ValueError(
+                    "EMBEDDING_QUERY_INSTRUCTION contains a control character "
+                    f"(U+{ord(ch):04X}); only line feed and tab are allowed"
+                )
+        return v
 
     @field_validator("log_level", mode="before")
     @classmethod
@@ -1686,6 +1868,28 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _validate_rerank_transport(self) -> "Settings":
+        """#367 (design D1): `RERANK_MODEL` holds no control character, and a
+        non-empty `RERANK_URL` passes the embedding hop's URL rules with its
+        own plaintext flag. The URL policy is skipped under `MCP_SANDBOX_MODE`,
+        like the embedding policy; the address class is not restricted (an
+        internal reranker is expected on a private or loopback host)."""
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in self.rerank_model):
+            raise ValueError("RERANK_MODEL contains a control character")
+        if not self.rerank_url or self.mcp_sandbox_mode:
+            return self
+        from src.services.transport_security import check_embedding_url_policy
+
+        check_embedding_url_policy(
+            self.rerank_url,
+            setting="RERANK_URL",
+            allow_plaintext=self.rerank_allow_plaintext,
+            allow_setting="RERANK_ALLOW_PLAINTEXT",
+            what="every rerank query and candidate note text",
+        )
+        return self
+
+    @model_validator(mode="after")
     def _reject_overlap_at_or_above_chunk_size(self) -> "Settings":
         """`CHUNK_OVERLAP` must be strictly less than `CHUNK_SIZE`.
 
@@ -1841,6 +2045,44 @@ class Settings(BaseSettings):
                     repr(h) for h in public_hosts
                 ),
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_oidc(self) -> "Settings":
+        if self.multi_user_mode and not (self.local_login_enabled or self.oidc_enabled):
+            raise ValueError("Multi-user mode requires at least one login method")
+        if not self.oidc_enabled:
+            return self
+        if not self.multi_user_mode or self.mcp_sandbox_mode:
+            raise ValueError("OIDC requires multi-user mode and forbids sandbox mode")
+        for value, origin_only in ((self.oidc_issuer, False), (self.base_url or "", True)):
+            parsed = urlsplit(value)
+            if (parsed.scheme != "https" or not parsed.hostname or parsed.username
+                    or parsed.password or parsed.query or parsed.fragment
+                    or any(ord(c) <= 32 or c == "\\" for c in value)
+                    or (origin_only and parsed.path not in ("", "/"))):
+                raise ValueError("OIDC requires an HTTPS issuer and HTTPS BASE_URL origin")
+            _ = parsed.port  # invalid port fails at startup
+        if len(self.oidc_issuer) > OIDC_MAX_ISSUER_CHARS:
+            raise ValueError(f"OIDC_ISSUER must be at most {OIDC_MAX_ISSUER_CHARS} characters")
+        if not all((self.oidc_client_id.strip(), self.oidc_client_secret.strip())):
+            raise ValueError("OIDC requires OIDC_CLIENT_ID and OIDC_CLIENT_SECRET")
+        if len(self.oidc_required_group) > 512:
+            raise ValueError("OIDC_REQUIRED_GROUP must be at most 512 characters")
+        if self.oidc_required_group and not self.oidc_required_group.strip():
+            raise ValueError("OIDC_REQUIRED_GROUP must be empty or name a group")
+        if self.oidc_token_auth_method not in OIDC_TOKEN_AUTH_METHODS:
+            raise ValueError("OIDC_TOKEN_AUTH_METHOD must be one of " + ", ".join(OIDC_TOKEN_AUTH_METHODS))
+        self.oidc_extra_scopes = _normalise_oidc_extra_scopes(self.oidc_extra_scopes)
+        name = self.oidc_display_name
+        if (not 1 <= len(name) <= OIDC_MAX_DISPLAY_NAME_CHARS or not name.isprintable()
+                or not name.strip()):
+            raise ValueError(
+                f"OIDC_DISPLAY_NAME must be 1-{OIDC_MAX_DISPLAY_NAME_CHARS} printable characters")
+        if self.oidc_ca_file is not None:
+            from src.services.transport_security import load_oidc_ca_context
+
+            self._oidc_ssl_context = load_oidc_ca_context(self.oidc_ca_file)
         return self
 
 

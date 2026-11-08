@@ -950,6 +950,7 @@ def test_fixture_golden_numbers_by_hand(tmp_path):
     approx = lambda v: pytest.approx(v, abs=1e-6)  # noqa: E731
     nd = 1 / (1 + L3)
     assert title["overall"] == {"n_queries": 12, "recall@5": approx(0.75), "recall@10": approx(0.75),
+                                "recall@20": approx(0.75), "recall@50": approx(0.75),
                                 "mrr": approx(10 / 12), "ndcg@10": approx((8 + 2 * nd) / 12),
                                 "novel@10": 0.0}
     assert title["class:identifier"]["recall@10"] == approx(0.7)
@@ -958,7 +959,8 @@ def test_fixture_golden_numbers_by_hand(tmp_path):
     assert title["class:prose"]["mrr"] == approx(6 / 7)
     assert title["source:mined"]["recall@10"] == approx(8 / 11)
     assert title["source:manual"] == {"n_queries": 2, "recall@5": approx(0.75),
-                                      "recall@10": approx(0.75), "mrr": approx(1.0),
+                                      "recall@10": approx(0.75), "recall@20": approx(0.75),
+                                      "recall@50": approx(0.75), "mrr": approx(1.0),
                                       "ndcg@10": approx((1 + nd) / 2), "novel@10": 0.0}
     c = report["counts"]
     assert (c["n_queries"], c["n_both_sources"], c["dropped_paths"], c["dropped_queries"]) == (12, 1, 1, 1)
@@ -1043,3 +1045,29 @@ def test_the_fixture_needs_no_database_settings():
     out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True,
                          env={"PATH": "/usr/bin:/bin"})
     assert out.returncode == 0, out.stderr
+
+
+def test_a_semantic_runfile_from_an_older_harness_scores_with_nulls(tmp_path, armmod):
+    """#355 (D8): a `runfile:` semantic arm carries its meta's retrieval
+    fingerprint and legacy count, or null from a harness that recorded none;
+    fixture arms gain neither key."""
+    other = tmp_path / "other"
+    write_data(other, [{"text": "q1", "relevant": ["A.md"]}], SNAP)
+    assert run(other, [f"{armmod}:semantic_m"], generation="S1").exit_code == EXIT_OK
+    staged = other / "runs" / manifest_of(other)["files"][f"{armmod}:semantic_m"]["path"]
+    meta = json.loads(staged.read_text())["meta"]
+    # Not DB-backed, so this producing run recorded neither field.
+    assert "retrieval_fingerprint" not in meta and "legacy_chunked_notes" not in meta
+    here = tmp_path / "here"
+    _copy_inputs(other, here)
+    spec = f"runfile:{staged}"
+    assert run(here, ["fixture-lexical", spec], generation="S2").exit_code == EXIT_OK
+    res = score(here, ["fixture-lexical", spec], min_queries=1)
+    lexical, semantic = res.report["arms"]
+    assert "retrieval_fingerprint" not in lexical and "legacy_chunked_notes" not in lexical
+    assert semantic["retrieval_fingerprint"] is None
+    assert semantic["legacy_chunked_notes"] is None
+    # #390 (D8): and the chunk-length distribution, also null; fixture arms
+    # gain no key.
+    assert semantic["chunk_lengths"] is None
+    assert "chunk_lengths" not in lexical and "chunk_lengths" not in meta
