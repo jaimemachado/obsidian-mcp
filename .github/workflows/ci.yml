@@ -18,6 +18,9 @@ permissions:
 
 env:
   PYTHON_VERSION: "3.12"
+  # Keep this pin identical to the image workflow. The action's downloader
+  # failed to find its own release, so CI uses the same container as publish.
+  TRIVY_IMAGE: aquasec/trivy:0.69.3@sha256:bcc376de8d77cfe086a917230e818dc9f8528e3c852f7b1aff648949b6258d1c
 
 jobs:
   # The full suite, with the opt-in Postgres integration modules actually
@@ -189,13 +192,18 @@ jobs:
         run: docker build -t obsidian-mcp:ci .
 
       - name: Run Trivy scan
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: "obsidian-mcp:ci"
-          severity: "HIGH,CRITICAL"
-          exit-code: "1"
-          ignore-unfixed: true
-          scanners: "vuln"
+        run: |
+          set -euo pipefail
+          ignore=()
+          if [ -f .trivyignore ]; then ignore=(--ignorefile /src/.trivyignore); fi
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock:ro \
+            -v "$PWD:/src:ro" \
+            "$TRIVY_IMAGE" image \
+              --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed \
+              --no-progress --scanners vuln \
+              "${ignore[@]}" \
+              obsidian-mcp:ci
 
   # Advisory: a new upstream CVE disclosed against a pinned dependency must not
   # block an unrelated PR. It still shows red in the checks list.
