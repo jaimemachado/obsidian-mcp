@@ -1,0 +1,8 @@
+inputs:
+  nixpkgs:
+    url: github:cachix/devenv-nixpkgs/rolling
+  devbase:
+    url: github:jaimemachadoneto/devbase-stacks?ref=v0.3.0
+    flake: false
+imports:
+  - ./devenv.stacks.nix

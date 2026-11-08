@@ -56,7 +56,25 @@
     "root": {
       "inputs": {
         "devenv": "devenv",
-        "nixpkgs": "nixpkgs"
+        "nixpkgs": "nixpkgs",
+        "devbase": "devbase"
+      }
+    },
+    "devbase": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1794144148,
+        "narHash": "sha256-YSnl0ZfsZAAN4OpWyxTJ/Vsm+HlEBnbXmJ2N7SNYL6I=",
+        "owner": "jaimemachadoneto",
+        "repo": "devbase-stacks",
+        "rev": "bc2da2d84e0a8f274d9e46a05eced0e46992166b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "jaimemachadoneto",
+        "ref": "v0.3.0",
+        "repo": "devbase-stacks",
+        "type": "github"
       }
     }
   },
